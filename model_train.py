@@ -1,362 +1,499 @@
+# model_train.py - 모델 학습 및 재학습 모듈
+
 import pandas as pd
 import numpy as np
-from lightgbm import LGBMClassifier
+import lightgbm as lgb
+from sklearn.model_selection import TimeSeriesSplit, train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.preprocessing import StandardScaler
 import joblib
-from datetime import datetime
+import json
 import os
-import glob
+from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-print("="*80)
-print("🚀 RSI + 프라이스 액션 ML 모델 (v2: 장기 추세 필터 & 모델 단순화)")
-print("="*80)
-
-# ============================================================
-# 설정
-# ============================================================
-CONFIG = {
-    'lookback': 30,         # 30분 룩백
-    'option_duration': 10,  # 10분 옵션
-    'threshold': 0.65,      # 진입 임계값
-    'data_folder': '1m',    # CSV 파일들이 있는 폴더
-    'train_months': [1, 2, 3, 4, 5, 6, 7, 8, 9], # 학습: 1~9월
-    'test_months': [10],    # 검증: 10월 (있으면)
-}
-
-# ============================================================
-# 1. CSV 파일 로드 (기존과 동일)
-# ============================================================
-print("\n📂 CSV 파일 검색 중...")
-csv_folder = CONFIG['data_folder']
-csv_files = sorted(glob.glob(f"{csv_folder}/*.csv"))
-if not csv_files:
-    print(f"❌ '{csv_folder}' 폴더에서 CSV 파일을 찾을 수 없습니다!")
-    exit(1)
-print(f"✅ {len(csv_files)}개 CSV 파일 발견.")
-
-print(f"\n📊 데이터 로딩 중...")
-dfs = []
-for csv_file in csv_files:
-    try:
-        df_temp = pd.read_csv(csv_file, header=None)
-        df_temp.columns = [
-            'open_time', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_volume', 'trades', 'taker_buy_volume',
-            'taker_buy_quote_volume', 'ignore'
-        ]
-        df_temp['timestamp'] = pd.to_datetime(df_temp['open_time'], unit='us') # ### 참고: 바이낸스 데이터는 보통 ms 단위 ###
-        required_cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-        df_temp = df_temp[required_cols].copy()
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df_temp[col] = pd.to_numeric(df_temp[col], errors='coerce')
-        dfs.append(df_temp)
-    except Exception as e:
-        print(f"   ❌ {os.path.basename(csv_file)}: 오류 - {e}")
-
-if not dfs:
-    print("❌ 로드된 데이터가 없습니다!")
-    exit(1)
-
-df = pd.concat(dfs, ignore_index=True)
-df = df.sort_values('timestamp').reset_index(drop=True)
-df = df.drop_duplicates(subset=['timestamp']).reset_index(drop=True)
-
-print(f"\n✅ 총 {len(df):,}개 1분봉 데이터 로드")
-print(f"   기간: {df['timestamp'].min()} ~ {df['timestamp'].max()}")
-
-# ============================================================
-# 2. 15분봉 집계 (기존과 동일)
-# ============================================================
-print("\n📈 15분봉 집계 중...")
-df.set_index('timestamp', inplace=True)
-df_15m = df.resample('15T').agg({
-    'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
-}).dropna()
-
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-df_15m['rsi_14'] = calculate_rsi(df_15m['close'], period=14)
-df_15m['rsi_7'] = calculate_rsi(df_15m['close'], period=7)
-df_15m['rsi_21'] = calculate_rsi(df_15m['close'], period=21)
-df_15m['is_bullish_15m'] = (df_15m['close'] > df_15m['open']).astype(int)
-df_15m['is_bearish_15m'] = (df_15m['close'] < df_15m['open']).astype(int)
-df_15m['ema_20_15m'] = df_15m['close'].ewm(span=20, adjust=False).mean()
-df_15m['ema_50_15m'] = df_15m['close'].ewm(span=50, adjust=False).mean()
-
-df = df.reset_index()
-df_15m_reindex = df_15m.reindex(pd.to_datetime(df['timestamp']), method='ffill').reset_index()
-
-for col in ['rsi_14', 'rsi_7', 'rsi_21', 'is_bullish_15m', 'is_bearish_15m', 'ema_20_15m', 'ema_50_15m']:
-    if col in df_15m_reindex.columns:
-        df[col] = df_15m_reindex[col].values
-print("✅ 15분봉 피처를 1분봉에 병합")
-
-# ============================================================
-# 2.5. 장기 추세 필터 (1시간봉) 생성 ### 추가된 부분 ###
-# ============================================================
-print("\n⏳ 장기 추세 필터 (1시간봉) 생성 중...")
-df.set_index('timestamp', inplace=True)
-
-df_1h = df.resample('1H').agg({
-    'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'
-}).dropna()
-
-# 1시간봉 기준 50 EMA 계산
-df_1h['ema_50_1h'] = df_1h['close'].ewm(span=50, adjust=False).mean()
-
-# 1분봉으로 다시 머지 (forward fill)
-df_1h_reindex = df_1h.reindex(df.index, method='ffill')
-
-df['ema_50_1h'] = df_1h_reindex['ema_50_1h']
-# 현재 1분봉 종가가 1시간봉 EMA 위에 있으면 상승추세(1), 아니면 하락추세(0)
-df['is_uptrend_1h'] = (df['close'] > df['ema_50_1h']).astype(int)
-
-df.reset_index(inplace=True)
-print("✅ 1시간봉 EMA 필터 병합 완료")
-
-# ============================================================
-# 3. 1분봉 지표 계산 (기존과 동일)
-# ============================================================
-print("\n📊 1분봉 지표 계산 중...")
-df['ema_20'] = df['close'].ewm(span=20, adjust=False).mean()
-df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
-df['body'] = df['close'] - df['open']
-df['body_abs'] = abs(df['body'])
-df['range'] = df['high'] - df['low']
-df['upper_shadow'] = df['high'] - df[['open', 'close']].max(axis=1)
-df['lower_shadow'] = df[['open', 'close']].min(axis=1) - df['low']
-df['body_ratio'] = df['body_abs'] / (df['range'] + 1e-8)
-df['upper_shadow_ratio'] = df['upper_shadow'] / (df['range'] + 1e-8)
-df['lower_shadow_ratio'] = df['lower_shadow'] / (df['range'] + 1e-8)
-df['is_bullish'] = (df['close'] > df['open']).astype(int)
-df['is_bearish'] = (df['close'] < df['open']).astype(int)
-df['is_doji'] = (df['body_ratio'] < 0.1).astype(int)
-df['is_hammer'] = ((df['lower_shadow_ratio'] > 0.6) & (df['upper_shadow_ratio'] < 0.15) & (df['body_ratio'] < 0.3)).astype(int)
-df['is_shooting_star'] = ((df['upper_shadow_ratio'] > 0.6) & (df['lower_shadow_ratio'] < 0.15) & (df['body_ratio'] < 0.3)).astype(int)
-df['volume_ma_10'] = df['volume'].rolling(window=10).mean()
-df['volume_ratio'] = df['volume'] / (df['volume_ma_10'] + 1e-8)
-df['volume_surge'] = (df['volume'] > df['volume_ma_10'] * 1.5).astype(int)
-df['recent_high_20'] = df['high'].rolling(window=20).max()
-df['recent_low_20'] = df['low'].rolling(window=20).min()
-df['distance_to_high'] = (df['recent_high_20'] - df['close']) / df['close']
-df['distance_to_low'] = (df['close'] - df['recent_low_20']) / df['close']
-df['trend_ema'] = (df['ema_20'] > df['ema_50']).astype(int)
-df['trend_15m'] = (df['ema_20_15m'] > df['ema_50_15m']).astype(int)
-print("✅ 1분봉 지표 계산 완료")
-
-# ============================================================
-# 4. RSI 상태 피처 생성 (기존과 동일)
-# ============================================================
-print("\n🎯 RSI 상태 피처 생성 중...")
-df['rsi_oversold'] = (df['rsi_14'] < 30).astype(int)
-df['rsi_overbought'] = (df['rsi_14'] > 70).astype(int)
-df['rsi_extreme_oversold'] = (df['rsi_14'] < 20).astype(int)
-df['rsi_extreme_overbought'] = (df['rsi_14'] > 80).astype(int)
-df['rsi_neutral'] = ((df['rsi_14'] >= 40) & (df['rsi_14'] <= 60)).astype(int)
-df['rsi_low_with_hammer'] = (df['rsi_oversold'] & df['is_hammer']).astype(int)
-df['rsi_low_with_bullish'] = (df['rsi_oversold'] & df['is_bullish']).astype(int)
-df['rsi_high_with_shooting'] = (df['rsi_overbought'] & df['is_shooting_star']).astype(int)
-df['rsi_high_with_bearish'] = (df['rsi_overbought'] & df['is_bearish']).astype(int)
-df['rsi_low_uptrend'] = (df['rsi_oversold'] & df['trend_15m']).astype(int)
-df['rsi_high_downtrend'] = (df['rsi_overbought'] & (df['trend_15m'] == 0)).astype(int)
-df['rsi_increasing'] = (df['rsi_14'].diff() > 0).astype(int)
-df['rsi_decreasing'] = (df['rsi_14'].diff() < 0).astype(int)
-df['after_15m_bullish'] = df['is_bullish_15m'].shift(1).fillna(0).astype(int)
-df['after_15m_bearish'] = df['is_bearish_15m'].shift(1).fillna(0).astype(int)
-df['rsi_low_after_15m_bull'] = (df['rsi_oversold'] & df['after_15m_bullish']).astype(int)
-df['rsi_high_after_15m_bear'] = (df['rsi_overbought'] & df['after_15m_bearish']).astype(int)
-print("✅ RSI 상태 피처 생성 완료")
-
-# ============================================================
-# 5. 타겟 생성 (기존과 동일)
-# ============================================================
-print("\n🎯 타겟 생성 중...")
-df['future_price'] = df['close'].shift(-CONFIG['option_duration'])
-df['target_long'] = (df['future_price'] > df['close']).astype(int)
-df['target_short'] = (df['future_price'] < df['close']).astype(int)
-print("✅ 타겟 생성 완료")
-
-# ============================================================
-# 6. 룩백 윈도우 피처 생성
-# ============================================================
-print("\n🔄 룩백 윈도우 피처 생성 중...")
-
-def create_lookback_features(df, lookback=30):
-    features_list = []
-    for i in range(lookback, len(df)):
-        window = df.iloc[i-lookback:i]
-        feature_dict = {'index': i, 'timestamp': df.loc[i, 'timestamp']}
+class FeatureEngineer:
+    """피처 엔지니어링 클래스"""
+    
+    @staticmethod
+    def create_feature_pool(df):
+        """
+        전체 피처 풀 생성
+        미래 데이터 사용 방지를 위해 shift 활용
+        """
+        features = pd.DataFrame(index=df.index)
         
-        # ... (기존 피처들) ...
-        feature_dict['current_rsi_14'] = df.loc[i, 'rsi_14']
-        feature_dict['rsi_oversold'] = df.loc[i, 'rsi_oversold']
-        feature_dict['rsi_overbought'] = df.loc[i, 'rsi_overbought']
-        feature_dict['rsi_low_with_hammer'] = df.loc[i, 'rsi_low_with_hammer']
-        feature_dict['rsi_high_with_shooting'] = df.loc[i, 'rsi_high_with_shooting']
-        feature_dict['is_hammer'] = df.loc[i, 'is_hammer']
-        feature_dict['is_shooting_star'] = df.loc[i, 'is_shooting_star']
-        feature_dict['volume_surge'] = df.loc[i, 'volume_surge']
-        feature_dict['trend_ema'] = df.loc[i, 'trend_ema']
-        feature_dict['trend_15m'] = df.loc[i, 'trend_15m']
+        # 기본 가격 데이터 (현재 캔들 기준)
+        features['open'] = df['open']
+        features['high'] = df['high'] 
+        features['low'] = df['low']
+        features['close'] = df['close']
+        features['volume'] = df['volume']
         
-        ### 추가됨: 장기 추세 피처를 모델이 학습하도록 추가 ###
-        feature_dict['is_uptrend_1h'] = df.loc[i, 'is_uptrend_1h']
+        # 가격 변화율 (이전 캔들 대비)
+        for period in [1, 3, 5, 10, 15, 30]:
+            features[f'return_{period}'] = df['close'].pct_change(period).shift(1)
+            features[f'volume_change_{period}'] = df['volume'].pct_change(period).shift(1)
         
-        feature_dict['distance_to_high'] = df.loc[i, 'distance_to_high']
-        feature_dict['distance_to_low'] = df.loc[i, 'distance_to_low']
+        # 이동평균 (MA)
+        for period in [5, 10, 20, 50, 100, 200]:
+            ma = df['close'].rolling(window=period).mean().shift(1)
+            features[f'ma_{period}'] = ma
+            features[f'price_to_ma_{period}'] = (df['close'] / ma - 1).shift(1)
         
-        returns = (window['close'] / window['open'] - 1).values
-        for j in range(min(15, lookback)):
-            feature_dict[f'ret_{j}'] = returns[-(j+1)]
+        # 지수이동평균 (EMA)
+        for period in [12, 26, 50]:
+            ema = df['close'].ewm(span=period, adjust=False).mean().shift(1)
+            features[f'ema_{period}'] = ema
+            features[f'price_to_ema_{period}'] = (df['close'] / ema - 1).shift(1)
+        
+        # 볼린저 밴드
+        for period in [20, 50]:
+            ma = df['close'].rolling(window=period).mean().shift(1)
+            std = df['close'].rolling(window=period).std().shift(1)
+            features[f'bb_upper_{period}'] = ma + (std * 2)
+            features[f'bb_lower_{period}'] = ma - (std * 2)
+            features[f'bb_width_{period}'] = features[f'bb_upper_{period}'] - features[f'bb_lower_{period}']
+            features[f'bb_position_{period}'] = ((df['close'] - features[f'bb_lower_{period}']) / 
+                                                  features[f'bb_width_{period}']).shift(1)
+        
+        # RSI (Relative Strength Index)
+        for period in [14, 28]:
+            delta = df['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+            rs = gain / loss
+            features[f'rsi_{period}'] = (100 - (100 / (1 + rs))).shift(1)
+        
+        # MACD
+        ema_12 = df['close'].ewm(span=12, adjust=False).mean()
+        ema_26 = df['close'].ewm(span=26, adjust=False).mean()
+        macd_line = ema_12 - ema_26
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        features['macd'] = macd_line.shift(1)
+        features['macd_signal'] = signal_line.shift(1)
+        features['macd_histogram'] = (macd_line - signal_line).shift(1)
+        
+        # Stochastic Oscillator
+        for period in [14]:
+            low_min = df['low'].rolling(window=period).min()
+            high_max = df['high'].rolling(window=period).max()
+            features[f'stoch_{period}'] = (((df['close'] - low_min) / 
+                                           (high_max - low_min)) * 100).shift(1)
+        
+        # ATR (Average True Range) - 변동성 지표
+        for period in [14, 28]:
+            high_low = df['high'] - df['low']
+            high_close = np.abs(df['high'] - df['close'].shift(1))
+            low_close = np.abs(df['low'] - df['close'].shift(1))
+            true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+            features[f'atr_{period}'] = true_range.rolling(window=period).mean().shift(1)
+        
+        # 거래량 지표
+        features['volume_sma_10'] = df['volume'].rolling(window=10).mean().shift(1)
+        features['volume_ratio'] = (df['volume'] / features['volume_sma_10']).shift(1)
+        
+        # OBV (On Balance Volume)
+        obv = (np.sign(df['close'].diff()) * df['volume']).cumsum()
+        features['obv'] = obv.shift(1)
+        features['obv_change'] = obv.pct_change(10).shift(1)
+        
+        # 캔들 패턴
+        features['body_size'] = (df['close'] - df['open']).abs().shift(1)
+        features['upper_shadow'] = (df['high'] - df[['open', 'close']].max(axis=1)).shift(1)
+        features['lower_shadow'] = (df[['open', 'close']].min(axis=1) - df['low']).shift(1)
+        features['body_to_shadow'] = (features['body_size'] / 
+                                     (features['upper_shadow'] + features['lower_shadow'] + 0.0001)).shift(1)
+        
+        # 시간 피처
+        if 'timestamp' in df.columns:
+            dt = pd.to_datetime(df['timestamp'])
+            features['hour'] = dt.dt.hour
+            features['minute'] = dt.dt.minute
+            features['day_of_week'] = dt.dt.dayofweek
+            features['hour_sin'] = np.sin(2 * np.pi * features['hour'] / 24)
+            features['hour_cos'] = np.cos(2 * np.pi * features['hour'] / 24)
+        
+        # 마이크로 구조 피처 (고빈도 거래 패턴)
+        for period in [3, 5, 10]:
+            features[f'high_low_ratio_{period}'] = ((df['high'] / df['low'] - 1) * 100).rolling(window=period).mean().shift(1)
+            features[f'close_position_{period}'] = ((df['close'] - df['low']) / 
+                                                   (df['high'] - df['low'] + 0.0001)).rolling(window=period).mean().shift(1)
+        
+        return features
+    
+    @staticmethod
+    def create_target(df, window=10):
+        """
+        타겟 변수 생성: window분 후 가격이 올랐는지(1) 내렸는지(0)
+        """
+        future_price = df['close'].shift(-window)
+        target = (future_price > df['close']).astype(int)
+        return target
+
+
+class ModelTrainer:
+    """모델 학습 클래스"""
+    
+    def __init__(self, config):
+        self.config = config
+        self.models = []
+        self.feature_importance = None
+        self.selected_features = None
+        self.scaler = StandardScaler()
+        
+    def feature_selection(self, X, y, top_k=50):
+        """
+        피처 중요도 기반 피처 선택
+        """
+        # 초기 모델로 피처 중요도 파악
+        train_idx = int(len(X) * 0.8)
+        X_train, X_val = X[:train_idx], X[train_idx:]
+        y_train, y_val = y[:train_idx], y[train_idx:]
+        
+        # NaN 처리
+        X_train = X_train.fillna(method='ffill').fillna(0)
+        X_val = X_val.fillna(method='ffill').fillna(0)
+        
+        lgb_train = lgb.Dataset(X_train, y_train)
+        lgb_val = lgb.Dataset(X_val, y_val, reference=lgb_train)
+        
+        model = lgb.train(
+            self.config.LGBM_PARAMS,
+            lgb_train,
+            valid_sets=[lgb_val],
+            callbacks=[lgb.early_stopping(10), lgb.log_evaluation(0)]
+        )
+        
+        # 피처 중요도 추출
+        importance = pd.DataFrame({
+            'feature': X.columns,
+            'importance': model.feature_importance(importance_type='gain')
+        }).sort_values('importance', ascending=False)
+        
+        self.feature_importance = importance
+        self.selected_features = importance.head(top_k)['feature'].tolist()
+        
+        return self.selected_features
+    
+    def train_ensemble(self, X, y):
+        """
+        앙상블 모델 학습
+        """
+        self.models = []
+        X_selected = X[self.selected_features]
+        
+        # 데이터 분할 (시계열 고려)
+        train_size = int(len(X) * self.config.TRAIN_RATIO)
+        val_size = int(len(X) * self.config.VAL_RATIO)
+        
+        X_train = X_selected[:train_size]
+        y_train = y[:train_size]
+        X_val = X_selected[train_size:train_size+val_size]
+        y_val = y[train_size:train_size+val_size]
+        X_test = X_selected[train_size+val_size:]
+        y_test = y[train_size+val_size:]
+        
+        # NaN 처리 및 스케일링
+        X_train = X_train.fillna(method='ffill').fillna(0)
+        X_val = X_val.fillna(method='ffill').fillna(0)
+        X_test = X_test.fillna(method='ffill').fillna(0)
+        
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_val_scaled = self.scaler.transform(X_val)
+        X_test_scaled = self.scaler.transform(X_test)
+        
+        # 앙상블 모델 학습
+        for i in range(self.config.ENSEMBLE_MODELS):
+            # 각 모델마다 다른 파라미터 사용
+            params = self.config.LGBM_PARAMS.copy()
+            params['random_state'] = 42 + i
+            params['num_leaves'] = 31 + i * 5
+            params['learning_rate'] = 0.05 - i * 0.005
             
-        feature_dict['target_long'] = df.loc[i, 'target_long']
-        feature_dict['target_short'] = df.loc[i, 'target_short']
+            lgb_train = lgb.Dataset(X_train_scaled, y_train)
+            lgb_val = lgb.Dataset(X_val_scaled, y_val, reference=lgb_train)
+            
+            model = lgb.train(
+                params,
+                lgb_train,
+                valid_sets=[lgb_val],
+                callbacks=[lgb.early_stopping(10), lgb.log_evaluation(0)]
+            )
+            
+            self.models.append(model)
         
-        features_list.append(feature_dict)
-        if (i - lookback) % 20000 == 0:
-            print(f"   진행: {i - lookback:,} / {len(df) - lookback:,}")
-    return pd.DataFrame(features_list)
+        # 앙상블 성능 평가
+        train_pred = self.predict_proba(X_train)
+        val_pred = self.predict_proba(X_val)
+        test_pred = self.predict_proba(X_test)
+        
+        metrics = {
+            'train': self.evaluate_predictions(y_train, train_pred),
+            'validation': self.evaluate_predictions(y_val, val_pred),
+            'test': self.evaluate_predictions(y_test, test_pred)
+        }
+        
+        return metrics
+    
+    def predict_proba(self, X):
+        """
+        앙상블 예측 (확률)
+        """
+        X_selected = X[self.selected_features]
+        X_selected = X_selected.fillna(method='ffill').fillna(0)
+        X_scaled = self.scaler.transform(X_selected)
+        
+        predictions = []
+        for model in self.models:
+            pred = model.predict(X_scaled, num_iteration=model.best_iteration)
+            predictions.append(pred)
+        
+        # 앙상블 평균
+        ensemble_pred = np.mean(predictions, axis=0)
+        return ensemble_pred
+    
+    def predict(self, X, threshold=0.5):
+        """
+        이진 분류 예측
+        """
+        proba = self.predict_proba(X)
+        return (proba > threshold).astype(int)
+    
+    def evaluate_predictions(self, y_true, y_pred_proba, threshold=0.5):
+        """
+        예측 성능 평가
+        """
+        y_pred = (y_pred_proba > threshold).astype(int)
+        
+        metrics = {
+            'accuracy': accuracy_score(y_true, y_pred),
+            'precision': precision_score(y_true, y_pred),
+            'recall': recall_score(y_true, y_pred),
+            'f1': f1_score(y_true, y_pred),
+            'win_rate': np.mean(y_pred == y_true)
+        }
+        
+        return metrics
+    
+    def save_model(self, filepath=None):
+        """
+        모델 저장
+        """
+        if filepath is None:
+            filepath = os.path.join(self.config.MODEL_DIR, 'current_model.pkl')
+        
+        model_data = {
+            'models': self.models,
+            'scaler': self.scaler,
+            'selected_features': self.selected_features,
+            'feature_importance': self.feature_importance,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        joblib.dump(model_data, filepath)
+        
+        # 피처 정보 저장
+        feature_log_path = os.path.join(self.config.FEATURE_LOG_DIR, 'selected_features.json')
+        with open(feature_log_path, 'w') as f:
+            json.dump({
+                'features': self.selected_features,
+                'importance': self.feature_importance.to_dict() if self.feature_importance is not None else None
+            }, f, indent=2)
+    
+    def load_model(self, filepath=None):
+        """
+        모델 로드
+        """
+        if filepath is None:
+            filepath = os.path.join(self.config.MODEL_DIR, 'current_model.pkl')
+        
+        if os.path.exists(filepath):
+            model_data = joblib.load(filepath)
+            self.models = model_data['models']
+            self.scaler = model_data['scaler']
+            self.selected_features = model_data['selected_features']
+            self.feature_importance = model_data.get('feature_importance')
+            return True
+        return False
 
-features_df = create_lookback_features(df, CONFIG['lookback'])
-print(f"✅ {len(features_df):,}개 샘플 생성")
-features_df = features_df.dropna()
-print(f"   NaN 제거 후: {len(features_df):,}개")
 
-# ============================================================
-# 7. 학습/검증 데이터 분리 (기존과 동일)
-# ============================================================
-print("\n✂️  데이터 분리 중...")
-features_df['month'] = pd.to_datetime(features_df['timestamp']).dt.month
-train_data = features_df[features_df['month'].isin(CONFIG['train_months'])].copy()
-test_data = features_df[features_df['month'].isin(CONFIG['test_months'])].copy()
-print(f"✅ 학습 데이터: {len(train_data):,}개 (월: {CONFIG['train_months']})")
-print(f"✅ 검증 데이터: {len(test_data):,}개 (월: {CONFIG['test_months']})")
+class ModelOptimizer:
+    """모델 최적화 및 재학습 관리"""
+    
+    def __init__(self, config):
+        self.config = config
+        self.trainer = ModelTrainer(config)
+        self.performance_history = []
+        
+    def initial_training(self, df):
+        """
+        초기 모델 학습 (8개월 학습, 1개월 검증)
+        """
+        print("=" * 50)
+        print("초기 모델 학습 시작")
+        print("=" * 50)
+        
+        # 피처 생성
+        feature_engineer = FeatureEngineer()
+        features = feature_engineer.create_feature_pool(df)
+        target = feature_engineer.create_target(df, window=self.config.PREDICTION_WINDOW)
+        
+        # 유효한 데이터만 사용 (NaN 제거)
+        valid_idx = target.notna()
+        features = features[valid_idx]
+        target = target[valid_idx]
+        
+        # 시간 기준 분할 (8개월 학습, 1개월 검증)
+        total_months = 9
+        train_months = 8
+        train_size = int(len(features) * (train_months / total_months))
+        
+        X_train = features[:train_size]
+        y_train = target[:train_size]
+        X_test = features[train_size:]
+        y_test = target[train_size:]
+        
+        print(f"학습 데이터: {len(X_train)} 샘플")
+        print(f"검증 데이터: {len(X_test)} 샘플")
+        
+        # 피처 선택
+        print("\n피처 선택 중...")
+        selected_features = self.trainer.feature_selection(X_train, y_train, top_k=50)
+        print(f"선택된 피처 수: {len(selected_features)}")
+        print(f"상위 10개 피처: {selected_features[:10]}")
+        
+        # 앙상블 학습
+        print("\n앙상블 모델 학습 중...")
+        metrics = self.trainer.train_ensemble(features, target)
+        
+        print("\n학습 결과:")
+        for split, metric in metrics.items():
+            print(f"\n{split.upper()}:")
+            for key, value in metric.items():
+                print(f"  {key}: {value:.4f}")
+        
+        # 모델 저장
+        self.trainer.save_model()
+        print("\n모델 저장 완료")
+        
+        return metrics
+    
+    def retrain_model(self, new_data_df):
+        """
+        새로운 데이터로 모델 재학습
+        """
+        print("\n모델 재학습 시작...")
+        
+        # 피처 생성
+        feature_engineer = FeatureEngineer()
+        features = feature_engineer.create_feature_pool(new_data_df)
+        target = feature_engineer.create_target(new_data_df, window=self.config.PREDICTION_WINDOW)
+        
+        # 유효한 데이터만 사용
+        valid_idx = target.notna()
+        features = features[valid_idx]
+        target = target[valid_idx]
+        
+        # 기존 모델 로드
+        old_model = ModelTrainer(self.config)
+        old_model.load_model()
+        
+        # 새 모델 학습
+        new_model = ModelTrainer(self.config)
+        new_model.selected_features = old_model.selected_features  # 같은 피처 사용
+        
+        # 데이터 분할 (70% 학습, 20% 검증, 10% 테스트)
+        train_size = int(len(features) * 0.7)
+        val_size = int(len(features) * 0.2)
+        
+        X_train = features[:train_size]
+        y_train = target[:train_size]
+        X_val = features[train_size:train_size+val_size]
+        y_val = target[train_size:train_size+val_size]
+        X_test = features[train_size+val_size:]
+        y_test = target[train_size+val_size:]
+        
+        # 새 모델 학습
+        new_metrics = new_model.train_ensemble(features, target)
+        
+        # 테스트 데이터에서 두 모델 비교
+        old_pred = old_model.predict(X_test)
+        new_pred = new_model.predict(X_test)
+        
+        old_accuracy = accuracy_score(y_test, old_pred)
+        new_accuracy = accuracy_score(y_test, new_pred)
+        
+        print(f"\n모델 비교:")
+        print(f"기존 모델 정확도: {old_accuracy:.4f}")
+        print(f"새 모델 정확도: {new_accuracy:.4f}")
+        
+        # 새 모델이 더 좋으면 교체
+        if new_accuracy > old_accuracy:
+            print("새 모델이 더 우수함. 모델 교체...")
+            # 기존 모델 백업
+            backup_path = os.path.join(self.config.MODEL_DIR, f'backup/model_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pkl')
+            old_model.save_model(backup_path)
+            
+            # 새 모델 저장
+            new_model.save_model()
+            self.trainer = new_model
+            print("모델 교체 완료")
+        else:
+            print("기존 모델 유지")
+            self.trainer = old_model
+        
+        return new_metrics
+    
+    def analyze_failures(self, trade_log_df):
+        """
+        실패 거래 분석 및 필터 생성
+        """
+        failures = trade_log_df[trade_log_df['result'] == 0]
+        
+        if len(failures) == 0:
+            return {}
+        
+        # 실패 패턴 분석
+        failure_patterns = {
+            'high_volatility': [],
+            'low_volume': [],
+            'time_based': [],
+            'technical_signals': []
+        }
+        
+        # 변동성 기반 필터
+        if 'atr_14' in failures.columns:
+            high_vol_threshold = failures['atr_14'].quantile(0.75)
+            failure_patterns['high_volatility'] = {
+                'atr_14_threshold': high_vol_threshold,
+                'filter': f"atr_14 > {high_vol_threshold}"
+            }
+        
+        # 거래량 기반 필터
+        if 'volume_ratio' in failures.columns:
+            low_vol_threshold = failures['volume_ratio'].quantile(0.25)
+            failure_patterns['low_volume'] = {
+                'volume_ratio_threshold': low_vol_threshold,
+                'filter': f"volume_ratio < {low_vol_threshold}"
+            }
+        
+        # 시간대 기반 필터
+        if 'hour' in failures.columns:
+            hour_failure_rate = failures.groupby('hour').size()
+            high_failure_hours = hour_failure_rate[hour_failure_rate > hour_failure_rate.mean() + hour_failure_rate.std()].index.tolist()
+            failure_patterns['time_based'] = {
+                'avoid_hours': high_failure_hours,
+                'filter': f"hour not in {high_failure_hours}"
+            }
+        
+        return failure_patterns
 
-# ============================================================
-# 8. 피처 컬럼 정의 (기존과 동일)
-# ============================================================
-exclude_cols = ['index', 'timestamp', 'month', 'target_long', 'target_short']
-feature_columns = [col for col in features_df.columns if col not in exclude_cols]
-print(f"\n📋 사용 피처: {len(feature_columns)}개")
 
-# ============================================================
-# 9. 모델 학습 - LONG (기존과 동일)
-# ============================================================
-print("\n" + "="*80)
-print("📈 LONG 모델 학습")
-print("="*80)
-X_train_long = train_data[feature_columns]
-y_train_long = train_data['target_long']
-
-model_long = LGBMClassifier(
-    n_estimators=200, learning_rate=0.1, max_depth=3, num_leaves=7,
-    min_child_samples=200, subsample=0.7, colsample_bytree=0.7,
-    reg_alpha=1.0, reg_lambda=1.0, random_state=42, verbose=-1
-)
-print("학습 중...")
-model_long.fit(X_train_long, y_train_long)
-print("✅ 학습 완료")
-
-# ============================================================
-# 10. 모델 학습 - SHORT ### 변경됨: 모델 파라미터 단순화 ###
-# ============================================================
-print("\n" + "="*80)
-print("📉 SHORT 모델 학습")
-print("="*80)
-X_train_short = train_data[feature_columns]
-y_train_short = train_data['target_short']
-
-# LONG 모델과 동일한 파라미터로 단순화하여 과적합 방지
-model_short = LGBMClassifier(
-    n_estimators=200, learning_rate=0.1, max_depth=3, num_leaves=7,
-    min_child_samples=200, subsample=0.7, colsample_bytree=0.7,
-    reg_alpha=1.0, reg_lambda=1.0, random_state=42, verbose=-1
-)
-print("학습 중...")
-model_short.fit(X_train_short, y_train_short)
-print("✅ 학습 완료")
-
-# ============================================================
-# 11. 검증 ### 변경됨: 장기 추세 필터 적용 ###
-# ============================================================
-if len(test_data) > 0:
-    print("\n" + "="*80)
-    print("🔍 검증 데이터 평가 (장기 추세 필터 적용)")
-    print("="*80)
+# 사용 예시
+if __name__ == "__main__":
+    from config import Config
     
-    X_test = test_data[feature_columns]
-    y_test_long = test_data['target_long']
-    y_test_short = test_data['target_short']
-    
-    # --- LONG 평가 ---
-    test_long_prob = model_long.predict_proba(X_test)[:, 1]
-    test_long_pred = (test_long_prob > CONFIG['threshold']).astype(int)
-    
-    # --- SHORT 평가 ---
-    test_short_prob = model_short.predict_proba(X_test)[:, 1]
-    test_short_pred = (test_short_prob > CONFIG['threshold']).astype(int)
-    
-    # --- 장기 추세 필터 적용 ---
-    # is_uptrend_1h 피처를 test_data에서 가져옴
-    trend_filter = test_data['is_uptrend_1h'].values
-
-    # Long 신호는 1시간봉 상승 추세(1)일 때만 유효
-    filtered_long_pred = test_long_pred & (trend_filter == 1)
-    
-    # Short 신호는 1시간봉 하락 추세(0)일 때만 유효
-    filtered_short_pred = test_short_pred & (trend_filter == 0)
-    
-    # 필터링된 예측 기반으로 진입점 결정
-    long_entries = test_data[filtered_long_pred == 1]
-    short_entries = test_data[filtered_short_pred == 1]
-    
-    # 승률 계산
-    long_wins = (long_entries['target_long'] == 1).sum()
-    long_total = len(long_entries)
-    long_winrate = (long_wins / long_total * 100) if long_total > 0 else 0
-    
-    short_wins = (short_entries['target_short'] == 1).sum()
-    short_total = len(short_entries)
-    short_winrate = (short_wins / short_total * 100) if short_total > 0 else 0
-    
-    total_trades = long_total + short_total
-    total_wins = long_wins + short_wins
-    total_winrate = (total_wins / total_trades) * 100 if total_trades > 0 else 0
-    
-    print(f"\nLONG (상승 추세 필터 적용):")
-    print(f"  원래 신호: {test_long_pred.sum()}개")
-    print(f"  필터 후 거래: {long_total}개")
-    print(f"  승률: {long_winrate:.2f}%")
-    
-    print(f"\nSHORT (하락 추세 필터 적용):")
-    print(f"  원래 신호: {test_short_pred.sum()}개")
-    print(f"  필터 후 거래: {short_total}개")
-    print(f"  승률: {short_winrate:.2f}%")
-    
-    print(f"\n통합:")
-    print(f"  총 거래: {total_trades}개")
-    print(f"  총 승률: {total_winrate:.2f}%")
-
-# ============================================================
-# 12. 모델 저장 (기존과 동일)
-# ============================================================
-print("\n" + "="*80)
-print("💾 모델 저장")
-print("="*80)
-os.makedirs('model', exist_ok=True)
-model_package = {
-    'long_model': model_long, 'short_model': model_short,
-    'feature_columns': feature_columns, 'config': CONFIG,
-    'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-}
-filename = f"model/rsi_price_action_v2_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pkl"
-joblib.dump(model_package, filename)
-print(f"✅ 모델 저장: {filename}")
-print("\n✅ 전체 파이프라인 완료!")
+    # 설정 초기화
+    Config.create_directories()

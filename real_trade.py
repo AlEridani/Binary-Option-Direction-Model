@@ -1,763 +1,675 @@
-import os
-import joblib
+# real_trade.py - 실시간 거래 및 검증 모듈
+
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
+import json
 import time
+import os
+from datetime import datetime, timedelta
+import requests
+import uuid
 from collections import deque
 import warnings
 warnings.filterwarnings('ignore')
 
-class StrategyTradingSystem:
-    def __init__(self, model_path, threshold_override=None, reverse_mode=False):
-        """실시간 거래 시스템 초기화 (정상 모드 기본 설정)"""
-        print("="*80)
-        print("📊 ML 기반 실시간 거래 시스템 (정상/역발상 모드 선택)")
-        print("="*80)
+class BinanceAPIClient:
+    """바이낸스 API 클라이언트 (시뮬레이션)"""
+    
+    def __init__(self, api_key=None, api_secret=None):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.base_url = "https://api.binance.com"
         
-        self.reverse_mode = reverse_mode 
-        if self.reverse_mode:
-            print("⚠️  역발상 모드 활성화: SHORT 신호 → LONG 진입, LONG 신호 → SHORT 진입")
-        else:
-            print("✅ 정상 모드 활성화: LONG 신호 → LONG 진입, SHORT 신호 → SHORT 진입")
-        
-        # 바이낸스 API 초기화
-        api_key = os.getenv('BINANCE_API_KEY')
-        api_secret = os.getenv('BINANCE_API_SECRET')
-        
-        if not api_key or not api_secret:
-            print("⚠️  API 키 없음 - 데모 모드 (실제 거래 불가)")
-            self.client = None
-        else:
-            try:
-                self.client = Client(api_key, api_secret) 
-                print("✅ 바이낸스 API 연결 성공")
-            except Exception as e:
-                print(f"❌ 바이낸스 API 연결 실패: {e}")
-                self.client = None
-        
-        # 모델 로드
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"❌ 모델 파일을 찾을 수 없습니다: {model_path}")
-        
-        print(f"\n📦 모델 로딩: {os.path.basename(model_path)}")
-        self.model_package = joblib.load(model_path)
-        self.long_model = self.model_package['long_model']
-        self.short_model = self.model_package['short_model']
-        self.feature_columns = self.model_package['feature_columns']
-        self.config = self.model_package['config']
-        
-        # 임계값 오버라이드
-        if threshold_override is not None:
-            self.config['threshold'] = threshold_override
-            print(f"⚠️  임계값 오버라이드: {threshold_override}")
-        
-        print(f"✅ 모델 로드 완료")
-        print(f"   룩백: {self.config.get('lookback', 30)}분")
-        print(f"   임계값: {self.config.get('threshold', 0.65)}")
-        print(f"   옵션 기간: {self.config.get('option_duration', 10)}분")
-        
-        # 변동성 필터 임계값 (기존 값 유지)
-        self.volatility_thresholds = {
-            'atr_90': 0.001075,
-            'atr_95': 0.001454
-        }
-        print(f"\n🛡️  변동성 필터 활성화")
-
-        # 🚨 [추가] 비정상 캔들 감지 및 거래 중단 설정
-        self.lockout_time_minutes = 5  # 거래 중단 시간 (분)
-        self.last_lockout_end_time = datetime.min # 마지막 잠금 해제 시간 추적
-        self.vol_surge_thresholds = {
-            'range_multiplier': 2.5, # 캔들 범위가 20-ATR%의 2.5배 이상
-            'volume_multiplier': 2.0 # 거래량이 10-MA의 2.0배 이상
-        }
-        print(f"🛡️ 비정상 변동성 감지: 잠금 시간 {self.lockout_time_minutes}분 (ATR>{self.vol_surge_thresholds['range_multiplier']}x, Vol>{self.vol_surge_thresholds['volume_multiplier']}x)")
-        
-        # 데이터 버퍼
-        self.lookback = self.config.get('lookback', 30)
-        self.option_duration = self.config.get('option_duration', 10)
-        buffer_size = self.lookback + self.option_duration + 100
-        self.data_buffer = deque(maxlen=buffer_size)
-        
-        # 활성 거래
-        self.active_trades = []
-        # === 여기서 최대 동시 포지션 수를 설정합니다 ===
-        self.max_active_trades = 5 
-        
-        # CSV 파일 설정
-        mode_suffix = "REVERSE" if self.reverse_mode else "NORMAL"
-        self.csv_filename = f"trades_{mode_suffix}_{datetime.now().strftime('%Y%m%d')}.csv"
-        self.features_log_filename = f"features_log_{mode_suffix}_{datetime.now().strftime('%Y%m%d')}.csv"
-        self._init_csv()
-        
-        # 통계
-        self.stats = {
-            'total': 0, 'wins': 0, 'losses': 0, 'pending': 0,
-            'long_trades': 0, 'short_trades': 0
-        }
-        
-        self.running = False
-        
-    def _init_csv(self):
-        """CSV 파일 초기화"""
-        # 거래 결과 CSV 초기화 (이 파일은 거래 완료 시점에 데이터가 추가됨)
-        if not os.path.exists(self.csv_filename):
-            df = pd.DataFrame(columns=[
-                'entry_time', 'exit_time', 'direction', 
-                'entry_price', 'exit_price', 'result', 
-                'probability', 'profit_pct', 'original_signal'
-            ])
-            df.to_csv(self.csv_filename, index=False)
-            print(f"📝 거래 결과 CSV: {self.csv_filename}")
-        
-        # 피처 로그 CSV 초기화
-        if not os.path.exists(self.features_log_filename):
-            print(f"📝 피처 로그 CSV: {self.features_log_filename}")
-        else:
-            print(f"📝 기존 피처 로그 사용: {self.features_log_filename}")
-
-    def fetch_initial_data(self, symbol='BTCUSDT'):
-        """초기 데이터 로드"""
-        print(f"\n📊 {symbol} 초기 데이터 로딩...")
-        
-        if self.client is None:
-            print("⚠️  데모 모드 - 실제 데이터 로드 없이 더미 데이터 사용")
-            return False 
-        
+    def get_current_price(self, symbol="BTCUSDT"):
+        """
+        현재 가격 조회
+        """
         try:
-            # 실제 바이낸스 API 호출
-            klines = self.client.get_klines(
-                symbol=symbol,
-                interval='1m',
-                limit=self.lookback + 100
-            )
-            
-            for kline in klines:
-                candle = {
-                    'timestamp': pd.to_datetime(kline[0], unit='ms'),
-                    'open': float(kline[1]), 'high': float(kline[2]), 
-                    'low': float(kline[3]), 'close': float(kline[4]), 
-                    'volume': float(kline[5])
-                }
-                self.data_buffer.append(candle)
-            
-            print(f"✅ {len(self.data_buffer)}개 캔들 로드 완료")
-            return True
-            
-        except BinanceAPIException as e:
-            print(f"❌ 데이터 로드 실패: {e} (API 키 또는 권한 확인 필요)")
-            return False
+            url = f"{self.base_url}/api/v3/ticker/price"
+            params = {"symbol": symbol}
+            response = requests.get(url, params=params)
+            data = response.json()
+            return float(data['price'])
+        except:
+            # 시뮬레이션 모드
+            return np.random.uniform(40000, 45000)
     
-    def calculate_indicators_and_features(self, df):
-        """훈련 시 사용된 지표 및 피처를 실시간 데이터에 맞게 계산하는 통합 함수"""
-        required_data = max(self.lookback, 50) + 10
-        if len(df) < required_data:
-            return None, None
-
-        df = df.copy()
-        df.set_index('timestamp', inplace=True)
-
-        # 1. RSI 계산 보조 함수 정의
-        def calculate_rsi(series, period=14):
-            delta = series.diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-            rs = gain / (loss + 1e-8)
-            rsi = 100 - (100 / (1 + rs))
-            return rsi
-        
-        # 2. 15분봉 지표 계산 및 머지
-        df_15m = df.resample('15T').agg({
-            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
-        }).dropna()
-        df_15m['rsi_14'] = calculate_rsi(df_15m['close'], period=14)
-        df_15m['ema_20_15m'] = df_15m['close'].ewm(span=20, adjust=False).mean()
-        df_15m['ema_50_15m'] = df_15m['close'].ewm(span=50, adjust=False).mean()
-        df_15m['trend_15m'] = (df_15m['ema_20_15m'] > df_15m['ema_50_15m']).astype(int)
-        df_15m_reindex = df_15m.reindex(df.index, method='ffill')
-        df['rsi_14'] = df_15m_reindex['rsi_14'].values
-        df['trend_15m'] = df_15m_reindex['trend_15m'].values
-        
-        # 3. 1시간봉 장기 추세 필터 (🚨 요청에 따라 계산 제거 - 10분 거래에 불필요)
-        # 4. 1분봉 지표 계산
-        df['ema_20'] = df['close'].ewm(span=20, adjust=False).mean()
-        df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
-        df['trend_ema'] = (df['ema_20'] > df['ema_50']).astype(int)
-        df['body'] = df['close'] - df['open']
-        df['range'] = df['high'] - df['low']
-        df['body_ratio'] = abs(df['body']) / (df['range'] + 1e-8)
-        df['upper_shadow'] = df['high'] - df[['open', 'close']].max(axis=1)
-        df['lower_shadow'] = df[['open', 'close']].min(axis=1) - df['low']
-        df['upper_shadow_ratio'] = df['upper_shadow'] / (df['range'] + 1e-8)
-        df['lower_shadow_ratio'] = df['lower_shadow'] / (df['range'] + 1e-8)
-        df['volume_ma_10'] = df['volume'].rolling(window=10).mean()
-        df['volume_surge'] = (df['volume'] > df['volume_ma_10'] * 1.5).astype(int)
-        df['recent_high_20'] = df['high'].rolling(window=20).max()
-        df['recent_low_20'] = df['low'].rolling(window=20).min()
-        df['distance_to_high'] = (df['recent_high_20'] - df['close']) / df['close']
-        df['distance_to_low'] = (df['close'] - df['recent_low_20']) / df['close']
-        df['is_hammer'] = ((df['lower_shadow_ratio'] > 0.6) & (df['upper_shadow_ratio'] < 0.15) & (df['body_ratio'] < 0.3)).astype(int)
-        df['is_shooting_star'] = ((df['upper_shadow_ratio'] > 0.6) & (df['lower_shadow_ratio'] < 0.15) & (df['body_ratio'] < 0.3)).astype(int)
-        df['rsi_oversold'] = (df['rsi_14'] < 30).astype(int)
-        df['rsi_overbought'] = (df['rsi_14'] > 70).astype(int)
-        df['rsi_low_with_hammer'] = (df['rsi_oversold'] & df['is_hammer']).astype(int)
-        df['rsi_high_with_shooting'] = (df['rsi_overbought'] & df['is_shooting_star']).astype(int)
-        
-        # 🌟 [반등 필터 계산] 1분봉 RSI 3기간 계산을 위한 보조 함수 (Calculate RSI 재사용)
-        df['rsi_3'] = calculate_rsi(df['close'], period=3) 
-
-        # 5. 룩백 피처 추출
-        i = len(df) - 1 
-        if i < self.lookback:
-            return None, None
+    def get_klines(self, symbol="BTCUSDT", interval="1m", limit=500):
+        """
+        캔들스틱 데이터 조회
+        """
+        try:
+            url = f"{self.base_url}/api/v3/klines"
+            params = {
+                "symbol": symbol,
+                "interval": interval,
+                "limit": limit
+            }
+            response = requests.get(url, params=params)
+            data = response.json()
             
-        window_df = df.iloc[i - self.lookback : i]
-        
-        feature_dict = {}
-        current_candle = df.iloc[i]
-        
-        feature_dict['current_rsi_14'] = current_candle['rsi_14']
-        feature_dict['rsi_oversold'] = current_candle['rsi_oversold']
-        feature_dict['rsi_overbought'] = current_candle['rsi_overbought']
-        feature_dict['rsi_low_with_hammer'] = current_candle['rsi_low_with_hammer']
-        feature_dict['rsi_high_with_shooting'] = current_candle['rsi_high_with_shooting']
-        feature_dict['is_hammer'] = current_candle['is_hammer']
-        feature_dict['is_shooting_star'] = current_candle['is_shooting_star']
-        feature_dict['volume_surge'] = current_candle['volume_surge']
-        feature_dict['trend_ema'] = current_candle['trend_ema']
-        feature_dict['trend_15m'] = current_candle['trend_15m']
-        feature_dict['distance_to_high'] = current_candle['distance_to_high']
-        feature_dict['distance_to_low'] = current_candle['distance_to_low']
-        
-        # 🌟 [반등 필터 피처] 1분봉 RSI 3기간 값 추가
-        feature_dict['current_rsi_3'] = current_candle['rsi_3'] 
-        
-        returns = (window_df['close'] / window_df['open'] - 1).values
-        for j in range(self.lookback):
-            if j < 15:
-                feature_dict[f'ret_{j}'] = returns[-(j+1)]
-        
-        current_features = pd.Series(feature_dict)
-        # 모델 학습 시 사용된 피처 목록으로 재정렬
-        X_df = pd.DataFrame([current_features]).reindex(columns=self.feature_columns, fill_value=0.0)
-        
-        # 🚨 1시간봉 추세 필터 제거에 따라 더미값 1 할당 (check_entry_signal과의 형식 유지를 위함)
-        trend_filter = 1 
-        
-        return X_df.iloc[0].squeeze(), trend_filter 
-
+            # DataFrame으로 변환
+            df = pd.DataFrame(data, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+                'taker_buy_quote', 'ignore'
+            ])
+            
+            # 타입 변환
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            for col in ['open', 'high', 'low', 'close', 'volume']:
+                df[col] = df[col].astype(float)
+            
+            return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+        except:
+            # 시뮬레이션 데이터
+            return self._generate_simulation_data(limit)
     
-    def calculate_current_volatility(self, df):
-        """현재 변동성 계산 (ATR)"""
-        if len(df) < 21:
+    def _generate_simulation_data(self, limit=500):
+        """
+        시뮬레이션용 데이터 생성
+        """
+        timestamps = pd.date_range(end=datetime.now(), periods=limit, freq='1min')
+        prices = np.random.randn(limit).cumsum() + 42000
+        
+        data = []
+        for i, ts in enumerate(timestamps):
+            base_price = prices[i]
+            o = base_price + np.random.uniform(-50, 50)
+            c = base_price + np.random.uniform(-50, 50)
+            h = max(o, c) + np.random.uniform(0, 100)
+            l = min(o, c) - np.random.uniform(0, 100)
+            v = np.random.uniform(100, 1000)
+            
+            data.append({
+                'timestamp': ts,
+                'open': o,
+                'high': h,
+                'low': l,
+                'close': c,
+                'volume': v
+            })
+        
+        return pd.DataFrame(data)
+
+
+class RealTimeTrader:
+    """실시간 거래 실행 클래스"""
+    
+    def __init__(self, config, model_trainer, api_client=None):
+        self.config = config
+        self.model_trainer = model_trainer
+        self.api_client = api_client or BinanceAPIClient()
+        
+        # 거래 상태
+        self.is_running = False
+        self.current_position = None
+        self.trade_history = deque(maxlen=self.config.EVALUATION_WINDOW)
+        self.performance_metrics = {
+            'total_trades': 0,
+            'wins': 0,
+            'losses': 0,
+            'current_streak': 0,
+            'max_streak': 0,
+            'total_profit': 0
+        }
+        
+        # 필터
+        self.trade_filters = {}
+        self.load_filters()
+        
+    def load_filters(self):
+        """
+        거래 필터 로드
+        """
+        filter_path = os.path.join(self.config.FEATURE_LOG_DIR, 'trade_filters.json')
+        if os.path.exists(filter_path):
+            with open(filter_path, 'r') as f:
+                self.trade_filters = json.load(f)
+                print(f"거래 필터 로드: {len(self.trade_filters)} 개")
+    
+    def save_filters(self):
+        """
+        거래 필터 저장
+        """
+        filter_path = os.path.join(self.config.FEATURE_LOG_DIR, 'trade_filters.json')
+        with open(filter_path, 'w') as f:
+            json.dump(self.trade_filters, f, indent=2)
+    
+    def apply_filters(self, features):
+        """
+        거래 필터 적용
+        """
+        # 기본적으로 거래 허용
+        should_trade = True
+        filter_reasons = []
+        
+        # 변동성 필터
+        if 'high_volatility' in self.trade_filters:
+            filter_config = self.trade_filters['high_volatility']
+            if 'atr_14' in features and features['atr_14'].iloc[-1] > filter_config.get('atr_14_threshold', float('inf')):
+                should_trade = False
+                filter_reasons.append("높은 변동성")
+        
+        # 거래량 필터
+        if 'low_volume' in self.trade_filters:
+            filter_config = self.trade_filters['low_volume']
+            if 'volume_ratio' in features and features['volume_ratio'].iloc[-1] < filter_config.get('volume_ratio_threshold', 0):
+                should_trade = False
+                filter_reasons.append("낮은 거래량")
+        
+        # 시간대 필터
+        if 'time_based' in self.trade_filters:
+            filter_config = self.trade_filters['time_based']
+            current_hour = datetime.now().hour
+            if current_hour in filter_config.get('avoid_hours', []):
+                should_trade = False
+                filter_reasons.append(f"제외 시간대: {current_hour}시")
+        
+        return should_trade, filter_reasons
+    
+    def prepare_features(self, df):
+        """
+        실시간 피처 준비
+        """
+        from model_train import FeatureEngineer
+        
+        feature_engineer = FeatureEngineer()
+        features = feature_engineer.create_feature_pool(df)
+        
+        # 마지막 행만 필요 (현재 시점)
+        return features
+    
+    def make_prediction(self, features):
+        """
+        예측 수행
+        """
+        # 모델이 로드되어 있는지 확인
+        if not self.model_trainer.models:
+            print("모델이 로드되지 않았습니다.")
+            return None, 0.5
+        
+        # 필터 적용
+        should_trade, filter_reasons = self.apply_filters(features)
+        
+        if not should_trade:
+            print(f"거래 필터에 의해 스킵: {', '.join(filter_reasons)}")
+            return None, 0.5
+        
+        # 예측 수행
+        try:
+            # 마지막 행으로 예측
+            X_current = features.iloc[[-1]]
+            pred_proba = self.model_trainer.predict_proba(X_current)[0]
+            prediction = 1 if pred_proba > 0.5 else 0
+            
+            return prediction, pred_proba
+        except Exception as e:
+            print(f"예측 오류: {e}")
+            return None, 0.5
+    
+    def execute_trade(self, prediction, confidence, amount=100):
+        """
+        거래 실행
+        """
+        trade_id = str(uuid.uuid4())[:8]
+        entry_time = datetime.now()
+        entry_price = self.api_client.get_current_price()
+        
+        trade_info = {
+            'trade_id': trade_id,
+            'entry_time': entry_time.isoformat(),
+            'entry_price': entry_price,
+            'prediction': prediction,  # 1: UP, 0: DOWN
+            'confidence': confidence,
+            'amount': amount,
+            'status': 'open'
+        }
+        
+        # 포지션 설정
+        self.current_position = trade_info
+        
+        # 로그 저장
+        self.save_trade_log(trade_info)
+        
+        direction = "UP" if prediction == 1 else "DOWN"
+        print(f"\n거래 실행: {trade_id}")
+        print(f"- 방향: {direction}")
+        print(f"- 신뢰도: {confidence:.2%}")
+        print(f"- 진입가: {entry_price:.2f}")
+        print(f"- 금액: ${amount}")
+        
+        return trade_id
+    
+    def check_trade_result(self, trade_id):
+        """
+        거래 결과 확인 (10분 후)
+        """
+        if self.current_position is None or self.current_position['trade_id'] != trade_id:
             return None
         
-        recent_20 = df.iloc[-20:].copy()
-        recent_20['tr'] = np.maximum(
-            recent_20['high'] - recent_20['low'],
-            np.maximum(
-                abs(recent_20['high'] - recent_20['close'].shift(1)),
-                abs(recent_20['low'] - recent_20['close'].shift(1))
-            )
-        )
-        
-        atr = recent_20['tr'].mean()
-        current_price = df.iloc[-1]['close']
-        atr_pct = atr / current_price
-        
-        return atr_pct
-    
-    def get_dynamic_threshold(self, atr_pct):
-        """변동성에 따른 동적 임계값 계산"""
-        base_threshold = self.config.get('threshold', 0.65)
-        
-        if atr_pct > self.volatility_thresholds['atr_95']:
-            return None, 'BLOCKED'
-        elif atr_pct > self.volatility_thresholds['atr_90']:
-            adjusted = min(base_threshold + 0.05, 0.85)
-            return adjusted, 'ADJUSTED'
-        else:
-            return base_threshold, 'NORMAL'
-    
-    def check_entry_signal(self):
-        """진입 신호 확인 (정상 모드/역발상 적용)"""
+        # 진입 시간 확인
+        entry_time = datetime.fromisoformat(self.current_position['entry_time'])
         current_time = datetime.now()
         
-        # 🚨 [1. 잠금 상태 확인]
-        if current_time < self.last_lockout_end_time:
-            lock_remaining = (self.last_lockout_end_time - current_time).total_seconds()
-            print(f"🚫 거래 잠금 중 ({lock_remaining:.0f}초 남음). 비정상 캔들 발생 후 대기 중.")
-            return None, None, {
-                'atr_pct': None,
-                'status': 'LOCKOUT',
-                'threshold': None
-            }
-
-        if len(self.data_buffer) < self.lookback + 21: # ATR 계산을 위해 최소 21개 필요
-            return None, None, None
+        # 10분 경과 확인
+        if (current_time - entry_time).total_seconds() < 600:
+            remaining = 600 - (current_time - entry_time).total_seconds()
+            print(f"거래 진행 중... {remaining:.0f}초 남음")
+            return None
         
-        df = pd.DataFrame(list(self.data_buffer))
-        df = df.drop_duplicates(subset=['timestamp']).reset_index(drop=True)
+        # 결과 확인
+        entry_price = self.current_position['entry_price']
+        exit_price = self.api_client.get_current_price()
         
-        atr_pct = self.calculate_current_volatility(df)
+        actual_direction = 1 if exit_price > entry_price else 0
+        prediction = self.current_position['prediction']
         
-        if atr_pct is None:
-            return None, None, None
+        # 승패 판정
+        is_win = (prediction == actual_direction)
+        amount = self.current_position['amount']
         
-        # 🚨 [2. 비정상 변동성 캔들 감지 로직] (방금 닫힌 봉 기준)
-        if len(df) >= 2:
-            current_closed_candle = df.iloc[-2]
-            current_range = current_closed_candle['high'] - current_closed_candle['low']
-            current_price = current_closed_candle['close']
-            
-            # 1. 캔들 범위가 ATR의 X배 이상인가?
-            range_pct = current_range / current_price
-            atr_multiple = range_pct / (atr_pct + 1e-8)
-            
-            # 2. 거래량이 MA의 X배 이상인가?
-            # df['volume_ma_10']를 계산하기 위해 df 전체를 사용해야 하지만, 여기서는 간소화를 위해 마지막 캔들 기준으로 계산합니다.
-            volume_ma_10 = df['volume'].rolling(window=10).mean().iloc[-2]
-            volume_multiple = current_closed_candle['volume'] / (volume_ma_10 + 1e-8)
-
-            if (atr_multiple >= self.vol_surge_thresholds['range_multiplier'] and
-                volume_multiple >= self.vol_surge_thresholds['volume_multiplier']):
-                
-                self.last_lockout_end_time = current_time + timedelta(minutes=self.lockout_time_minutes)
-                print(f"\n🔥🔥 비정상 캔들 감지! {self.lockout_time_minutes}분간 거래 잠금 발동! 🔥🔥")
-                print(f"   ATR 배율: {atr_multiple:.1f}x | 거래량 배율: {volume_multiple:.1f}x")
-                print(f"   잠금 해제 시간: {self.last_lockout_end_time.strftime('%H:%M:%S')}")
-                
-                # 잠금 발동 즉시 신호 확인 중단
-                return None, None, {
-                    'atr_pct': atr_pct,
-                    'status': 'LOCKOUT_TRIGGERED',
-                    'threshold': None
-                }
+        if is_win:
+            profit = amount * self.config.WIN_RATE  # 80% 수익
+            result = 1
+        else:
+            profit = -amount  # 전액 손실
+            result = 0
         
-        # 3. [기존 동적 임계값 및 신호 확인 로직]
-        dynamic_threshold, volatility_status = self.get_dynamic_threshold(atr_pct)
+        # 결과 업데이트
+        self.current_position['exit_time'] = current_time.isoformat()
+        self.current_position['exit_price'] = exit_price
+        self.current_position['result'] = result
+        self.current_position['profit_loss'] = profit
+        self.current_position['status'] = 'closed'
         
-        if dynamic_threshold is None:
-            return None, None, {
-                'atr_pct': atr_pct,
-                'status': volatility_status,
-                'threshold': None
-            }
+        # 통계 업데이트
+        self.update_performance(is_win, profit)
         
-        features_series, trend_filter = self.calculate_indicators_and_features(df.iloc[:-1].copy())
+        # 거래 기록에 추가
+        self.trade_history.append(result)
         
-        if features_series is None:
-            return None, None, None
-            
-        rsi_3 = features_series.get('current_rsi_3', 50.0) 
+        # 로그 업데이트
+        self.update_trade_log(trade_id, result, profit)
         
-        try:
-            X = features_series[self.feature_columns].values.reshape(1, -1)
-            long_prob = self.long_model.predict_proba(X)[0][1] 
-            short_prob = self.short_model.predict_proba(X)[0][1]
-            
-            threshold = dynamic_threshold
-            
-            long_signal = long_prob > threshold
-            short_signal = short_prob > threshold
-            
-            # 피처 로그 저장
-            self._save_features_log(features_series, long_prob, short_prob, long_signal, short_signal, trend_filter)
-            
-            signals = []
-            
-            if not self.reverse_mode:
-                # 🌟🌟🌟 정상 모드 로직 🌟🌟🌟
-                
-                # 1. LONG 진입 로직: 장기 추세 필터 제거
-                if long_signal and not short_signal:
-                    signals.append({'direction': 'LONG', 'probability': long_prob, 'original_signal': 'LONG'})
-                    print(f"   ⬆️  정상: LONG 신호({long_prob:.2%}) → LONG 진입")
-                
-                # 2. SHORT 진입 로직: Long 모델 역필터 및 1분봉 RSI 필터 추가
-                elif short_signal and not long_signal and long_prob < 0.60 and rsi_3 < 90:
-                    signals.append({'direction': 'SHORT', 'probability': short_prob, 'original_signal': 'SHORT'})
-                    print(f"   ⬇️  정상: SHORT 신호({short_prob:.2%}) → SHORT 진입 (L-Prob:<0.60, RSI3:<90)")
-                
-                # 3. 신호/필터 충돌 및 차단 로직
-                elif (long_signal and short_signal) or (short_signal and long_prob >= 0.60) or (short_signal and rsi_3 >= 90):
-                    is_l_filtered = long_prob >= 0.60
-                    is_rsi_filtered = rsi_3 >= 90
-                    print(f"   ⚠️  신호/필터 충돌/차단 → 관망 (L:{long_prob:.2%}, S:{short_prob:.2%}, L필터:{is_l_filtered}, RSI3필터:{is_rsi_filtered})")
-                else:
-                    print(f"   ➖  신호 없음 (L:{long_prob:.2%}, S:{short_prob:.2%})")
-
-            else:
-                # 역발상 모드 (기존 로직 유지)
-                if short_signal and not long_signal:
-                    signals.append({'direction': 'LONG', 'probability': short_prob, 'original_signal': 'SHORT'})
-                    print(f"   🔄 역발상: SHORT 신호({short_prob:.2%}) → LONG 진입")
-                elif long_signal and not short_signal:
-                    signals.append({'direction': 'SHORT', 'probability': long_prob, 'original_signal': 'LONG'})
-                    print(f"   🔄 역발상: LONG 신호({long_prob:.2%}) → SHORT 진입")
-                elif (long_signal and short_signal):
-                    print(f"   ⚠️  신호 충돌 → 관망 (롱:{long_prob:.2%}, 숏:{short_prob:.2%})")
-                else:
-                    print(f"   ➖  신호 없음 (롱:{long_prob:.2%}, 숏:{short_prob:.2%})")
-            
-            volatility_info = {
-                'atr_pct': atr_pct,
-                'status': volatility_status,
-                'threshold': threshold
-            }
-            
-            return signals if signals else None, (long_prob, short_prob), volatility_info
-            
-        except Exception as e:
-            print(f"❌ 신호 확인 오류: {e}")
-            import traceback
-            traceback.print_exc()
-            return None, None, None
+        print(f"\n거래 종료: {trade_id}")
+        print(f"- 결과: {'승' if is_win else '패'}")
+        print(f"- 진입가: {entry_price:.2f}")
+        print(f"- 종료가: {exit_price:.2f}")
+        print(f"- 손익: ${profit:.2f}")
+        
+        # 포지션 초기화
+        self.current_position = None
+        
+        return result
     
-    def enter_trade(self, signal, entry_price):
-        """거래 진입 (파일 수정 없이 활성 거래 목록에 추가만 함)
-        반환: True(진입 성공) / False(진입 거부: 최대 포지션 도달)
+    def update_performance(self, is_win, profit):
         """
-        # 동시 활성 거래 제한 확인
-        if len(self.active_trades) >= self.max_active_trades:
-            print(f"⚠️ 진입 거부: 활성 거래가 최대({self.max_active_trades})에 도달했습니다.")
-            return False
+        성능 통계 업데이트
+        """
+        self.performance_metrics['total_trades'] += 1
+        
+        if is_win:
+            self.performance_metrics['wins'] += 1
+            self.performance_metrics['current_streak'] += 1
+            self.performance_metrics['max_streak'] = max(
+                self.performance_metrics['max_streak'],
+                self.performance_metrics['current_streak']
+            )
+        else:
+            self.performance_metrics['losses'] += 1
+            self.performance_metrics['current_streak'] = 0
+        
+        self.performance_metrics['total_profit'] += profit
+        
+        # 승률 계산
+        if self.performance_metrics['total_trades'] > 0:
+            win_rate = self.performance_metrics['wins'] / self.performance_metrics['total_trades']
+            self.performance_metrics['win_rate'] = win_rate
+    
+    def check_retrain_needed(self):
+        """
+        재학습 필요 여부 확인
+        """
+        if len(self.trade_history) >= self.config.EVALUATION_WINDOW:
+            recent_win_rate = sum(self.trade_history) / len(self.trade_history)
             
-        # 🚨 [추가] 잠금 상태 재확인 (혹시 모를 지연 실행 방지)
-        if datetime.now() < self.last_lockout_end_time:
-            print(f"🚫 진입 거부: 잠금 시간 ({self.last_lockout_end_time.strftime('%H:%M:%S')}) 이전입니다.")
-            return False
-
-        entry_time = datetime.now()
-        exit_time = entry_time + timedelta(minutes=self.option_duration)
-        
-        trade = {
-            'direction': signal['direction'],
-            'entry_time': entry_time,
-            'exit_time': exit_time,
-            'entry_price': entry_price,
-            'exit_price': None,
-            'probability': signal['probability'],
-            'original_signal': signal.get('original_signal', signal['direction']),
-            'status': 'ACTIVE',
-            'result': None
-        }
-        
-        self.active_trades.append(trade)
-        self.stats['total'] += 1
-        self.stats['pending'] += 1
-        
-        if signal['direction'] == 'LONG':
-            self.stats['long_trades'] += 1
-        else:
-            self.stats['short_trades'] += 1
-        
-        emoji = '🔺' if signal['direction'] == 'LONG' else '🔻'
-        orig_signal_text = signal.get('original_signal', signal['direction'])
-        
-        if self.reverse_mode:
-            print(f"   {emoji} {trade['direction']} 진입 (원래: {orig_signal_text}) | 종료: {exit_time.strftime('%H:%M:%S')}")
-        else:
-            print(f"   {emoji} {trade['direction']} 진입 | 종료: {exit_time.strftime('%H:%M:%S')}")
-        return True
-    
-    def check_exits(self):
-        """만료된 거래 확인 및 청산 (이 시점에 CSV 파일에 추가됨)"""
-        if len(self.data_buffer) < 2:
-            return
-        
-        current_time = datetime.now()
-        completed_indices = []
-        
-        # 청산 가격은 현재 닫힌 봉의 종가
-        exit_price = self.data_buffer[-2]['close']
-        
-        for idx, trade in enumerate(self.active_trades):
-            if current_time >= trade['exit_time']:
-                trade['exit_price'] = exit_price
-                trade['status'] = 'COMPLETED'
-                
-                # 결과 판단
-                if trade['direction'] == 'LONG':
-                    trade['result'] = 'WIN' if exit_price > trade['entry_price'] else 'LOSS'
-                else:
-                    trade['result'] = 'WIN' if exit_price < trade['entry_price'] else 'LOSS'
-                
-                profit_pct = ((exit_price - trade['entry_price']) / trade['entry_price']) * 100
-                if trade['direction'] == 'SHORT':
-                    profit_pct = -profit_pct
-                
-                trade['profit_pct'] = profit_pct
-                
-                self.stats['pending'] -= 1
-                if trade['result'] == 'WIN':
-                    self.stats['wins'] += 1
-                else:
-                    self.stats['losses'] += 1
-                
-                # ✅ 거래 완료 시점에 CSV 파일에 추가
-                self._save_trade_to_csv(trade)
-                
-                emoji = '✅' if trade['result'] == 'WIN' else '❌'
-                orig_signal = f" (원래: {trade['original_signal']})" if self.reverse_mode else ""
-                print(f"\n{emoji} 거래 종료 - {trade['direction']}{orig_signal}")
-                print(f"   진입: {trade['entry_price']:.2f} → 종료: {exit_price:.2f}")
-                print(f"   결과: {trade['result']}")
-                
-                completed_indices.append(idx)
-        
-        for idx in reversed(completed_indices):
-            self.active_trades.pop(idx)
-    
-    def _save_features_log(self, features, long_prob, short_prob, long_signal, short_signal, trend_filter):
-        """피처와 예측 확률 로그 저장 (매 분마다 추가)"""
-        log_data = {
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'long_prob': long_prob,
-            'short_prob': short_prob,
-            'long_signal': int(long_signal),
-            'short_signal': int(short_signal),
-            'is_uptrend_1h': trend_filter # 🚨 이제 더미값이지만 로깅을 위해 필드 유지
-        }
-        
-        for col in self.feature_columns:
-            log_data[col] = features.get(col, np.nan)
-        
-        # 🌟 1분봉 RSI 3기간 값도 로그에 포함
-        log_data['current_rsi_3'] = features.get('current_rsi_3', np.nan)
-        
-        df_log = pd.DataFrame([log_data])
-        
-        if not os.path.exists(self.features_log_filename):
-            df_log.to_csv(self.features_log_filename, index=False)
-        else:
-            df_log.to_csv(self.features_log_filename, mode='a', header=False, index=False)
-    
-    def _save_trade_to_csv(self, trade):
-        """거래 내역 CSV 저장 (거래 완료 시점에 추가)"""
-        df = pd.DataFrame([{
-            'entry_time': trade['entry_time'].strftime('%Y-%m-%d %H:%M:%S'),
-            'exit_time': trade['exit_time'].strftime('%Y-%m-%d %H:%M:%S'),
-            'direction': trade['direction'],
-            'entry_price': trade['entry_price'],
-            'exit_price': trade['exit_price'],
-            'result': trade['result'],
-            'probability': trade['probability'],
-            'profit_pct': f"{trade['profit_pct']:+.2f}%",
-            'original_signal': trade['original_signal']
-        }])
-        
-        df.to_csv(self.csv_filename, mode='a', header=False, index=False)
-    
-    def print_statistics(self):
-        """통계 출력 (화면을 지우지 않고 누적 출력)"""
-        print("\n" + "#"*80)
-        mode_text = "🔄 역발상 전략" if self.reverse_mode else "📊 정상 전략"
-        print(f"{mode_text} 실시간 거래 통계")
-        print("#"*80)
-        
-        if self.stats['total'] > 0:
-            completed = self.stats['wins'] + self.stats['losses']
-            win_rate = (self.stats['wins'] / completed * 100) if completed > 0 else 0
-            expected_return = (win_rate/100 * 0.80) - ((100-win_rate)/100 * 1)
+            print(f"\n최근 {self.config.EVALUATION_WINDOW}건 거래 승률: {recent_win_rate:.2%}")
             
-            print(f"총 거래: {self.stats['total']} (완료: {completed}, 대기: {self.stats['pending']})")
+            if recent_win_rate < self.config.RETRAIN_THRESHOLD:
+                print(f"승률이 {self.config.RETRAIN_THRESHOLD:.0%} 미만입니다. 재학습이 필요합니다.")
+                return True
             
-            if completed > 0:
-                print(f"승리: {self.stats['wins']} | 패배: {self.stats['losses']}")
-                print(f"승률: {win_rate:.1f}%")
-                print(f"롱/숏: {self.stats['long_trades']}/{self.stats['short_trades']}")
-                print(f"기대 수익률 (80% 페이아웃 기준): {expected_return*100:+.1f}% per trade")
-                print(f"손익분기: 55.56% | 차이: {win_rate - 55.56:+.2f}%p")
-                
-                if win_rate >= 55.56:
-                    print(f"✅ 수익성 기준 충족")
-                else:
-                    print(f"⚠️  손익분기 미달")
-        else:
-            print("거래 기록 없음")
-        print("="*80)
-
+        return False
     
-    def run_realtime(self, symbol='BTCUSDT', check_interval=1):
-        """실시간 거래 실행"""
-        print(f"\n{'='*80}")
-        mode_text = "🔄 역발상 전략" if self.reverse_mode else "📊 정상 전략"
-        print(f"{mode_text} 실시간 거래 시작")
-        print(f"{'='*80}")
-        print(f"심볼: {symbol}")
-        print(f"저장 파일: {self.csv_filename}")
-        print(f"Ctrl+C로 중단\n")
+    def save_trade_log(self, trade_info):
+        """
+        거래 로그 저장
+        """
+        log_path = os.path.join(self.config.TRADE_LOG_DIR, 'trades.csv')
         
-        self.running = True
-        last_check_minute = None
-        pending_signals = None
+        # DataFrame 생성
+        df_new = pd.DataFrame([trade_info])
+        
+        # 기존 파일이 있으면 추가
+        if os.path.exists(log_path):
+            df_existing = pd.read_csv(log_path)
+            df = pd.concat([df_existing, df_new], ignore_index=True)
+        else:
+            df = df_new
+        
+        # 저장
+        df.to_csv(log_path, index=False)
+    
+    def update_trade_log(self, trade_id, result, profit_loss):
+        """
+        거래 결과 업데이트
+        """
+        from data_merge import DataMerger
+        merger = DataMerger(self.config)
+        merger.update_trade_result(trade_id, result, profit_loss)
+    
+    def save_feature_log(self, features, trade_id):
+        """
+        거래 시점의 피처 저장
+        """
+        # 마지막 행 (현재 시점) 피처만 저장
+        current_features = features.iloc[[-1]].copy()
+        current_features['trade_id'] = trade_id
+        current_features['timestamp'] = datetime.now()
+        
+        # 파일명
+        today = datetime.now().strftime("%Y%m%d")
+        log_path = os.path.join(self.config.FEATURE_LOG_DIR, f'features_{today}.csv')
+        
+        # 기존 파일이 있으면 추가
+        if os.path.exists(log_path):
+            df_existing = pd.read_csv(log_path)
+            df = pd.concat([df_existing, current_features], ignore_index=True)
+        else:
+            df = current_features
+        
+        # 저장
+        df.to_csv(log_path, index=False)
+    
+    def print_performance_summary(self):
+        """
+        성능 요약 출력
+        """
+        print("\n" + "="*50)
+        print("실시간 거래 성능 요약")
+        print("="*50)
+        
+        metrics = self.performance_metrics
+        print(f"총 거래 수: {metrics['total_trades']}")
+        print(f"승: {metrics['wins']} / 패: {metrics['losses']}")
+        
+        if metrics['total_trades'] > 0:
+            win_rate = metrics.get('win_rate', 0)
+            print(f"승률: {win_rate:.2%}")
+        
+        print(f"현재 연승: {metrics['current_streak']}")
+        print(f"최대 연승: {metrics['max_streak']}")
+        print(f"총 손익: ${metrics['total_profit']:.2f}")
+        
+        if metrics['total_trades'] > 0:
+            avg_profit = metrics['total_profit'] / metrics['total_trades']
+            print(f"평균 손익: ${avg_profit:.2f}")
+        
+        print("="*50)
+    
+    def run_live_trading(self, duration_hours=1, trade_interval_minutes=11):
+        """
+        실시간 거래 실행
+        """
+        print(f"\n실시간 거래 시작 (기간: {duration_hours}시간)")
+        print("="*50)
+        
+        self.is_running = True
+        start_time = datetime.now()
+        end_time = start_time + timedelta(hours=duration_hours)
+        
+        # 모델 로드
+        if not self.model_trainer.models:
+            print("모델 로딩 중...")
+            success = self.model_trainer.load_model()
+            if not success:
+                print("모델을 찾을 수 없습니다. 먼저 학습을 진행하세요.")
+                return
+        
+        last_trade_time = None
         
         try:
-            while self.running:
-                try:
-                    current_time = datetime.now()
-                    current_minute = current_time.replace(second=0, microsecond=0)
-                    current_second = current_time.second
-                    
-                    # 최신 데이터 업데이트
-                    if self.client:
-                        klines = self.client.get_klines(symbol=symbol, interval='1m', limit=2)
-                        latest_candle = {
-                            'timestamp': pd.to_datetime(klines[-1][0], unit='ms'),
-                            'open': float(klines[-1][1]), 'high': float(klines[-1][2]), 
-                            'low': float(klines[-1][3]), 'close': float(klines[-1][4]), 
-                            'volume': float(klines[-1][5])
-                        }
-                        
-                        if len(self.data_buffer) == 0 or self.data_buffer[-1]['timestamp'] < latest_candle['timestamp']:
-                            self.data_buffer.append(latest_candle)
-                        elif len(self.data_buffer) > 0 and self.data_buffer[-1]['timestamp'] == latest_candle['timestamp']:
-                            self.data_buffer[-1] = latest_candle
-                        
-                    # 매 분 58~59초: 신호 판단
-                    if 58 <= current_second <= 59:
-                        if last_check_minute is None or current_minute > last_check_minute:
-                            
-                            # 🚨 거래 잠금 상태인 경우 메시지만 출력하고 스킵
-                            if current_time < self.last_lockout_end_time:
-                                lock_remaining = (self.last_lockout_end_time - current_time).total_seconds()
-                                print(f"🚫 [{current_time.strftime('%H:%M:%S')}] 잠금 중 ({lock_remaining:.0f}초 남음)...")
-                                last_check_minute = current_minute
-                                time.sleep(1)
-                                continue
-
-                            print(f"\n{'='*60}")
-                            print(f"🔍 [{current_time.strftime('%H:%M:%S')}] 신호 판단 중...")
-                            
-                            signals, probs, vol_info = self.check_entry_signal()
-                            
-                            # 🚨 잠금 발동 시 루프를 다시 시작
-                            if vol_info and vol_info['status'] == 'LOCKOUT_TRIGGERED':
-                                pending_signals = None
-                                last_check_minute = current_minute
-                                continue
-                            
-                            if vol_info:
-                                atr_pct = vol_info['atr_pct']
-                                status = vol_info['status']
-                                threshold = vol_info['threshold']
-                                
-                                if status == 'BLOCKED':
-                                    print(f"🚫 변동성 과다! ATR: {atr_pct:.4%}")
-                                    pending_signals = None
-                                elif status == 'ADJUSTED':
-                                    print(f"⚠️  변동성 높음! 임계값: {threshold:.2f}")
-                                    pending_signals = signals
-                                else:
-                                    pending_signals = signals
-                            
-                            if signals:
-                                long_prob, short_prob = probs
-                                print(f"✅ 신호 감지! {len(signals)}개")
-                                for idx, signal in enumerate(signals, 1):
-                                    orig = f" ← {signal['original_signal']}" if self.reverse_mode else ""
-                                    print(f"   [{idx}] {signal['direction']}{orig} | 확률: {signal['probability']:.2%}")
-                                print(f"⏳ 다음 봉 open 진입 대기...")
-                            
-                            print(f"{'='*60}")
-                            last_check_minute = current_minute
-                    
-                    # 매 분 정각 0~2초: 진입 실행
-                    elif 0 <= current_second <= 2:
-                        if pending_signals:
-                            # 🚨 진입 직전 잠금 상태 재확인
-                            if datetime.now() < self.last_lockout_end_time:
-                                print(f"🚫 진입 시간 ({current_time.strftime('%H:%M:%S')})에 잠금 상태입니다. 진입 스킵.")
-                                pending_signals = None
-                                time.sleep(1) 
-                                continue
-
-                            print(f"\n💰 [{current_time.strftime('%H:%M:%S')}] 진입 실행!")
-                            
-                            if self.client and len(self.data_buffer) > 0:
-                                entry_price = self.data_buffer[-1]['open'] 
-                                
-                                print(f"   초봉 open 진입가: {entry_price:.2f}")
-                                # 변경: pending_signals 순회 중 최대 활성 포지션 도달하면 중단
-                                for signal in pending_signals:
-                                    if len(self.active_trades) >= self.max_active_trades:
-                                        print(f"⚠️ 더 이상 진입하지 않습니다. 활성 거래 수가 최대({self.max_active_trades})입니다.")
-                                        break
-                                    entered = self.enter_trade(signal, entry_price)
-                                    if not entered:
-                                        break
-                            else:
-                                print("⚠️  API 미연결 또는 데이터 부족 - 진입 스킵")
-                            
-                            pending_signals = None
-                    
-                    # 거래 청산 확인
-                    self.check_exits()
-                    
-                    # 매 분 정각 0~2초: 1분마다 통계 출력 (화면 덮어쓰기 없이 누적)
-                    if 0 <= current_second <= 2:
-                        if last_check_minute is not None and current_minute > last_check_minute:
-                            
-                            print("\n" + "-"*80)
-                            print(f"🕐 {current_time.strftime('%Y-%m-%d %H:%M:%S')} - 실시간 상태")
-                            if len(self.data_buffer) > 0:
-                                print(f"💹 현재가: {self.data_buffer[-1]['close']:.2f}")
-                            
-                            self.print_statistics()
-                            
-                            time.sleep(1) 
-                    
-                except Exception as e:
-                    print(f"❌ 업데이트 오류: {e}")
-                    time.sleep(5) 
+            while datetime.now() < end_time and self.is_running:
+                current_time = datetime.now()
                 
-                time.sleep(check_interval)
+                # 현재 포지션이 없고, 거래 간격이 지났으면 새 거래
+                if self.current_position is None:
+                    if last_trade_time is None or \
+                       (current_time - last_trade_time).total_seconds() >= trade_interval_minutes * 60:
+                        
+                        # 최신 데이터 가져오기
+                        print(f"\n[{current_time.strftime('%H:%M:%S')}] 데이터 수집 중...")
+                        df = self.api_client.get_klines(limit=500)
+                        
+                        # 피처 준비
+                        features = self.prepare_features(df)
+                        
+                        # 예측
+                        prediction, confidence = self.make_prediction(features)
+                        
+                        if prediction is not None:
+                            # 거래 실행
+                            trade_id = self.execute_trade(prediction, confidence)
+                            
+                            # 피처 로그 저장
+                            self.save_feature_log(features, trade_id)
+                            
+                            last_trade_time = current_time
+                
+                # 진행 중인 거래 확인
+                elif self.current_position is not None:
+                    result = self.check_trade_result(self.current_position['trade_id'])
+                    
+                    if result is not None:
+                        # 재학습 필요 확인
+                        if self.check_retrain_needed():
+                            print("\n재학습을 시작합니다...")
+                            # 여기서 main_pipe의 재학습 트리거
+                            self.trigger_retrain()
+                        
+                        # 성능 요약 출력
+                        if self.performance_metrics['total_trades'] % 10 == 0:
+                            self.print_performance_summary()
+                
+                # 대기
+                time.sleep(10)
                 
         except KeyboardInterrupt:
-            print("\n\n🛑 거래 중단")
-            self.running = False
-            self.print_statistics()
+            print("\n거래 중단...")
+        finally:
+            self.is_running = False
+            self.print_performance_summary()
+    
+    def trigger_retrain(self):
+        """
+        재학습 트리거
+        """
+        # 재학습 플래그 파일 생성
+        flag_path = os.path.join(self.config.BASE_DIR, '.retrain_required')
+        with open(flag_path, 'w') as f:
+            f.write(datetime.now().isoformat())
+        
+        print("재학습 플래그 설정 완료")
+    
+    def backtest(self, historical_data, start_date=None, end_date=None):
+        """
+        백테스팅
+        """
+        print("\n백테스팅 시작...")
+        
+        # 데이터 필터링
+        if start_date:
+            historical_data = historical_data[historical_data['timestamp'] >= start_date]
+        if end_date:
+            historical_data = historical_data[historical_data['timestamp'] <= end_date]
+        
+        # 피처 생성
+        from model_train import FeatureEngineer
+        feature_engineer = FeatureEngineer()
+        features = feature_engineer.create_feature_pool(historical_data)
+        target = feature_engineer.create_target(historical_data, window=self.config.PREDICTION_WINDOW)
+        
+        # 유효 데이터만 사용
+        valid_idx = target.notna()
+        features = features[valid_idx]
+        target = target[valid_idx]
+        
+        # 거래 시뮬레이션
+        trades = []
+        for i in range(len(features) - self.config.PREDICTION_WINDOW):
+            # 현재 시점까지의 데이터로 예측
+            X_current = features.iloc[[i]]
+            
+            # 예측
+            pred_proba = self.model_trainer.predict_proba(X_current)[0]
+            prediction = 1 if pred_proba > 0.5 else 0
+            
+            # 실제 결과
+            actual = target.iloc[i]
+            
+            # 거래 기록
+            trades.append({
+                'timestamp': historical_data['timestamp'].iloc[i],
+                'prediction': prediction,
+                'actual': actual,
+                'confidence': pred_proba,
+                'correct': prediction == actual
+            })
+        
+        # 결과 분석
+        trades_df = pd.DataFrame(trades)
+        
+        total_trades = len(trades_df)
+        correct_trades = trades_df['correct'].sum()
+        win_rate = correct_trades / total_trades if total_trades > 0 else 0
+        
+        # 수익 계산
+        wins = trades_df['correct'].sum()
+        losses = (~trades_df['correct']).sum()
+        profit = (wins * 100 * self.config.WIN_RATE) - (losses * 100)
+        
+        print(f"\n백테스팅 결과:")
+        print(f"- 기간: {trades_df['timestamp'].min()} ~ {trades_df['timestamp'].max()}")
+        print(f"- 총 거래: {total_trades}")
+        print(f"- 승: {wins} / 패: {losses}")
+        print(f"- 승률: {win_rate:.2%}")
+        print(f"- 총 손익: ${profit:.2f}")
+        print(f"- 평균 손익: ${profit/total_trades if total_trades > 0 else 0:.2f}")
+        
+        return trades_df
 
-def main():
-    """메인 실행 함수"""
-    import sys
-    
-    # 1. 모델 경로 설정
-    if len(sys.argv) > 1:
-        model_path = sys.argv[1]
-    else:
-        model_path = 'model/rsi_price_action_v3_20251016_131305.pkl' 
-    
-    # 2. 임계값 오버라이드
-    threshold_override = None
-    if len(sys.argv) > 2:
-        threshold_override = float(sys.argv[2])
-    
-    # 3. 역발상 모드 설정
-    reverse_mode = False 
-    if len(sys.argv) > 3:
-        reverse_mode = sys.argv[3].lower() in ['true', '1', 'yes', 'reverse']
-    
-    try:
-        system = StrategyTradingSystem(
-            model_path, 
-            threshold_override,
-            reverse_mode=reverse_mode
-        )
-        
-        if not system.fetch_initial_data('BTCUSDT'):
-            print("API 연결 문제 또는 초기 데이터 로드 실패로 시스템을 종료합니다.")
-            return
-        
-        system.run_realtime(symbol='BTCUSDT', check_interval=1)
-        
-    except Exception as e:
-        print(f"❌ 시스템 오류: {e}")
-        import traceback
-        traceback.print_exc()
 
+class TradingMonitor:
+    """거래 모니터링 클래스"""
+    
+    def __init__(self, config):
+        self.config = config
+    
+    def analyze_recent_trades(self, days=7):
+        """
+        최근 거래 분석
+        """
+        from data_merge import DataMerger
+        merger = DataMerger(self.config)
+        trades = merger.load_trade_logs()
+        
+        if trades.empty:
+            print("거래 기록이 없습니다.")
+            return None
+        
+        # 최근 N일 필터링
+        cutoff = datetime.now() - timedelta(days=days)
+        if 'entry_time' in trades.columns:
+            trades['entry_time'] = pd.to_datetime(trades['entry_time'])
+            recent_trades = trades[trades['entry_time'] >= cutoff]
+        else:
+            recent_trades = trades
+        
+        if recent_trades.empty:
+            print(f"최근 {days}일간 거래 기록이 없습니다.")
+            return None
+        
+        # 통계 계산
+        stats = {
+            'total_trades': len(recent_trades),
+            'wins': (recent_trades['result'] == 1).sum() if 'result' in recent_trades.columns else 0,
+            'losses': (recent_trades['result'] == 0).sum() if 'result' in recent_trades.columns else 0,
+            'total_profit': recent_trades['profit_loss'].sum() if 'profit_loss' in recent_trades.columns else 0
+        }
+        
+        if stats['total_trades'] > 0:
+            stats['win_rate'] = stats['wins'] / stats['total_trades']
+            stats['avg_profit'] = stats['total_profit'] / stats['total_trades']
+        
+        # 시간대별 분석
+        if 'entry_time' in recent_trades.columns:
+            recent_trades['hour'] = recent_trades['entry_time'].dt.hour
+            hourly_stats = recent_trades.groupby('hour').agg({
+                'result': ['count', 'mean']
+            }).round(3)
+            stats['hourly_performance'] = hourly_stats
+        
+        return stats
+    
+    def generate_report(self):
+        """
+        종합 리포트 생성
+        """
+        print("\n" + "="*60)
+        print("거래 시스템 종합 리포트")
+        print("="*60)
+        
+        # 7일 통계
+        week_stats = self.analyze_recent_trades(7)
+        if week_stats:
+            print("\n[최근 7일 성과]")
+            print(f"총 거래: {week_stats['total_trades']}")
+            print(f"승/패: {week_stats['wins']}/{week_stats['losses']}")
+            print(f"승률: {week_stats.get('win_rate', 0):.2%}")
+            print(f"총 손익: ${week_stats['total_profit']:.2f}")
+            print(f"평균 손익: ${week_stats.get('avg_profit', 0):.2f}")
+        
+        # 30일 통계
+        month_stats = self.analyze_recent_trades(30)
+        if month_stats:
+            print("\n[최근 30일 성과]")
+            print(f"총 거래: {month_stats['total_trades']}")
+            print(f"승/패: {month_stats['wins']}/{month_stats['losses']}")
+            print(f"승률: {month_stats.get('win_rate', 0):.2%}")
+            print(f"총 손익: ${month_stats['total_profit']:.2f}")
+            print(f"평균 손익: ${month_stats.get('avg_profit', 0):.2f}")
+        
+        print("\n" + "="*60)
+
+
+# 사용 예시
 if __name__ == "__main__":
-    main()
+    from config import Config
+    from model_train import ModelTrainer
+    
+    # 설정 초기화
+    Config.create_directories()
+    
+    # 모델 로드
+    trainer = ModelTrainer(Config)
+    trainer.load_model()
+    
+    # 실시간 거래 시작
+    trader = RealTimeTrader(Config, trainer)
+    
+    # 백테스팅 (옵션)
+    # trader.backtest(historical_data, start_date, end_date)
+    
+    # 실시간 거래 실행
+    trader.run_live_trading(duration_hours=1, trade_interval_minutes=11)
