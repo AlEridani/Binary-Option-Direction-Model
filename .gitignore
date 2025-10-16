@@ -1,0 +1,30 @@
+# Python 컴파일 파일 및 환경
+__pycache__/
+*.pyc
+*.pyd
+
+# 가상 환경 폴더 (Python Virtual Environment)
+env/
+venv/
+.venv/
+.conda/
+.direnv/
+
+# 로그 파일
+log/
+*.log
+
+# 모델 파일 및 결과 데이터 (용량이 크므로 제외)
+models/
+result/
+
+# 데이터 및 테스트 폴더 (데이터 자체는 저장소에 올리지 않음)
+1m/
+test1m/
+
+# IDE/에디터 특정 파일 (VS Code)
+.vscode/
+
+# 운영체제 파일
+.DS_Store
+Thumbs.db

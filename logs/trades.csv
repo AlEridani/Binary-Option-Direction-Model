@@ -1,0 +1,3 @@
+entry_time,entry_price,signal_type,prediction,probability,strategy,exit_time,exit_price,return,result
+2025-10-11 06:31:00,112602.74,SHORT,1,61.172196111868125,cross_touch_long_short,,,,
+2025-10-11 06:34:00,112343.89,SHORT,1,66.46003108638598,cross_touch_long_short,,,,
