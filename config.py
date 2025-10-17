@@ -12,13 +12,16 @@ class Config:
     FEATURE_LOG_DIR = os.path.join(BASE_DIR, 'feature_log')
     TRADE_LOG_DIR = os.path.join(BASE_DIR, 'trade_log')
     RESULT_DIR = os.path.join(BASE_DIR, 'result')
-    
+    BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY')
+    BINANCE_API_SECRET = os.environ.get('BINANCE_API_SECRET')    
     # 모델 설정
     PREDICTION_WINDOW = 10  # 10분 예측
     WIN_RATE = 0.80  # 10분 승리시 80% 수익
     TARGET_WIN_RATE = 0.60  # 목표 승률 60%
     RETRAIN_THRESHOLD = 0.55  # 55% 미만시 재학습
     EVALUATION_WINDOW = 50  # 50번 거래마다 평가
+    CONF_THRESHOLD = 0.60       # 신뢰도 임계값(60%)
+    MAX_CONCURRENT_POS = 5      # 동시 포지션 최대 5
     
     # 학습 설정
     INITIAL_TRAIN_MONTHS = 8  # 초기 학습: 8개월
