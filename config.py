@@ -22,7 +22,9 @@ class Config:
     EVALUATION_WINDOW = 50  # 50번 거래마다 평가
     CONF_THRESHOLD = 0.60       # 신뢰도 임계값(60%)
     MAX_CONCURRENT_POS = 5      # 동시 포지션 최대 5
-    
+    ENTRY_COOLDOWN_SEC = 60    # 진입 최소 간격(초) - 텀 제어
+    ENTRY_CONF_THRESHOLD = 0.60
+
     # 학습 설정
     INITIAL_TRAIN_MONTHS = 8  # 초기 학습: 8개월
     INITIAL_TEST_MONTHS = 1   # 초기 검증: 1개월
