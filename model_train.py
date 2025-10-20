@@ -327,6 +327,9 @@ class ModelTrainer:
         self.selected_features = None
         self.calibrator = None
         self.calib_method = 'isotonic'
+        
+        # 진행 상황 콜백
+        self._progress_callback = None
 
     def _regime_to_name(self, regime_val: int) -> str:
         if regime_val == 1:
@@ -371,6 +374,15 @@ class ModelTrainer:
         min_len = min(len(X), len(y))
         X = X.iloc[:min_len]
         y = y.iloc[:min_len]
+
+        # ★ regime 정보 없는 데이터 제외
+        if regime_col in X.columns:
+            valid_mask = X[regime_col].notna()
+            excluded = (~valid_mask).sum()
+            if excluded > 0:
+                print(f"\nℹ️  레짐 정보 없는 데이터 {excluded:,}건 제외 (피처 선택)")
+                X = X[valid_mask].reset_index(drop=True)
+                y = y[valid_mask].reset_index(drop=True)
 
         all_selected = set()
 
@@ -501,7 +513,7 @@ class ModelTrainer:
 
     # --- 레짐별 학습 ---
     def train_ensemble_regime(self, X, y, regime_col='regime', test_size=0.2):
-        """레짐별 독립 학습"""
+        """레짐별 독립 학습 - 시간 갭 추가"""
         if regime_col not in X.columns:
             return self.train_ensemble_temporal(X, y, test_size)
 
@@ -513,6 +525,16 @@ class ModelTrainer:
         X = X.iloc[:min_len]
         y = y.iloc[:min_len]
 
+        # ★ regime 정보 없는 레거시 데이터 필터링
+        if regime_col in X.columns:
+            valid_regime_mask = X[regime_col].notna()
+            invalid_count = (~valid_regime_mask).sum()
+            
+            if invalid_count > 0:
+                print(f"\nℹ️  레짐 정보 없는 레거시 데이터 {invalid_count:,}건 제외")
+                X = X[valid_regime_mask].reset_index(drop=True)
+                y = y[valid_regime_mask].reset_index(drop=True)
+
         if not self.selected_features:
             self.selected_features = [c for c in X.columns if c not in ['timestamp', 'regime', 'htf_regime']][:50]
 
@@ -523,8 +545,12 @@ class ModelTrainer:
             print(f"\n{'='*60}")
             print(f"레짐 {rname} ({rval}) 학습 시작")
             print(f"{'='*60}")
+            
+            # 진행 상황 콜백 호출
+            if self._progress_callback:
+                self._progress_callback(rname)
 
-            mask = (X[regime_col] == rval).values  # .values로 numpy array 변환
+            mask = (X[regime_col] == rval).values
             Xr = X[mask].copy()
             yr = y[mask].copy()
 
@@ -533,7 +559,6 @@ class ModelTrainer:
                 self.bundles[rname] = None
                 continue
 
-            # 인덱스 리셋
             Xr = Xr.reset_index(drop=True)
             yr = yr.reset_index(drop=True)
 
@@ -541,19 +566,27 @@ class ModelTrainer:
             Xs = _safe_prep(Xs)
 
             total = len(Xs)
-            val_size = int(total * test_size)
-            train_size = total - 2 * val_size
+            
+            # ★ 시간 갭 추가
+            train_ratio = 0.60
+            gap_ratio = 0.10
+            val_ratio = 0.10
+            # test는 나머지 (0.20)
+            
+            train_end = int(total * train_ratio)
+            gap_end = int(total * (train_ratio + gap_ratio))
+            val_end = int(total * (train_ratio + gap_ratio + val_ratio))
 
-            if train_size <= 50:
-                print(f"  train 샘플 부족 → 스킵")
+            if train_end < 50 or (val_end - gap_end) < 20 or (total - val_end) < 20:
+                print(f"  분할 후 샘플 부족 → 스킵")
                 self.bundles[rname] = None
                 continue
 
-            X_tr, y_tr = Xs.iloc[:train_size], yr.iloc[:train_size]
-            X_va, y_va = Xs.iloc[train_size:train_size+val_size], yr.iloc[train_size:train_size+val_size]
-            X_te, y_te = Xs.iloc[train_size+val_size:], yr.iloc[train_size+val_size:]
+            X_tr, y_tr = Xs.iloc[:train_end], yr.iloc[:train_end]
+            X_va, y_va = Xs.iloc[gap_end:val_end], yr.iloc[gap_end:val_end]
+            X_te, y_te = Xs.iloc[val_end:], yr.iloc[val_end:]
 
-            print(f"  데이터 분할: train={len(X_tr)}, val={len(X_va)}, test={len(X_te)}")
+            print(f"  데이터 분할: train={len(X_tr)}, GAP={gap_end-train_end}, val={len(X_va)}, test={len(X_te)}")
 
             X_tr, y_tr = X_tr.reset_index(drop=True), y_tr.reset_index(drop=True)
             X_va, y_va = X_va.reset_index(drop=True), y_va.reset_index(drop=True)
@@ -661,7 +694,7 @@ class ModelTrainer:
             for split, m in metrics.items():
                 print(f"  {split}: acc={m['accuracy']:.4f}, win={m['win_rate']:.4f}")
 
-        # Legacy 호환: FLAT 번들을 기본으로
+        # Legacy 호환
         if self.bundles['FLAT'] is not None:
             self.models = self.bundles['FLAT']['models']
             self.scaler = self.bundles['FLAT']['scaler']
@@ -1068,12 +1101,34 @@ class ModelOptimizer:
     def __init__(self, config):
         self.config = config
         self.trainer = ModelTrainer(config)
+        self.progress_file = os.path.join(config.BASE_DIR, '.retrain_progress.json')
+
+    def update_progress(self, step_num, total_steps, current_step, regime=''):
+        """재학습 진행 상황 업데이트"""
+        try:
+            progress = {
+                'status': 'training',
+                'step_num': step_num,
+                'total_steps': total_steps,
+                'current_step': current_step,
+                'regime': regime,
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            }
+            with open(self.progress_file, 'w', encoding='utf-8') as f:
+                json.dump(progress, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     def initial_training(self, df):
         print("="*60)
         print("초기 학습 시작 (레짐별 스위칭 모델)")
         print("="*60)
 
+        total_steps = 5  # 전체 단계 수
+        
+        # Step 1: 데이터 준비
+        self.update_progress(1, total_steps, "데이터 준비 중")
+        
         if 'timestamp' in df.columns:
             df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
             print(f"기간: {df['timestamp'].min()} ~ {df['timestamp'].max()}")
@@ -1086,19 +1141,37 @@ class ModelOptimizer:
         X, y = X[valid], y[valid]
         print(f"유효 샘플: {len(X)}")
 
+        # Step 2: 미래 누출 점검
+        self.update_progress(2, total_steps, "미래 누출 점검 중")
+        
         print("\n미래 누출 점검...")
         if not fe.validate_no_future_leak(X, y):
             print("⚠️ 누출 의심 존재")
         else:
             print("✓ 누출 없음")
 
+        # Step 3: 피처 선택
+        self.update_progress(3, total_steps, "레짐별 피처 선택 중")
+        
         print("\n레짐별 피처 선택...")
         topk = int(getattr(self.config, 'TOP_K_FEATURES', 30))
         self.trainer.feature_selection_regime(X, y, regime_col='regime', top_k=topk)
 
+        # Step 4: 학습 + 캘리브레이션
+        self.update_progress(4, total_steps, "레짐별 모델 학습 중")
+        
         print("\n레짐별 학습 + 캘리브레이션...")
+        
+        # 학습 중 진행 상황 업데이트를 위해 trainer에 progress callback 전달
+        self.trainer._progress_callback = lambda regime: self.update_progress(
+            4, total_steps, f"레짐별 모델 학습 중", regime
+        )
+        
         metrics = self.trainer.train_ensemble_regime(X, y, regime_col='regime', test_size=0.2)
 
+        # Step 5: 저장
+        self.update_progress(5, total_steps, "모델 저장 중")
+        
         print("\n전체 결과:")
         for regime_name, regime_metrics in metrics.items():
             print(f"\n[{regime_name}]")
@@ -1124,10 +1197,21 @@ class ModelOptimizer:
             index=False
         )
         
+        # 완료 플래그 생성
+        flag_path = os.path.join(self.config.BASE_DIR, '.retrain_complete')
+        with open(flag_path, 'w', encoding='utf-8') as f:
+            f.write(datetime.now(timezone.utc).isoformat())
+        
         return metrics
 
     def retrain_model(self, new_df):
         print("\n재학습 시작 (레짐별)...")
+        
+        total_steps = 6
+        
+        # Step 1: 데이터 준비
+        self.update_progress(1, total_steps, "데이터 준비 중")
+        
         if 'timestamp' in new_df.columns:
             new_df['timestamp'] = pd.to_datetime(new_df['timestamp'], utc=True)
 
@@ -1138,29 +1222,55 @@ class ModelOptimizer:
         valid = y.notna() & (y.index >= 200)
         X, y = X[valid], y[valid]
 
+        # Step 2: 기존 모델 로드
+        self.update_progress(2, total_steps, "기존 모델 로드 중")
+        
         old = ModelTrainer(self.config)
         old.load_model()
 
+        # Step 3: 새 모델 학습
+        self.update_progress(3, total_steps, "새 모델 학습 중")
+        
         new = ModelTrainer(self.config)
         new.selected_features = old.selected_features
+        
+        # 진행 상황 콜백 설정
+        new._progress_callback = lambda regime: self.update_progress(
+            3, total_steps, f"새 모델 학습 중", regime
+        )
 
         new_metrics = new.train_ensemble_regime(X, y, regime_col='regime', test_size=0.2)
 
+        # Step 4: 모델 비교
+        self.update_progress(4, total_steps, "모델 성능 비교 중")
+        
         n = len(X)
         if n > 0:
             start = int(n * 0.9)
-            X_te, y_te = X.iloc[start:], y.iloc[start:]
+            X_te = X.iloc[start:].reset_index(drop=True)
+            y_te = y.iloc[start:].reset_index(drop=True)
             
             regime_accs = {'old': {}, 'new': {}}
             
             for rval in [1, -1, 0]:
                 rname = self.trainer._regime_to_name(rval)
-                mask = (X_te['regime'] == rval)
+                
+                # numpy array로 변환 후 적용
+                mask = (X_te['regime'] == rval).values
                 if mask.sum() < 10:
                     continue
-                    
-                X_r = X_te[mask]
-                y_r = y_te[mask]
+                
+                # 마스크 적용 후 즉시 인덱스 리셋
+                X_r = X_te[mask].reset_index(drop=True)
+                y_r = y_te[mask].reset_index(drop=True)
+                
+                # 길이 확인 및 맞추기
+                min_len = min(len(X_r), len(y_r))
+                X_r = X_r.iloc[:min_len]
+                y_r = y_r.iloc[:min_len]
+                
+                if len(X_r) < 10:
+                    continue
                 
                 old_pred = old.predict(X_r, regime=rval)
                 new_pred = new.predict(X_r, regime=rval)
@@ -1180,6 +1290,9 @@ class ModelOptimizer:
             old_avg = np.mean(list(regime_accs['old'].values())) if regime_accs['old'] else 0
             new_avg = np.mean(list(regime_accs['new'].values())) if regime_accs['new'] else 0
 
+            # Step 5: 모델 저장
+            self.update_progress(5, total_steps, "모델 저장 중")
+            
             if new_avg > old_avg:
                 print("→ 새 모델 채택")
                 bkp = os.path.join(self.config.MODEL_DIR,
@@ -1191,6 +1304,14 @@ class ModelOptimizer:
             else:
                 print("→ 기존 모델 유지")
                 self.trainer = old
+
+        # Step 6: 완료
+        self.update_progress(6, total_steps, "재학습 완료")
+        
+        # 완료 플래그 생성
+        flag_path = os.path.join(self.config.BASE_DIR, '.retrain_complete')
+        with open(flag_path, 'w', encoding='utf-8') as f:
+            f.write(datetime.now(timezone.utc).isoformat())
 
         return new_metrics
 

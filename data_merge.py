@@ -1,4 +1,4 @@
-# data_merge.py - 데이터 병합 및 관리 모듈 (UTC & ts_min 안전, 거래/피처만 있어도 병합 가능)
+# data_merge.py - 데이터 병합 및 관리 모듈 (UTC & ts_min 안전, 거래/피처만 있어도 병합 가능, regime 지원)
 
 import pandas as pd
 import numpy as np
@@ -97,13 +97,29 @@ class DataMerger:
         return merged_df
 
     def load_trade_logs(self):
-        """거래 로그 로드 (UTC 변환), ts_min은 병합 시 통일 생성"""
+        """
+        거래 로그 로드 (UTC 변환, regime 컬럼 처리)
+        - regime 컬럼이 없으면 추가 (레거시 데이터 대응)
+        - ts_min은 병합 시 통일 생성
+        """
         path = os.path.join(self.config.TRADE_LOG_DIR, 'trades.csv')
         if not os.path.exists(path):
             return pd.DataFrame()
 
         df = pd.read_csv(path)
         df = self._dedup_columns(df)
+
+        # ★ regime 컬럼 처리 (없으면 추가)
+        if 'regime' not in df.columns:
+            df['regime'] = pd.NA
+            print("ℹ️  레거시 데이터: regime 컬럼 추가 (NaN)")
+        else:
+            # regime 컬럼이 있어도 숫자형으로 변환
+            df['regime'] = pd.to_numeric(df['regime'], errors='coerce')
+
+        # ★ p_up 컬럼도 숫자형으로 변환 (있으면)
+        if 'p_up' in df.columns:
+            df['p_up'] = pd.to_numeric(df['p_up'], errors='coerce')
 
         if 'entry_time' in df.columns:
             df['entry_time'] = self._to_utc_series(df['entry_time'])
@@ -112,6 +128,7 @@ class DataMerger:
 
         if 'ts_min' in df.columns:
             df = df.drop(columns=['ts_min'])
+        
         return df
 
     def load_feature_logs(self):
@@ -149,6 +166,7 @@ class DataMerger:
         - 가격/거래/피처 각각에서 ts_min 생성(1회) 후 병합
         - 가격 데이터가 없어도 거래/피처만으로 병합 가능
         - 최종 timestamp는 (가능하면) 가격의 timestamp, 없으면 ts_min
+        - ★ regime 컬럼 포함 통계 출력
         """
         print("데이터 병합 시작...")
 
@@ -200,19 +218,78 @@ class DataMerger:
         merged = self._dedup_columns(merged).sort_values('ts_min')
         self.merged_data = merged
 
-        # 통계 출력
-        print("\n병합 완료:")
-        print(f"- 전체 레코드 수: {len(merged)}")
+        # ★ 통계 출력 (regime 포함)
+        print("\n" + "="*60)
+        print("병합 완료:")
+        print("="*60)
+        print(f"- 전체 레코드 수: {len(merged):,}")
         print(f"- 시작 시간: {merged['timestamp'].min()}")
         print(f"- 종료 시간: {merged['timestamp'].max()}")
 
         if 'trade_id' in merged.columns:
             tc = merged['trade_id'].notna().sum()
-            print(f"- 거래 기록 수: {tc}")
+            print(f"- 거래 기록 수: {tc:,}")
+            
             if 'result' in merged.columns:
                 wr = merged['result'].dropna()
                 if not wr.empty:
-                    print(f"- 승률: {wr.mean()*100:.2f}%")
+                    wins = (wr == 1).sum()
+                    total = len(wr)
+                    print(f"- 승률: {wr.mean()*100:.2f}% ({wins}/{total})")
+            
+            # ★ 레짐 분포 통계
+            if 'regime' in merged.columns:
+                print("\n[레짐 분포]")
+                regime_data = merged[merged['trade_id'].notna()]['regime']
+                
+                regime_labels = {
+                    0.0: "UP 트렌드 🟢",
+                    1.0: "DOWN 트렌드 🔴",
+                    2.0: "FLAT 횡보 ⚪"
+                }
+                
+                total_with_regime = regime_data.notna().sum()
+                total_without_regime = regime_data.isna().sum()
+                
+                if total_with_regime > 0:
+                    regime_counts = regime_data.value_counts().sort_index()
+                    for regime_val, count in regime_counts.items():
+                        regime_name = regime_labels.get(regime_val, f"REGIME-{int(regime_val)}")
+                        pct = (count / total_with_regime) * 100
+                        print(f"  {regime_name:20s}: {count:4d}건 ({pct:5.1f}%)")
+                
+                if total_without_regime > 0:
+                    print(f"  {'레거시 (N/A)':20s}: {total_without_regime:4d}건")
+                
+                # ★ 레짐별 승률 (result가 있으면)
+                if 'result' in merged.columns:
+                    print("\n[레짐별 승률]")
+                    regime_result = merged[merged['regime'].notna() & merged['result'].notna()]
+                    
+                    if len(regime_result) > 0:
+                        for regime_val in sorted(regime_result['regime'].unique()):
+                            regime_mask = regime_result['regime'] == regime_val
+                            regime_subset = regime_result[regime_mask]
+                            
+                            wins = (regime_subset['result'] == 1).sum()
+                            total = len(regime_subset)
+                            win_rate = wins / total if total > 0 else 0
+                            
+                            regime_name = regime_labels.get(regime_val, f"REGIME-{int(regime_val)}")
+                            
+                            # 승률에 따른 이모지
+                            if win_rate >= 0.60:
+                                emoji = "🔥"
+                            elif win_rate >= 0.55:
+                                emoji = "✅"
+                            elif win_rate >= 0.50:
+                                emoji = "⚠️"
+                            else:
+                                emoji = "❌"
+                            
+                            print(f"  {regime_name:20s}: {win_rate*100:5.1f}% ({wins:3d}/{total:3d}) {emoji}")
+
+        print("="*60 + "\n")
 
         return merged
 
@@ -289,6 +366,7 @@ class DataMerger:
         - 최근 N일 필터
         - FeatureEngineer로 feature/target 생성
         - (옵션) 클래스 밸런싱 + 디듀프 적용
+        - ★ regime 컬럼 보존
         """
         latest_path = os.path.join(self.config.RESULT_DIR, 'training_data.pkl')
         if os.path.exists(latest_path):
@@ -337,6 +415,15 @@ class DataMerger:
 
         X_final = tmp[feat_cols].copy()
         y_final = tmp['target'].copy()
+        
+        # ★ regime 컬럼 통계 출력
+        if 'regime' in X_final.columns:
+            regime_with_data = X_final['regime'].notna().sum()
+            regime_without_data = X_final['regime'].isna().sum()
+            print(f"\n[학습 데이터 레짐 정보]")
+            print(f"  레짐 정보 있음: {regime_with_data:,}건")
+            print(f"  레짐 정보 없음: {regime_without_data:,}건 (레거시)")
+        
         return X_final, y_final
 
     def update_trade_result(self, trade_id, result, profit_loss):
@@ -355,7 +442,7 @@ class DataMerger:
             df.loc[mask, 'result'] = result
             df.loc[mask, 'profit_loss'] = profit_loss
             df.loc[mask, 'exit_time'] = datetime.now(timezone.utc).isoformat()
-            df.to_csv(path, index=False)
+            df.to_csv(path, index=False, encoding='utf-8-sig')
             print(f"거래 {trade_id} 결과 업데이트 완료")
             return True
         return False
@@ -380,7 +467,7 @@ class DataMerger:
 
         merged = merged.sort_values('timestamp').drop_duplicates(subset=['ts_min'], keep='last')
         merged = merged.drop(columns=['ts_min'], errors='ignore')
-        merged.to_csv(fp, index=False)
+        merged.to_csv(fp, index=False, encoding='utf-8-sig')
         print(f"가격 데이터 추가 완료: {len(new_data)} 레코드")
         return True
 
@@ -412,9 +499,9 @@ class DataMerger:
                 if not old.empty:
                     archive = os.path.join(self.config.TRADE_LOG_DIR,
                                            f'trades_archive_{cutoff.strftime("%Y%m%d")}.csv')
-                    old.to_csv(archive, index=False)
+                    old.to_csv(archive, index=False, encoding='utf-8-sig')
                     df = df[df['entry_time'] >= cutoff_utc]
-                    df.to_csv(trade_log, index=False)
+                    df.to_csv(trade_log, index=False, encoding='utf-8-sig')
                     print(f"거래 로그 아카이브 완료: {len(old)} 레코드")
 
 
@@ -453,9 +540,9 @@ class DataValidator:
 
     @staticmethod
     def validate_trade_logs(df):
-        """거래 로그 검증 (현재 스키마: direction 사용)"""
+        """거래 로그 검증 (현재 스키마: direction 사용, regime 선택적)"""
         issues = []
-        required = ['trade_id', 'entry_time', 'direction']  # ★ prediction → direction
+        required = ['trade_id', 'entry_time', 'direction']
         missing = [c for c in required if c not in df.columns]
         if missing:
             issues.append(f"누락된 컬럼: {missing}")
@@ -469,6 +556,14 @@ class DataValidator:
             bad = df[~df['direction'].isin([0, 1])]
             if not bad.empty:
                 issues.append(f"잘못된 direction 값: {len(bad)} 레코드")
+        
+        # ★ regime 검증 (선택적)
+        if 'regime' in df.columns:
+            regime_data = df['regime'].dropna()
+            if len(regime_data) > 0:
+                bad_regime = regime_data[~regime_data.isin([0, 1, 2])]
+                if not bad_regime.empty:
+                    issues.append(f"잘못된 regime 값: {len(bad_regime)} 레코드")
 
         return len(issues) == 0, issues
 
@@ -480,9 +575,9 @@ if __name__ == "__main__":
     merger = DataMerger(Config)
 
     merged = merger.merge_all_data()
-    merged = merged.dropna(subset=['open','high','low','close','volume'])
-
+    
     if merged is not None:
+        merged = merged.dropna(subset=['open','high','low','close','volume'])
         merger.save_merged_data()
 
         X, y = merger.get_training_data(lookback_days=30)

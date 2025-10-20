@@ -101,7 +101,7 @@ class RealTimeTrader:
         # 거래 상태
         self.is_running = False
         self.active_positions = {}           # trade_id -> position dict
-        self.max_positions = 5               # 동시 최대 포지션
+        self.max_positions = 999             # 데이터 수집용 무제한
         self.trade_history = deque(maxlen=self.config.EVALUATION_WINDOW)
 
         # 재학습 관련
@@ -295,22 +295,32 @@ class RealTimeTrader:
         return self.config.WIN_RATE if hit else -1.0
 
     def execute_trade(self, side, p_up, amount=100):
-        """거래 실행"""
+        """거래 실행 - 레짐 정보 포함"""
         if len(self.active_positions) >= self.max_positions:
             return None
 
         trade_id = str(uuid.uuid4())[:8]
         entry_time = datetime.now(timezone.utc)
-        expiry_time = entry_time + timedelta(minutes=self.config.PREDICTION_WINDOW)  # ★ 칼만기
+        expiry_time = entry_time + timedelta(minutes=self.config.PREDICTION_WINDOW)
         entry_price = self.api_client.get_current_price()
+        
+        # ★ 현재 레짐 정보 추출
+        try:
+            df = self.api_client.get_klines(limit=500)
+            features = self.prepare_features(df)
+            current_regime = int(features['regime'].iloc[-1]) if 'regime' in features.columns else None
+        except Exception as e:
+            print(f"⚠️ 레짐 정보 추출 실패: {e}")
+            current_regime = None
 
         info = {
             'trade_id': trade_id,
             'entry_time': entry_time.isoformat(),
-            'expiry_time': expiry_time.isoformat(),        # ★ 로그/기록용
+            'expiry_time': expiry_time.isoformat(),
             'entry_price': entry_price,
             'direction': int(side),                         # 1=LONG, 0=SHORT
-            'p_up': float(p_up),                            # 기록용 (캘리 확률)
+            'p_up': float(p_up),                            # 예측 확률
+            'regime': current_regime,                        # ★ 레짐 정보 (0:UP, 1:DOWN, 2:FLAT)
             'amount': amount,
             'status': 'open'
         }
@@ -326,6 +336,10 @@ class RealTimeTrader:
         # 알림 로그
         direction = "롱 (UP)" if side == 1 else "숏 (DOWN)"
         emoji = "🟢⬆️" if side == 1 else "🔴⬇️"
+        
+        # 레짐 표시
+        regime_labels = {0: "UP 트렌드🟢", 1: "DOWN 트렌드🔴", 2: "FLAT 횡보⚪", None: "알 수 없음❓"}
+        regime_text = regime_labels.get(current_regime, f"REGIME-{current_regime}")
 
         print("\n" + "="*70)
         print("🔔" * 35)
@@ -336,6 +350,7 @@ class RealTimeTrader:
         print(f"  ⏰ 진입 시간   : {entry_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
         print(f"  ⏱️  만기 시간   : {expiry_time.strftime('%H:%M:%S')} UTC ({self.config.PREDICTION_WINDOW}분 후, 칼만기)")
         print(f"  📊 방향        : {direction} {emoji}")
+        print(f"  🎯 레짐        : {regime_text}")  # ★ 레짐 정보 표시
         print(f"  📈 P(UP)       : {p_up:.2%}")
         print(f"  💰 진입가      : ${entry_price:,.2f}")
         print(f"  💵 배팅 금액   : ${amount}")
@@ -391,6 +406,10 @@ class RealTimeTrader:
         actual_dir = "상승" if exit_price > entry_price else "하락"
         result_emoji = "✅ 승리!" if result == 1 else "❌ 패배"
         result_color = "🟢" if result == 1 else "🔴"
+        
+        # 레짐 정보
+        regime_labels = {0: "UP🟢", 1: "DOWN🔴", 2: "FLAT⚪", None: "N/A"}
+        regime_text = regime_labels.get(pos.get('regime'), "N/A")
 
         print("\n" + "="*70)
         print(f"{result_color} 거래 청산: {trade_id}")
@@ -398,6 +417,7 @@ class RealTimeTrader:
         print(f"  ⏰ 진입시각    : {entry_time.strftime('%H:%M:%S')} UTC")
         print(f"  ⏱️  만기시각    : {expiry_time.strftime('%H:%M:%S')} UTC  (칼만기)")
         print(f"  ⏳ 청산시각    : {now.strftime('%H:%M:%S')} UTC")
+        print(f"  🎯 레짐        : {regime_text}")  # ★ 레짐 정보 표시
         print(f"  📊 예측 방향   : {'롱 (UP)' if direction==1 else '숏 (DOWN)'}")
         print(f"  📈 실제 방향   : {actual_dir}")
         print(f"  💰 진입가      : ${entry_price:,.2f}")
@@ -494,12 +514,19 @@ class RealTimeTrader:
 
     # ---------- 로깅/저장 ----------
     def save_trade_log(self, trade_info):
-        """거래 로그 저장 (append) — expiry_time/exit_time 컬럼 포함 권장"""
-        log_path = os.path.join(self.config.TRADE_LOG_DIR, 'trades.csv')
-        os.makedirs(self.config.TRADE_LOG_DIR, exist_ok=True)
-        df_new = pd.DataFrame([trade_info])
-        write_header = not os.path.exists(log_path)
-        df_new.to_csv(log_path, mode='a', header=write_header, index=False, encoding='utf-8-sig')
+        """거래 로그 저장 (append) — regime 컬럼 포함"""
+        try:
+            log_path = os.path.join(self.config.TRADE_LOG_DIR, 'trades.csv')
+            os.makedirs(self.config.TRADE_LOG_DIR, exist_ok=True)
+            
+            df_new = pd.DataFrame([trade_info])
+            write_header = not os.path.exists(log_path)
+            df_new.to_csv(log_path, mode='a', header=write_header, index=False, encoding='utf-8-sig')
+            
+        except Exception as e:
+            print(f"  ❌ 거래 로그 저장 실패: {e}")
+            import traceback
+            traceback.print_exc()
 
     def update_trade_log(self, trade_id, result, profit_loss):
         """거래 결과 업데이트 (exit_time/exit_price/result/profit_loss 등)"""
@@ -595,40 +622,79 @@ class RealTimeTrader:
 
     # ---------- 재학습 ----------
     def execute_retrain_process(self):
-        """재학습 프로세스 (모델/필터 리로드)"""
+        """재학습 프로세스 (모델/필터 리로드) - 진행 상황 표시"""
         print(f"\n{'='*60}")
         print("재학습 및 필터 업데이트 프로세스 시작")
         print(f"{'='*60}")
 
         self.trigger_retrain()
 
-        print("재학습 완료 대기...")
-        time.sleep(5)
-
         flag_path = os.path.join(self.config.BASE_DIR, '.retrain_complete')
-        max_wait = 600
-        waited = 0
-
-        while not os.path.exists(flag_path) and waited < max_wait:
-            time.sleep(10)
-            waited += 10
-            print(f"  대기 중... ({waited}/{max_wait}초)")
-
+        progress_file = os.path.join(self.config.BASE_DIR, '.retrain_progress.json')
+        
+        # 기존 완료 플래그 삭제
         if os.path.exists(flag_path):
             os.remove(flag_path)
-            print("✓ 재학습 완료!")
+        
+        print("\n재학습 진행 중...")
+        print("(별도 프로세스에서 model_train.py를 실행하세요)")
+        print("-" * 60)
+        
+        last_status = None
+        check_count = 0
+        
+        while not os.path.exists(flag_path):
+            # 진행 상황 파일 읽기
+            if os.path.exists(progress_file):
+                try:
+                    with open(progress_file, 'r', encoding='utf-8') as f:
+                        progress = json.load(f)
+                    
+                    status = progress.get('status', 'unknown')
+                    current_step = progress.get('current_step', '')
+                    total_steps = progress.get('total_steps', 0)
+                    step_num = progress.get('step_num', 0)
+                    regime = progress.get('regime', '')
+                    
+                    # 상태가 변경되었을 때만 출력
+                    current_status = f"{step_num}/{total_steps}: {current_step}"
+                    if current_status != last_status:
+                        timestamp = datetime.now(timezone.utc).strftime('%H:%M:%S')
+                        if regime:
+                            print(f"[{timestamp}] {current_status} ({regime})")
+                        else:
+                            print(f"[{timestamp}] {current_status}")
+                        last_status = current_status
+                        
+                except Exception as e:
+                    pass
+            else:
+                # 진행 상황 파일이 없으면 대기 중 표시
+                if check_count % 6 == 0:  # 30초마다
+                    print(f"  대기 중... ({check_count * 5}초 경과)")
+            
+            check_count += 1
+            time.sleep(5)
+        
+        # 완료 플래그 삭제
+        if os.path.exists(flag_path):
+            os.remove(flag_path)
+        
+        # 진행 상황 파일 삭제
+        if os.path.exists(progress_file):
+            os.remove(progress_file)
+        
+        print("-" * 60)
+        print("✓ 재학습 완료!")
 
-            # 모델 및 필터 리로드
-            self.model_trainer.load_model()
-            self.adaptive_filters = self.load_adaptive_filters()
+        # 모델 및 필터 리로드
+        print("\n모델 및 필터 리로드 중...")
+        self.model_trainer.load_model()
+        self.adaptive_filters = self.load_adaptive_filters()
 
-            self.trades_since_last_check = 0
-            self.pending_retrain = False
-            print("✓ 거래 재개")
-        else:
-            print("⚠️  재학습 시간 초과. 기존 모델 사용")
-            self.trades_since_last_check = 0
-            self.pending_retrain = False
+        self.trades_since_last_check = 0
+        self.pending_retrain = False
+        print("✓ 거래 재개 준비 완료")
 
     def trigger_retrain(self):
         """재학습 트리거 파일 생성"""
@@ -643,7 +709,7 @@ class RealTimeTrader:
         print(f"\n실시간 거래 시작 (레짐 기반 + 캘리, ADX 레짐, 적응형 필터)")
         print(f"- 실행 기간: {'무제한 (Ctrl+C로 종료)' if duration_hours >= 99999 else f'{duration_hours}시간'}")
         print(f"- 진입 간격: {trade_interval_minutes}분 (만기 {self.config.PREDICTION_WINDOW}분, 칼만기)")
-        print(f"- 최대 포지션: {self.max_positions} (동시 활성)")
+        print(f"- 최대 포지션: {self.max_positions} (데이터 수집용)")
         print(f"- 재학습 평가: {self.config.EVALUATION_WINDOW}회마다")
         afc = len(self.adaptive_filters.get('active_filters', []))
         print(f"- 적응형 필터: {afc}개 {'활성' if afc > 0 else '대기중 (재학습 후 생성)'}")
@@ -750,48 +816,25 @@ class RealTimeTrader:
         if end_date:
             historical_data = historical_data[historical_data['timestamp'] <= end_date]
 
-        # 인덱스 리셋
-        historical_data = historical_data.reset_index(drop=True)
-
         from model_train import FeatureEngineer
         fe = FeatureEngineer()
-        features = fe.create_feature_pool(historical_data, lookback_window=200)
+        features = fe.create_feature_pool(historical_data)
         target = fe.create_target(historical_data, window=self.config.PREDICTION_WINDOW)
 
-        # 인덱스 정렬 및 길이 맞추기
-        features = features.reset_index(drop=True)
-        target = target.reset_index(drop=True)
-        
-        min_len = min(len(features), len(target))
-        features = features.iloc[:min_len]
-        target = target.iloc[:min_len]
-
-        # valid 체크 (numpy array로 변환) ← 핵심 수정
-        valid_idx = (target.notna()).values  # .values 추가!
-        features = features[valid_idx].reset_index(drop=True)
-        target = target[valid_idx].reset_index(drop=True)
+        valid_idx = target.notna()
+        features = features[valid_idx]
+        target = target[valid_idx]
 
         trades = []
 
         for i in range(len(features) - self.config.PREDICTION_WINDOW):
             X_current = features.iloc[[i]]
-            
-            # 레짐 추출
-            regime = int(features['regime'].iloc[i]) if 'regime' in features.columns else 0
-            
-            # 레짐별 모델로 예측
-            p_up = self.model_trainer.predict_proba(X_current, regime=regime)
-            
-            # numpy array면 스칼라로 변환
-            if isinstance(p_up, np.ndarray):
-                p_up = float(p_up[-1]) if len(p_up) > 0 else 0.5
-            else:
-                p_up = float(p_up)
-            
-            if not np.isfinite(p_up):
+            p_up_arr = np.ravel(self.model_trainer.predict_proba(X_current))
+            if len(p_up_arr) == 0 or not np.isfinite(p_up_arr[-1]):
                 continue
+            p_up = float(p_up_arr[-1])
 
-            # 레짐 기반 진입 결정
+            regime = int(features['regime'].iloc[i]) if 'regime' in features.columns else 0
             side = self.model_trainer.decide_from_proba_regime(p_up, regime)
             if side is None:
                 continue
@@ -799,7 +842,7 @@ class RealTimeTrader:
             actual = int(target.iloc[i])
 
             trades.append({
-                'timestamp': historical_data['timestamp'].iloc[i] if 'timestamp' in historical_data.columns else i,
+                'timestamp': historical_data['timestamp'].iloc[i],
                 'p_up': p_up,
                 'regime': regime,
                 'decision': side,
@@ -825,32 +868,21 @@ class RealTimeTrader:
         print(f"- 승률: {win_rate:.2%}")
         print(f"- 총 손익(가정): ${profit:.2f}")
         print(f"- 평균 손익/거래: ${profit/total_trades if total_trades > 0 else 0:.2f}")
-        
-        # 레짐별 통계
-        if total_trades > 0 and 'regime' in trades_df.columns:
-            print(f"\n레짐별 성과:")
-            for regime_val in [1, -1, 0]:
-                regime_name = "UP" if regime_val == 1 else ("DOWN" if regime_val == -1 else "FLAT")
-                regime_trades = trades_df[trades_df['regime'] == regime_val]
-                if len(regime_trades) > 0:
-                    regime_wins = regime_trades['correct'].sum()
-                    regime_wr = regime_wins / len(regime_trades)
-                    print(f"  [{regime_name:5s}] 거래: {len(regime_trades):4d}  승률: {regime_wr:.2%}")
 
         return trades_df
 
 
 # =================================
-# 모니터 (그대로 사용 가능, 선택사항)
+# 모니터 + 레짐별 분석
 # =================================
 class TradingMonitor:
-    """거래 모니터링 클래스"""
+    """거래 모니터링 클래스 (레짐별 분석 포함)"""
 
     def __init__(self, config):
         self.config = config
 
     def analyze_recent_trades(self, days=7):
-        """최근 거래 분석"""
+        """최근 거래 분석 (레짐별 포함)"""
         from data_merge import DataMerger
         merger = DataMerger(self.config)
         trades = merger.load_trade_logs()
@@ -870,28 +902,74 @@ class TradingMonitor:
             print(f"최근 {days}일간 거래 기록이 없습니다.")
             return None
 
+        # result, profit_loss를 숫자로 변환
+        if 'result' in recent_trades.columns:
+            recent_trades['result'] = pd.to_numeric(recent_trades['result'], errors='coerce')
+        
+        if 'profit_loss' in recent_trades.columns:
+            recent_trades['profit_loss'] = pd.to_numeric(recent_trades['profit_loss'], errors='coerce')
+
         stats = {
             'total_trades': len(recent_trades),
-            'wins': (recent_trades['result'] == 1).sum() if 'result' in recent_trades.columns else 0,
-            'losses': (recent_trades['result'] == 0).sum() if 'result' in recent_trades.columns else 0,
-            'total_profit': recent_trades['profit_loss'].sum() if 'profit_loss' in recent_trades.columns else 0
+            'wins': int((recent_trades['result'] == 1).sum()) if 'result' in recent_trades.columns else 0,
+            'losses': int((recent_trades['result'] == 0).sum()) if 'result' in recent_trades.columns else 0,
+            'total_profit': float(recent_trades['profit_loss'].sum()) if 'profit_loss' in recent_trades.columns else 0.0
         }
 
         if stats['total_trades'] > 0:
             stats['win_rate'] = stats['wins'] / stats['total_trades']
             stats['avg_profit'] = stats['total_profit'] / stats['total_trades']
 
+        # ★ 레짐별 성과 분석
+        if 'regime' in recent_trades.columns and 'result' in recent_trades.columns:
+            try:
+                # regime 컬럼을 숫자로 변환
+                recent_trades['regime'] = pd.to_numeric(recent_trades['regime'], errors='coerce')
+                
+                # 레짐 정보가 있는 데이터만 필터링
+                trades_with_regime = recent_trades[recent_trades['regime'].notna()]
+                
+                if len(trades_with_regime) > 0:
+                    regime_stats = trades_with_regime.groupby('regime').agg({
+                        'result': ['count', 'mean', 'sum'],
+                        'profit_loss': 'sum'
+                    }).round(3)
+                    
+                    regime_stats.columns = ['_'.join(col).strip() for col in regime_stats.columns.values]
+                    stats['regime_performance'] = regime_stats
+                    
+                    # 레짐별 롱/숏 성과
+                    if 'direction' in trades_with_regime.columns:
+                        trades_with_regime['direction'] = pd.to_numeric(trades_with_regime['direction'], errors='coerce')
+                        regime_direction_stats = trades_with_regime.groupby(['regime', 'direction']).agg({
+                            'result': ['count', 'mean'],
+                            'profit_loss': 'sum'
+                        }).round(3)
+                        stats['regime_direction_performance'] = regime_direction_stats
+                        
+            except Exception as e:
+                print(f"⚠️ 레짐별 통계 생성 실패: {e}")
+                stats['regime_performance'] = None
+
+        # 시간대별 성과
         if 'entry_time' in recent_trades.columns and 'result' in recent_trades.columns:
-            recent_trades['hour'] = recent_trades['entry_time'].dt.hour
-            hourly_stats = recent_trades.groupby('hour').agg({
-                'result': ['count', 'mean']
-            }).round(3)
-            stats['hourly_performance'] = hourly_stats
+            try:
+                recent_trades['hour'] = recent_trades['entry_time'].dt.hour
+                valid_results = recent_trades[recent_trades['result'].notna()]
+                
+                if len(valid_results) > 0:
+                    hourly_stats = valid_results.groupby('hour').agg({
+                        'result': ['count', 'mean']
+                    }).round(3)
+                    stats['hourly_performance'] = hourly_stats
+            except Exception as e:
+                print(f"⚠️ 시간대별 통계 생성 실패: {e}")
+                stats['hourly_performance'] = None
 
         return stats
 
     def generate_report(self):
-        """종합 리포트 생성"""
+        """종합 리포트 생성 (레짐 분석 포함)"""
         print("\n" + "="*60)
         print("거래 시스템 종합 리포트")
         print("="*60)
@@ -904,6 +982,18 @@ class TradingMonitor:
             print(f"승률: {week_stats.get('win_rate', 0):.2%}")
             print(f"총 손익: ${week_stats['total_profit']:.2f}")
             print(f"평균 손익: ${week_stats.get('avg_profit', 0):.2f}")
+            
+            # ★ 레짐별 성과
+            if week_stats.get('regime_performance') is not None:
+                print("\n[레짐별 성과]")
+                regime_labels = {0: "UP 트렌드", 1: "DOWN 트렌드", 2: "FLAT 횡보"}
+                rp = week_stats['regime_performance']
+                for regime_idx in rp.index:
+                    regime_name = regime_labels.get(regime_idx, f"REGIME-{regime_idx}")
+                    count = int(rp.loc[regime_idx, 'result_count'])
+                    win_rate = rp.loc[regime_idx, 'result_mean']
+                    profit = rp.loc[regime_idx, 'profit_loss_sum']
+                    print(f"  {regime_name}: {count}회, 승률 {win_rate:.1%}, 손익 ${profit:+.2f}")
 
         month_stats = self.analyze_recent_trades(30)
         if month_stats:
