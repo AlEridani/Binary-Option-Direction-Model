@@ -228,7 +228,8 @@ class RealTimeTrader:
     def make_prediction(self, features, debug=False):
         """
         레짐 기반 진입 결정:
-          - model_trainer.predict_proba()로 p_up 계산
+          - features에서 regime 추출
+          - model_trainer.predict_proba(features, regime) → 레짐별 모델로 p_up 계산
           - model_trainer.decide_from_proba_regime(p_up, regime) → 1/0/None
           - 적응형 필터 통과 시에만 side 반환
         """
@@ -237,13 +238,23 @@ class RealTimeTrader:
             return None, 0.5
 
         try:
-            X_cur = features.iloc[[-1]]
-            p_arr = np.ravel(self.model_trainer.predict_proba(X_cur))
-            if len(p_arr) == 0 or not np.isfinite(p_arr[-1]):
-                return None, 0.5
-            p_up = float(p_arr[-1])
-
+            # 현재 행에서 regime 추출
             regime = int(features['regime'].iloc[-1]) if 'regime' in features.columns else 0
+            
+            # 레짐별 모델로 확률 예측
+            X_cur = features.iloc[[-1]]
+            p_up = self.model_trainer.predict_proba(X_cur, regime=regime)
+            
+            # numpy array면 스칼라로 변환
+            if isinstance(p_up, np.ndarray):
+                p_up = float(p_up[-1]) if len(p_up) > 0 else 0.5
+            else:
+                p_up = float(p_up)
+            
+            if not np.isfinite(p_up):
+                return None, 0.5
+
+            # 레짐 기반 진입 결정
             side = self.model_trainer.decide_from_proba_regime(p_up, regime)
 
             if debug:
@@ -743,16 +754,6 @@ class RealTimeTrader:
         fe = FeatureEngineer()
         features = fe.create_feature_pool(historical_data)
         target = fe.create_target(historical_data, window=self.config.PREDICTION_WINDOW)
-
-        # 1) 인덱스/길이 정렬: features는 lookback 이후라 더 짧음 → target을 뒤에서 맞춤
-        features = features.reset_index(drop=True)
-        if len(target) > len(features):
-            target = target.iloc[-len(features):]
-        else:
-            # target이 features보다 길이가 더 짧을 일은 거의 없지만, 방어적으로 features도 잘라줌
-            features = features.iloc[-len(target):]
-
-        target = target.reset_index(drop=True)
 
         valid_idx = target.notna()
         features = features[valid_idx]
