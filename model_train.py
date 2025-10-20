@@ -1,353 +1,923 @@
-# model_train.py - 시계열 안전 학습/재학습 + 실패패턴 필터 (timestamp=close_time)
+# model_train.py
+# 시계열 기반 학습 + 확률 캘리브레이션 + 보수적 LGBM 파라미터
+# - EV 관련 로직/지표/평가는 전부 제거
+# - 상위봉(기본 15분) ADX 레짐을 'regime' 컬럼으로 제공
+# - Isotonic/Platt 캘리브레이션 선택 가능
+# - 진단 플롯(히스토그램/리라이어빌리티)과 Brier score 저장
+# - 실패 트레이드 패턴 분석(적응형 필터 설계 기반)
+
 import os
 import json
-from datetime import datetime, timezone
+import joblib
+import warnings
+warnings.filterwarnings('ignore')
+
+try:
+    import lightgbm as lgb
+    _LGBM_ERR = None
+except Exception as e:
+    lgb, _LGBM_ERR = None, e  # ← 실패해도 모듈 로드는 계속
 
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
+
+from datetime import datetime, timezone
+
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, brier_score_loss
+)
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-import joblib
-import warnings
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import calibration_curve
 
-warnings.filterwarnings("ignore")
+import matplotlib
+matplotlib.use("Agg")  # 서버/무디스플레이 환경에서 플롯 저장용
+import matplotlib.pyplot as plt
 
 
-# ---------------- Feature Engineering ----------------
+# ===============================
+# Feature Engineering
+# ===============================
 class FeatureEngineer:
+    """피처 엔지니어링 (미래 누출 방지: 모든 가격/거래량은 shift(1) 기준)"""
+
     @staticmethod
-    def create_feature_pool(df: pd.DataFrame, lookback_window: int = 200) -> pd.DataFrame:
-        f = pd.DataFrame(index=df.index)
+    def _compute_adx_core(high, low, close, w: int = 14):
+        up_move   = high.diff()
+        down_move = (-low.diff())
 
-        # timestamp는 이미 close_time으로 세팅되어 들어옴 (UTC 가정)
-        if "timestamp" in df.columns:
-            ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-            f["timestamp"] = ts
+        plus_dm  = np.where((up_move > down_move) & (up_move > 0),  up_move, 0.0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-        # 과거 값만 사용 (shift(1))
-        f["prev_open"] = df["open"].shift(1)
-        f["prev_high"] = df["high"].shift(1)
-        f["prev_low"]  = df["low"].shift(1)
-        f["prev_close"] = df["close"].shift(1)
-        f["prev_volume"] = df["volume"].shift(1)
+        tr1 = (high - low)
+        tr2 = (high - close.shift()).abs()
+        tr3 = (low  - close.shift()).abs()
+        tr  = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-        for p in [1,2,3,5,10,15,30,60]:
-            f[f"return_{p}"] = (df["close"].shift(1) / df["close"].shift(p+1) - 1)
-            f[f"volume_change_{p}"] = (df["volume"].shift(1) / df["volume"].shift(p+1) - 1)
+        alpha = 1.0 / w  # Wilder EMA
+        tr_s       = tr.ewm(alpha=alpha, adjust=False, min_periods=w).mean()
+        plus_dm_s  = pd.Series(plus_dm,  index=high.index).ewm(alpha=alpha, adjust=False, min_periods=w).mean()
+        minus_dm_s = pd.Series(minus_dm, index=high.index).ewm(alpha=alpha, adjust=False, min_periods=w).mean()
 
-        for p in [5,10,20,50,100,200]:
-            ma = df["close"].shift(1).rolling(p, min_periods=p).mean()
-            f[f"ma_{p}"] = ma
-            f[f"price_to_ma_{p}"] = (df["close"].shift(1) / ma - 1)
-            f[f"ma_{p}_slope"] = ma.diff(5) / ma.shift(5)
+        plus_di  = 100.0 * (plus_dm_s / (tr_s + 1e-9))
+        minus_di = 100.0 * (minus_dm_s / (tr_s + 1e-9))
+        dx       = 100.0 * (plus_di.subtract(minus_di).abs() / (plus_di + minus_di + 1e-9))
+        adx      = dx.ewm(alpha=alpha, adjust=False, min_periods=w).mean()
+        return plus_di, minus_di, adx
 
-        for p in [12,26,50]:
-            ema = df["close"].shift(1).ewm(span=p, adjust=False, min_periods=p).mean()
-            f[f"ema_{p}"] = ema
-            f[f"price_to_ema_{p}"] = (df["close"].shift(1) / ema - 1)
+    @staticmethod
+    def _compute_adx(df: pd.DataFrame, w: int = 14):
+        high  = df['high'].astype(float)
+        low   = df['low'].astype(float)
+        close = df['close'].astype(float)
+        return FeatureEngineer._compute_adx_core(high, low, close, w=w)
 
-        for p in [20,50]:
-            sc = df["close"].shift(1)
-            ma = sc.rolling(p, min_periods=p).mean()
-            std = sc.rolling(p, min_periods=p).std()
-            f[f"bb_upper_{p}"] = ma + 2*std
-            f[f"bb_lower_{p}"] = ma - 2*std
-            f[f"bb_width_{p}"] = (4*std) / ma
-            f[f"bb_position_{p}"] = (sc - f[f"bb_lower_{p}"]) / (f[f"bb_upper_{p}"] - f[f"bb_lower_{p}"] + 1e-4)
+    @staticmethod
+    def _htf_regime_features(df, tf='15min', adx_thr=20, w=14):
+        """상위봉(예: 15분) OHLC로 ADX/DI 및 레짐 추정 후 1분 타임라인으로 ffill 매핑."""
+        # 인덱스/타임스탬프 정리
+        if 'timestamp' in df.columns:
+            idx = pd.to_datetime(df['timestamp'], utc=True)
+        else:
+            idx = pd.to_datetime(df.index, utc=True)
+        src = df.set_index(idx).sort_index()
+        ohlc = src[['open','high','low','close','volume']]
 
-        for p in [14,28]:
-            sc = df["close"].shift(1)
+        # 리샘플 → 상위봉 OHLCV
+        htf = pd.DataFrame({
+            'open':   ohlc['open'].resample(tf).first(),
+            'high':   ohlc['high'].resample(tf).max(),
+            'low':    ohlc['low'].resample(tf).min(),
+            'close':  ohlc['close'].resample(tf).last(),
+            'volume': ohlc['volume'].resample(tf).sum(),
+        }).dropna()
+
+        pdi, mdi, adx = FeatureEngineer._compute_adx_core(htf['high'], htf['low'], htf['close'], w=w)
+        up   = (adx > adx_thr) & (pdi > mdi)
+        down = (adx > adx_thr) & (mdi > pdi)
+        regime = np.select([up, down], [1, -1], default=0).astype(int)
+
+        out = pd.DataFrame({
+            'htf_pdi_14': pdi,
+            'htf_mdi_14': mdi,
+            'htf_adx_14': adx,
+            'htf_regime': regime,
+        }, index=htf.index)
+
+        # 원 타임라인(1분 등)으로 ffill 매핑
+        out_1m = out.reindex(src.index, method='ffill')
+        return out_1m.reset_index(drop=True)
+
+    @staticmethod
+    def create_feature_pool(df, lookback_window=200):
+        features = pd.DataFrame(index=df.index)
+
+        # 시간(UTC) 보존
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+            features['timestamp'] = df['timestamp']
+
+        # 기본 과거 캔들
+        features['prev_open']   = df['open'].shift(1)
+        features['prev_high']   = df['high'].shift(1)
+        features['prev_low']    = df['low'].shift(1)
+        features['prev_close']  = df['close'].shift(1)
+        features['prev_volume'] = df['volume'].shift(1)
+
+        # 수익률/체결량 변화율
+        for period in [1, 2, 3, 5, 10, 15, 30, 60]:
+            features[f'return_{period}']        = df['close'].shift(1) / df['close'].shift(period+1) - 1
+            features[f'volume_change_{period}'] = df['volume'].shift(1) / df['volume'].shift(period+1) - 1
+
+        # 이동평균/기울기
+        for period in [5, 10, 20, 50, 100, 200]:
+            ma = df['close'].shift(1).rolling(window=period, min_periods=period).mean()
+            features[f'ma_{period}'] = ma
+            features[f'price_to_ma_{period}'] = df['close'].shift(1) / (ma + 1e-9) - 1
+            features[f'ma_{period}_slope'] = ma.diff(5) / (ma.shift(5) + 1e-9)
+
+        # EMA
+        for period in [12, 26, 50]:
+            ema = df['close'].shift(1).ewm(span=period, adjust=False, min_periods=period).mean()
+            features[f'ema_{period}'] = ema
+            features[f'price_to_ema_{period}'] = df['close'].shift(1) / (ema + 1e-9) - 1
+
+        # 볼린저
+        for period in [20, 50]:
+            sc  = df['close'].shift(1)
+            ma  = sc.rolling(window=period, min_periods=period).mean()
+            std = sc.rolling(window=period, min_periods=period).std()
+            upper = ma + 2 * std
+            lower = ma - 2 * std
+            features[f'bb_upper_{period}'] = upper
+            features[f'bb_lower_{period}'] = lower
+            features[f'bb_width_{period}'] = 4 * std / (ma + 1e-9)
+            features[f'bb_position_{period}'] = (sc - lower) / ((upper - lower) + 1e-9)
+
+        # RSI
+        for period in [14, 28]:
+            sc = df['close'].shift(1)
             delta = sc.diff()
-            gain = delta.where(delta>0,0).rolling(p, min_periods=p).mean()
-            loss = (-delta.where(delta<0,0)).rolling(p, min_periods=p).mean()
-            rs = gain / (loss + 1e-4)
-            f[f"rsi_{p}"] = 100 - (100/(1+rs))
+            gain = delta.where(delta > 0, 0).rolling(window=period, min_periods=period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=period, min_periods=period).mean()
+            rs = gain / (loss + 1e-9)
+            features[f'rsi_{period}'] = 100 - (100 / (1 + rs))
 
-        sc = df["close"].shift(1)
+        # MACD
+        sc = df['close'].shift(1)
         ema12 = sc.ewm(span=12, adjust=False, min_periods=12).mean()
         ema26 = sc.ewm(span=26, adjust=False, min_periods=26).mean()
         macd = ema12 - ema26
         signal = macd.ewm(span=9, adjust=False, min_periods=9).mean()
-        f["macd"] = macd
-        f["macd_signal"] = signal
-        f["macd_histogram"] = macd - signal
+        features['macd'] = macd
+        features['macd_signal'] = signal
+        features['macd_histogram'] = macd - signal
 
-        sh, sl, sc2 = df["high"].shift(1), df["low"].shift(1), df["close"].shift(1)
-        low14  = sl.rolling(14, min_periods=14).min()
-        high14 = sh.rolling(14, min_periods=14).max()
-        f["stoch_14"] = (sc2 - low14) / (high14 - low14 + 1e-4) * 100
+        # Stochastic
+        for period in [14]:
+            sh = df['high'].shift(1); sl = df['low'].shift(1); sc = df['close'].shift(1)
+            low_min  = sl.rolling(window=period, min_periods=period).min()
+            high_max = sh.rolling(window=period, min_periods=period).max()
+            features[f'stoch_{period}'] = (sc - low_min) / ((high_max - low_min) + 1e-9) * 100
 
-        for p in [14,28]:
-            sh, sl, sc3 = df["high"].shift(1), df["low"].shift(1), df["close"].shift(1)
-            tr = pd.concat([sh-sl, (sh - sc3.shift(1)).abs(), (sl - sc3.shift(1)).abs()], axis=1).max(axis=1)
-            f[f"atr_{p}"] = tr.rolling(p, min_periods=p).mean()
-            f[f"atr_ratio_{p}"] = f[f"atr_{p}"] / sc3
+        # ATR
+        for period in [14, 28]:
+            sh = df['high'].shift(1); sl = df['low'].shift(1); sc = df['close'].shift(1)
+            tr = pd.concat([
+                sh - sl,
+                (sh - sc.shift(1)).abs(),
+                (sl - sc.shift(1)).abs()
+            ], axis=1).max(axis=1)
+            atr = tr.rolling(window=period, min_periods=period).mean()
+            features[f'atr_{period}'] = atr
+            features[f'atr_ratio_{period}'] = atr / (sc + 1e-9)
 
-        sv = df["volume"].shift(1)
-        f["volume_sma_10"] = sv.rolling(10, min_periods=10).mean()
-        f["volume_sma_50"] = sv.rolling(50, min_periods=50).mean()
-        f["volume_ratio"]  = sv / f["volume_sma_10"]
-        f["volume_trend"]  = f["volume_sma_10"] / f["volume_sma_50"]
+        # 거래량 지표
+        sv = df['volume'].shift(1)
+        features['volume_sma_10'] = sv.rolling(window=10, min_periods=10).mean()
+        features['volume_sma_50'] = sv.rolling(window=50, min_periods=50).mean()
+        features['volume_ratio'] = sv / (features['volume_sma_10'] + 1e-9)
+        features['volume_trend'] = features['volume_sma_10'] / (features['volume_sma_50'] + 1e-9)
 
-        price_diff = df["close"].diff().shift(1)
-        obv = (np.sign(price_diff) * df["volume"].shift(1)).cumsum()
-        f["obv"] = obv
-        f["obv_ema"] = obv.ewm(span=20, adjust=False, min_periods=20).mean()
-        f["obv_signal"] = obv / f["obv_ema"] - 1
+        # OBV
+        price_diff = df['close'].diff().shift(1)
+        obv = (np.sign(price_diff) * df['volume'].shift(1)).cumsum()
+        features['obv'] = obv
+        features['obv_ema'] = obv.ewm(span=20, adjust=False, min_periods=20).mean()
+        features['obv_signal'] = obv / (features['obv_ema'] + 1e-9) - 1
 
-        po, pc, ph, pl = df["open"].shift(1), df["close"].shift(1), df["high"].shift(1), df["low"].shift(1)
-        f["body_size"] = (pc - po).abs() / po
-        f["upper_shadow"] = (ph - pd.concat([po, pc], axis=1).max(axis=1)) / po
-        f["lower_shadow"] = (pd.concat([po, pc], axis=1).min(axis=1) - pl) / po
-        f["body_position"] = (pc - po) / (ph - pl + 1e-4)
-        for i in range(1,4):
-            f[f"candle_direction_{i}"] = np.sign(df["close"].shift(i) - df["open"].shift(i))
-            f[f"candle_size_{i}"] = (df["high"].shift(i) - df["low"].shift(i)) / df["close"].shift(i)
+        # 캔들 패턴
+        po = df['open'].shift(1); pc = df['close'].shift(1); ph = df['high'].shift(1); pl = df['low'].shift(1)
+        features['body_size'] = (pc - po).abs() / (po + 1e-9)
+        features['upper_shadow'] = (ph - pd.concat([po, pc], axis=1).max(axis=1)) / (po + 1e-9)
+        features['lower_shadow'] = (pd.concat([po, pc], axis=1).min(axis=1) - pl) / (po + 1e-9)
+        features['body_position'] = (pc - po) / ((ph - pl) + 1e-9)
 
-        # 시간 피처 (timestamp=close_time)
-        if "timestamp" in f.columns:
-            dt = pd.to_datetime(f["timestamp"], utc=True, errors="coerce")
-            f["hour"] = dt.dt.hour
-            f["minute"] = dt.dt.minute
-            f["day_of_week"] = dt.dt.dayofweek
-            f["day_of_month"] = dt.dt.day
-            f["hour_sin"] = np.sin(2*np.pi*f["hour"]/24)
-            f["hour_cos"] = np.cos(2*np.pi*f["hour"]/24)
-            f["dow_sin"] = np.sin(2*np.pi*f["day_of_week"]/7)
-            f["dow_cos"] = np.cos(2*np.pi*f["day_of_week"]/7)
+        for i in range(1, 4):
+            features[f'candle_direction_{i}'] = np.sign(df['close'].shift(i) - df['open'].shift(i))
+            features[f'candle_size_{i}'] = (df['high'].shift(i) - df['low'].shift(i)) / (df['close'].shift(i) + 1e-9)
 
-        # 마이크로/추세/변동성
-        for p in [3,5,10]:
-            sh, sl, sc4 = df["high"].shift(1), df["low"].shift(1), df["close"].shift(1)
-            f[f"high_low_ratio_{p}"] = ((sh/sl - 1).rolling(p, min_periods=p).mean())
-            f[f"close_position_{p}"] = (((sc4 - sl) / (sh - sl + 1e-4)).rolling(p, min_periods=p).mean())
+        # 시간 피처
+        if 'timestamp' in df.columns:
+            dt = pd.to_datetime(df['timestamp'], utc=True)
+            features['hour'] = dt.dt.hour
+            features['minute'] = dt.dt.minute
+            features['day_of_week'] = dt.dt.dayofweek
+            features['day_of_month'] = dt.dt.day
+            features['hour_sin'] = np.sin(2*np.pi*features['hour']/24.0)
+            features['hour_cos'] = np.cos(2*np.pi*features['hour']/24.0)
+            features['dow_sin'] = np.sin(2*np.pi*features['day_of_week']/7.0)
+            features['dow_cos'] = np.cos(2*np.pi*features['day_of_week']/7.0)
 
-        for p in [10,20,50]:
-            sc5 = df["close"].shift(1)
-            ma = sc5.rolling(p, min_periods=p).mean()
-            f[f"trend_strength_{p}"] = (sc5 > ma).astype(int).rolling(p, min_periods=p).mean()
+        # 마이크로구조
+        for period in [3, 5, 10]:
+            sh = df['high'].shift(1); sl = df['low'].shift(1); sc = df['close'].shift(1)
+            features[f'high_low_ratio_{period}'] = (sh / (sl + 1e-9) - 1).rolling(period, min_periods=period).mean()
+            features[f'close_position_{period}'] = (((sc - sl) / ((sh - sl) + 1e-9))
+                                                    .rolling(period, min_periods=period).mean())
 
-        for p in [10,30]:
-            sr = df["close"].shift(1).pct_change()
-            f[f"volatility_{p}"] = sr.rolling(p, min_periods=p).std()
-            f[f"volatility_ratio_{p}"] = f[f"volatility_{p}"] / sr.rolling(p*3, min_periods=p*3).std()
+        # 추세 강도
+        for period in [10, 20, 50]:
+            sc = df['close'].shift(1)
+            ma = sc.rolling(window=period, min_periods=period).mean()
+            above = (sc > ma).astype(int)
+            features[f'trend_strength_{period}'] = above.rolling(window=period, min_periods=period).mean()
 
-        return f.iloc[lookback_window:]
+        # 변동성
+        for period in [10, 30]:
+            sr = df['close'].shift(1).pct_change()
+            features[f'volatility_{period}'] = sr.rolling(window=period, min_periods=period).std()
+            features[f'volatility_ratio_{period}'] = (
+                features[f'volatility_{period}'] /
+                (sr.rolling(window=period*3, min_periods=period*3).std() + 1e-9)
+            )
+
+        # ---- lookback_window 이전 제거 ----
+        features = features.iloc[lookback_window:]
+
+        # ---- (a) 동일 타임프레임의 DI/ADX 참고 피처(누출 방지용 shift) ----
+        pdi, mdi, adx = FeatureEngineer._compute_adx(df, w=14)
+        pdi  = pdi.shift(1).reindex(features.index)
+        mdi  = mdi.shift(1).reindex(features.index)
+        adx  = adx.shift(1).reindex(features.index)
+
+        features['di_plus_14']  = pdi
+        features['di_minus_14'] = mdi
+        features['adx_14']      = adx
+
+        # ---- (b) 상위봉(기본 15분) 레짐 생성 → 'regime'으로 사용 ----
+        try:
+            from config import Config
+            tf = getattr(Config, 'REGIME_TF', '15min')
+            adx_thr = getattr(Config, 'REGIME_ADX_THR', 20)
+        except Exception:
+            tf = '15min'
+            adx_thr = 20
+
+        htf = FeatureEngineer._htf_regime_features(df.copy(), tf=tf, adx_thr=adx_thr, w=14)
+        htf = htf.iloc[lookback_window:].reset_index(drop=True)
+        features = features.reset_index(drop=True)
+        features = pd.concat([features, htf], axis=1)
+
+        # 상위봉 레짐을 최종 regime으로
+        features['regime'] = features['htf_regime'].astype('int16')
+
+        return features
 
     @staticmethod
-    def create_target(df: pd.DataFrame, window: int = 10) -> pd.Series:
-        # timestamp=close_time 기준 → 현재 닫힌 봉 대비 10분 뒤 닫힌 봉
-        cur = df["close"]
-        fut = df["close"].shift(-window)
-        return (fut > cur).astype(float)
+    def create_target(df, window=10):
+        current = df['close']
+        future = df['close'].shift(-window)
+        return (future > current).astype(int)
+
+    @staticmethod
+    def validate_no_future_leak(features, target):
+        issues = []
+        for col in features.columns:
+            if col == 'timestamp':
+                continue
+            corr = features[col].corr(target)
+            if pd.notna(corr) and abs(corr) > 0.95:
+                issues.append(f"Suspicious correlation in {col}: {corr:.3f}")
+        if issues:
+            print("⚠️ 미래 데이터 누출 의심:")
+            for it in issues:
+                print("  -", it)
+            return False
+        return True
 
 
-# ---------------- Trainer ----------------
-class TimeSeriesModelTrainer:
+# ===============================
+# Model Trainer
+# ===============================
+class ModelTrainer:
+    """시계열 LGBM 앙상블 + 확률 캘리브레이션"""
+
     def __init__(self, config):
         self.config = config
+        if lgb is None:
+            raise ImportError(
+                f"lightgbm import failed: {_LGBM_ERR}\n"
+                "→ pip install lightgbm (환경에 맞는 버전/휠) 후 다시 실행하세요."
+            )
+
         self.models = []
         self.scaler = StandardScaler()
-        self.selected_features = None
         self.feature_importance = None
+        self.selected_features = None
 
-    def _prepare_xy(self, df: pd.DataFrame):
-        if "timestamp" in df.columns:
-            df = df.copy()
-            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        # (참고용) 레짐 임계
+        self.REGIME_THRESHOLDS = {
+            +1: 0.55,
+            -1: 0.55,
+            0: 0.60
+        }
+
+        self.calibrator = None
+        self.calib_method = 'isotonic'
+
+    # --- 간단 결정: 순수 승률(0.5) ---
+    def decide_from_proba_simple(self, p_up: float) -> int:
+        return 1 if p_up >= 0.5 else 0
+
+    # --- (선택) 레짐 힌트 기반 결정 ---
+    def decide_from_proba_regime(self, p_up, regime):
+        if regime == 1:     # 상향 추세면 롱 쪽 선호
+            return 1
+        elif regime == -1:  # 하향 추세면 숏 쪽 선호
+            return 0
+        else:
+            return 1 if p_up >= 0.5 else 0
+
+    # --- Feature selection (간단 중요도 기반) ---
+    def feature_selection_temporal(self, X, y, top_k=50):
+        X = X.reset_index(drop=True)
+        y = y.reset_index(drop=True)
+
+        train_size = int(len(X) * 0.7)
+        X_tr, y_tr = X.iloc[:train_size], y.iloc[:train_size]
+        X_va, y_va = X.iloc[train_size:], y.iloc[train_size:]
+
+        cols = [c for c in X.columns if c != 'timestamp']
+        X_tr = X_tr[cols]
+        X_va = X_va[cols]
+
+        X_tr = X_tr.fillna(method='ffill').fillna(0).replace([np.inf, -np.inf], 0)
+        X_va = X_va.fillna(method='ffill').fillna(0).replace([np.inf, -np.inf], 0)
+
+        n_tr = min(len(X_tr), len(y_tr))
+        n_va = min(len(X_va), len(y_va))
+        if len(X_tr) != len(y_tr) or len(X_va) != len(y_va):
+            X_tr = X_tr.iloc[:n_tr]; y_tr = y_tr.iloc[:n_tr]
+            X_va = X_va.iloc[:n_va]; y_va = y_va.iloc[:n_va]
+
+        dtr = lgb.Dataset(X_tr, y_tr)
+        dva = lgb.Dataset(X_va, y_va, reference=dtr)
+
+        base = getattr(self.config, 'LGBM_PARAMS', {})
+        params = {
+            'objective': 'binary',
+            'metric': 'binary_logloss',
+            'boosting_type': 'gbdt',
+            'learning_rate': 0.03,
+            'num_leaves': 31,
+            'max_depth': 7,
+            'min_data_in_leaf': 200,
+            'feature_fraction': 0.7,
+            'bagging_fraction': 0.7,
+            'bagging_freq': 1,
+            'lambda_l2': 10.0,
+            **base
+        }
+
+        model = lgb.train(
+            params,
+            dtr,
+            valid_sets=[dva],
+            callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)]
+        )
+
+        imp = pd.DataFrame({
+            'feature': cols,
+            'importance': model.feature_importance(importance_type='gain')
+        }).sort_values('importance', ascending=False)
+
+        self.feature_importance = imp
+        self.selected_features = imp.head(top_k)['feature'].tolist()
+
+        print("\n선택된 상위 피처(10):")
+        for _, row in imp.head(10).iterrows():
+            print(f"  {row['feature']}: {row['importance']:.2f}")
+
+        return self.selected_features
+
+    # --- Training + Calibration ---
+    def train_ensemble_temporal(self, X, y, test_size=0.2):
+        self.models = []
+        X = X.reset_index(drop=True)
+        y = y.reset_index(drop=True)
+
+        # timestamp 제거 & selected 적용
+        if 'timestamp' in X.columns:
+            X = X.drop('timestamp', axis=1)
+        if not self.selected_features:
+            self.selected_features = list(X.columns)[:50]
+            print("⚠️ selected_features 비어있음 → 상위 50개 컬럼 기본 사용")
+
+        Xs = X[self.selected_features]
+
+        # 클래스 불균형 가중
+        pos, neg = int((y == 1).sum()), int((y == 0).sum())
+        base_params = {
+            'objective': 'binary',
+            'metric': 'binary_logloss',
+            'boosting_type': 'gbdt',
+            'learning_rate': 0.03,
+            'num_leaves': 31,
+            'max_depth': 7,
+            'min_data_in_leaf': 200,
+            'feature_fraction': 0.7,
+            'bagging_fraction': 0.7,
+            'bagging_freq': 1,
+            'lambda_l2': 10.0,
+        }
+        base_params.update(getattr(self.config, 'LGBM_PARAMS', {}))
+        if pos > 0 and neg > 0:
+            base_params['is_unbalance'] = False
+            base_params['scale_pos_weight'] = neg / max(1, pos)
+
+        # 시간순 분할
+        total = len(Xs)
+        val_size = int(total * test_size)
+        train_size = total - 2 * val_size
+        if train_size <= 0:
+            raise ValueError("데이터가 너무 적어 train/val/test 분할 불가.")
+
+        X_tr, y_tr = Xs.iloc[:train_size], y.iloc[:train_size]
+        X_va, y_va = Xs.iloc[train_size:train_size+val_size], y.iloc[train_size:train_size+val_size]
+        X_te, y_te = Xs.iloc[train_size+val_size:], y.iloc[train_size+val_size:]
+
+        print("\n데이터 분할(시간 순서):")
+        print(f"  train={len(X_tr)}  val={len(X_va)}  test={len(X_te)}")
+
+        # 전처리 & 스케일
+        def _prep(df):
+            return df.fillna(method='ffill').fillna(0).replace([np.inf, -np.inf], 0)
+
+        X_tr = _prep(X_tr); X_va = _prep(X_va); X_te = _prep(X_te)
+
+        # ★ 길이 어긋남 방어적 보정
+        X_tr, y_tr = X_tr.reset_index(drop=True), y_tr.reset_index(drop=True)
+        X_va, y_va = X_va.reset_index(drop=True), y_va.reset_index(drop=True)
+        X_te, y_te = X_te.reset_index(drop=True), y_te.reset_index(drop=True)
+
+        n_tr = min(len(X_tr), len(y_tr))
+        n_va = min(len(X_va), len(y_va))
+        n_te = min(len(X_te), len(y_te))
+        if len(X_tr)!=len(y_tr) or len(X_va)!=len(y_va) or len(X_te)!=len(y_te):
+            X_tr = X_tr.iloc[:n_tr]; y_tr = y_tr.iloc[:n_tr]
+            X_va = X_va.iloc[:n_va]; y_va = y_va.iloc[:n_va]
+            X_te = X_te.iloc[:n_te]; y_te = y_te.iloc[:n_te]
+
+        # ★ 스케일링 행렬 생성 (NameError 원인 수정)
+        self.scaler = StandardScaler()
+        X_tr_s = self.scaler.fit_transform(X_tr)
+        X_va_s = self.scaler.transform(X_va)
+        X_te_s = self.scaler.transform(X_te)
+
+        # 앙상블(3~5개 권장)
+        n_models = int(getattr(self.config, 'ENSEMBLE_MODELS', 3))
+        n_models = max(1, min(5, n_models))
+
+        for i in range(n_models):
+            params = base_params.copy()
+            params['random_state'] = 42 + i
+            # 약간의 다양성
+            params['num_leaves']   = min(63, 31 + i * 8)
+            params['feature_fraction'] = max(0.5, 0.7 - i * 0.05)
+            params['bagging_fraction'] = min(0.8, 0.7 + i * 0.03)
+
+            start = int(i * len(X_tr_s) * 0.1)
+            dtr = lgb.Dataset(X_tr_s[start:], y_tr.iloc[start:])
+            dva = lgb.Dataset(X_va_s, y_va, reference=dtr)
+
+            model = lgb.train(
+                params,
+                dtr,
+                valid_sets=[dva],
+                callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)]
+            )
+            self.models.append(model)
+            print(f"  모델 {i+1}/{n_models} 학습 완료 (scale_pos_weight={params.get('scale_pos_weight')})")
+
+        # --- Calibration ---
+        val_pred_raw = self._predict_proba_array(X_va_s)
+        method = getattr(self.config, 'CALIBRATION_METHOD', self.calib_method)
+        if method not in ('isotonic', 'platt'):
+            method = 'isotonic'
+
+        if method == 'isotonic':
+            self.calibrator = IsotonicRegression(out_of_bounds='clip')
+            self.calibrator.fit(val_pred_raw, y_va.values)
+            self.calib_method = 'isotonic'
+            print("✓ 확률 캘리브레이션: IsotonicRegression")
+        else:
+            lr = LogisticRegression(max_iter=1000)
+            lr.fit(val_pred_raw.reshape(-1, 1), y_va.values)
+            self.calibrator = lr
+            self.calib_method = 'platt'
+            print("✓ 확률 캘리브레이션: Platt(Logistic)")
+
+        # 진단 저장
+        self._save_calibration_diagnostics(X_va_s, y_va, val_pred_raw)
+
+        # 성능 (0.5 임계)
+        tr_proba = self.predict_proba_df(pd.DataFrame(X_tr, columns=X_tr.columns))
+        va_proba = self.predict_proba_df(pd.DataFrame(X_va, columns=X_va.columns))
+        te_proba = self.predict_proba_df(pd.DataFrame(X_te, columns=X_te.columns))
+
+        metrics = {
+            'train': self._evaluate_block(y_tr, tr_proba),
+            'validation': self._evaluate_block(y_va, va_proba),
+            'test': self._evaluate_block(y_te, te_proba),
+        }
+
+        return metrics
+
+    # --- Predict helpers ---
+    def _predict_proba_array(self, X_nd):
+        preds = []
+        for m in self.models:
+            preds.append(m.predict(X_nd, num_iteration=m.best_iteration))
+        preds = np.vstack(preds)
+        # 최근 모델 가중 증가
+        n = preds.shape[0]
+        if n == 1:
+            w = np.array([1.0])
+        else:
+            w = np.linspace(1.0, 1.5, n)
+            w = w / w.sum()
+        p = np.average(preds, axis=0, weights=w)
+        return p
+
+    def _apply_calibration(self, p_raw):
+        if self.calibrator is None:
+            return p_raw
+        if isinstance(self.calibrator, IsotonicRegression):
+            return self.calibrator.predict(p_raw)
+        return self.calibrator.predict_proba(p_raw.reshape(-1, 1))[:, 1]
+
+    def predict_proba(self, X):
+        if isinstance(X, pd.DataFrame):
+            return self.predict_proba_df(X)
+        p_raw = self._predict_proba_array(X)
+        p = self._apply_calibration(p_raw)
+        return np.clip(p, 0.02, 0.98)
+
+    def predict_proba_df(self, X_df):
+        X_tmp = X_df.copy()
+        if 'timestamp' in X_tmp.columns:
+            X_tmp = X_tmp.drop('timestamp', axis=1)
+        if not self.selected_features:
+            self.selected_features = list(X_tmp.columns)[:50]
+        X_tmp = X_tmp[self.selected_features].fillna(method='ffill').fillna(0).replace([np.inf, -np.inf], 0)
+        X_s = self.scaler.transform(X_tmp)
+        p_raw = self._predict_proba_array(X_s)
+        p = self._apply_calibration(p_raw)
+        return np.clip(p, 0.02, 0.98)
+
+    def predict(self, X, threshold=0.5):
+        p = self.predict_proba(X)
+        return (p > threshold).astype(int)
+
+    # --- Evaluation helpers ---
+    def _evaluate_block(self, y_true, proba, th=0.5):
+        y_pred = (proba > th).astype(int)
+        return {
+            'accuracy': accuracy_score(y_true, y_pred),
+            'precision': precision_score(y_true, y_pred, zero_division=0),
+            'recall': recall_score(y_true, y_pred, zero_division=0),
+            'f1': f1_score(y_true, y_pred, zero_division=0),
+            'win_rate': float(np.mean(y_pred == y_true))
+        }
+
+    def _save_calibration_diagnostics(self, X_val_s, y_val, val_pred_raw):
+        """히스토그램/리라이어빌리티/Brier 저장(검증세트 기준)"""
+        try:
+            val_pred_cal = self._apply_calibration(val_pred_raw)
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            outdir = os.path.join(self.config.MODEL_DIR, "diag")
+            os.makedirs(outdir, exist_ok=True)
+
+            # 히스토그램
+            plt.figure(figsize=(9, 4))
+            plt.subplot(1, 2, 1)
+            plt.hist(val_pred_raw, bins=50)
+            plt.title("P(UP) raw (val)")
+            plt.xlabel("p_up"); plt.ylabel("freq")
+
+            plt.subplot(1, 2, 2)
+            plt.hist(val_pred_cal, bins=50)
+            plt.title(f"P(UP) calibrated ({self.calib_method})")
+            plt.xlabel("p_up"); plt.ylabel("freq")
+
+            hist_path = os.path.join(outdir, f"proba_hist_{ts}.png")
+            plt.tight_layout(); plt.savefig(hist_path); plt.close()
+
+            # 리라이어빌리티 커브
+            frac_raw, mean_raw = calibration_curve(y_val.values, val_pred_raw, n_bins=20, strategy="uniform")
+            frac_cal, mean_cal = calibration_curve(y_val.values, val_pred_cal, n_bins=20, strategy="uniform")
+
+            plt.figure(figsize=(5, 5))
+            plt.plot([0, 1], [0, 1], linestyle="--", label="ideal")
+            plt.plot(mean_raw, frac_raw, marker="o", label="raw")
+            plt.plot(mean_cal, frac_cal, marker="o", label=f"calibrated ({self.calib_method})")
+            plt.xlabel("predicted probability"); plt.ylabel("observed frequency")
+            plt.title("Reliability (validation)"); plt.legend()
+            rel_path = os.path.join(outdir, f"reliability_{ts}.png")
+            plt.tight_layout(); plt.savefig(rel_path); plt.close()
+
+            # Brier
+            b_raw = brier_score_loss(y_val.values, val_pred_raw)
+            b_cal = brier_score_loss(y_val.values, val_pred_cal)
+            print(f"진단 저장: {hist_path}")
+            print(f"진단 저장: {rel_path}")
+            print(f"Brier raw={b_raw:.4f} → calibrated={b_cal:.4f}")
+        except Exception as e:
+            print(f"(진단 저장 생략) {e}")
+
+    # --- Save / Load ---
+    def save_model(self, filepath=None):
+        if filepath is None:
+            filepath = os.path.join(self.config.MODEL_DIR, 'current_model.pkl')
+        data = {
+            'models': self.models,
+            'scaler': self.scaler,
+            'selected_features': self.selected_features,
+            'feature_importance': self.feature_importance,
+            'calibration_method': self.calib_method,
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        }
+        if self.calibrator is not None:
+            data['calibrator'] = self.calibrator
+        joblib.dump(data, filepath)
+
+        if self.feature_importance is not None:
+            os.makedirs(self.config.FEATURE_LOG_DIR, exist_ok=True)
+            fp = os.path.join(self.config.FEATURE_LOG_DIR,
+                              f'feature_importance_{datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")}.csv')
+            self.feature_importance.to_csv(fp, index=False)
+
+        sel = os.path.join(self.config.FEATURE_LOG_DIR, 'selected_features.json')
+        with open(sel, 'w') as f:
+            json.dump({
+                'features': self.selected_features,
+                'count': len(self.selected_features) if self.selected_features else 0,
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            }, f, indent=2)
+
+    def load_model(self, filepath=None):
+        if filepath is None:
+            filepath = os.path.join(self.config.MODEL_DIR, 'current_model.pkl')
+        if not os.path.exists(filepath):
+            return False
+        data = joblib.load(filepath)
+        self.models = data['models']
+        self.scaler = data['scaler']
+        self.selected_features = data['selected_features']
+        self.feature_importance = data.get('feature_importance')
+        self.calib_method = data.get('calibration_method', 'isotonic')
+        self.calibrator = data.get('calibrator', None)
+        return True
+
+
+# ===============================
+# Model Optimizer (초기학습/재학습/실패분석)
+# ===============================
+class ModelOptimizer:
+    def __init__(self, config):
+        self.config = config
+        self.trainer = ModelTrainer(config)
+
+    def initial_training(self, df):
+        print("="*60)
+        print("초기 학습 시작")
+        print("="*60)
+
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+            print(f"기간: {df['timestamp'].min()} ~ {df['timestamp'].max()}")
 
         fe = FeatureEngineer()
         X = fe.create_feature_pool(df, lookback_window=200)
         y = fe.create_target(df, window=self.config.PREDICTION_WINDOW)
 
-        y = y.dropna()
-        common = X.index.intersection(y.index)
-        X = X.loc[common]
-        y = y.loc[common].astype(int)
-
-        X = X.fillna(method="ffill").fillna(0).replace([np.inf, -np.inf], 0)
-        return X, y
-
-    def feature_selection_temporal(self, X: pd.DataFrame, y: pd.Series, top_k: int = 50):
-        cols = [c for c in X.columns if c != "timestamp"]
-        n = len(X)
-        cut = int(n * 0.7)
-        Xtr, ytr = X.iloc[:cut][cols], y.iloc[:cut]
-        Xva, yva = X.iloc[cut:][cols], y.iloc[cut:]
-
-        dtr = lgb.Dataset(Xtr, ytr)
-        dva = lgb.Dataset(Xva, yva, reference=dtr)
-        params = self.config.LGBM_PARAMS.copy()
-        params.update({"objective": "binary", "metric": "binary_logloss"})
-
-        model = lgb.train(
-            params, dtr, valid_sets=[dva],
-            callbacks=[lgb.early_stopping(10), lgb.log_evaluation(0)]
-        )
-
-        imp = pd.DataFrame({
-            "feature": cols,
-            "importance": model.feature_importance("gain")
-        }).sort_values("importance", ascending=False)
-
-        self.feature_importance = imp
-        self.selected_features = imp.head(top_k)["feature"].tolist()
-        print("\n[피처선택 상위 10]")
-        for _, r in imp.head(10).iterrows():
-            print(f"  {r['feature']}: {r['importance']:.2f}")
-        return self.selected_features
-
-    def _split_ts(self, X: pd.DataFrame, y: pd.Series, test_size=0.2):
-        tot = len(X); val_n = int(tot * test_size); tr_n = tot - 2*val_n
-        Xtr, ytr = X.iloc[:tr_n], y.iloc[:tr_n]
-        Xva, yva = X.iloc[tr_n:tr_n+val_n], y.iloc[tr_n:tr_n+val_n]
-        Xte, yte = X.iloc[tr_n+val_n:], y.iloc[tr_n+val_n:]
-        return Xtr, ytr, Xva, yva, Xte, yte
-
-    def _eval(self, y_true, p, thr=0.5):
-        y_pred = (p > thr).astype(int)
-        return dict(
-            accuracy=float(accuracy_score(y_true, y_pred)),
-            precision=float(precision_score(y_true, y_pred, zero_division=0)),
-            recall=float(recall_score(y_true, y_pred, zero_division=0)),
-            f1=float(f1_score(y_true, y_pred, zero_division=0)),
-            win_rate=float(np.mean(y_pred == y_true)),
-        )
-
-    def train_ensemble_temporal(self, X: pd.DataFrame, y: pd.Series, test_size=0.2):
-        self.models.clear()
-        if "timestamp" in X.columns:
-            X = X.drop(columns=["timestamp"])
-        if self.selected_features:
-            X = X[self.selected_features]
-
-        Xtr, ytr, Xva, yva, Xte, yte = self._split_ts(X, y, test_size=test_size)
-        Xtr_s = self.scaler.fit_transform(Xtr)
-        Xva_s = self.scaler.transform(Xva)
-        Xte_s = self.scaler.transform(Xte)
-
-        for i in range(self.config.ENSEMBLE_MODELS):
-            params = self.config.LGBM_PARAMS.copy()
-            params.update(dict(
-                random_state=42+i,
-                num_leaves=31 + i*8,
-                learning_rate=max(0.01, 0.05 - i*0.005),
-                feature_fraction=max(0.6, 0.9 - i*0.05),
-                bagging_fraction=min(0.95, 0.8 + i*0.03),
-                objective="binary", metric="binary_logloss"
-            ))
-            start = int(i * len(Xtr_s) * 0.1)
-            dtr = lgb.Dataset(Xtr_s[start:], ytr.iloc[start:])
-            dva = lgb.Dataset(Xva_s, yva, reference=dtr)
-            model = lgb.train(
-                params, dtr, valid_sets=[dva],
-                callbacks=[lgb.early_stopping(10), lgb.log_evaluation(0)]
-            )
-            self.models.append(model)
-            print(f"  - 모델 {i+1} 학습 완료")
-
-        tr_p = self.predict_proba_raw(Xtr_s)
-        va_p = self.predict_proba_raw(Xva_s)
-        te_p = self.predict_proba_raw(Xte_s)
-        return dict(
-            train=self._eval(ytr, tr_p),
-            validation=self._eval(yva, va_p),
-            test=self._eval(yte, te_p),
-        )
-
-    def predict_proba_raw(self, Xs: np.ndarray) -> np.ndarray:
-        if not self.models:
-            return np.zeros(Xs.shape[0])
-        preds = np.vstack([m.predict(Xs, num_iteration=m.best_iteration) for m in self.models])
-        w = np.array([0.15,0.15,0.2,0.25,0.25])[:preds.shape[0]]
-        w = w / w.sum()
-        return np.average(preds, axis=0, weights=w)
-
-    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        Xc = X.copy()
-        if "timestamp" in Xc.columns:
-            Xc = Xc.drop(columns=["timestamp"])
-        if self.selected_features:
-            # 실시간 누락 피처가 있으면 0으로 채워도 OK (real_trade에서 이미 처리)
-            missing = [c for c in self.selected_features if c not in Xc.columns]
-            for c in missing:
-                Xc[c] = 0.0
-            Xc = Xc[self.selected_features]
-        Xc = Xc.fillna(method="ffill").fillna(0).replace([np.inf, -np.inf], 0)
-        Xs = self.scaler.transform(Xc)
-        return self.predict_proba_raw(Xs)
-
-    def predict(self, X: pd.DataFrame, threshold=0.5):
-        return (self.predict_proba(X) > threshold).astype(int)
-
-    # -------- I/O --------
-    def save_model(self, filepath=None):
-        if filepath is None:
-            filepath = os.path.join(self.config.MODEL_DIR, "current_model.pkl")
-        data = dict(
-            models=self.models,
-            scaler=self.scaler,
-            selected_features=self.selected_features,
-            feature_importance=self.feature_importance,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-        )
-        joblib.dump(data, filepath)
-        if self.feature_importance is not None:
-            fi_path = os.path.join(
-                self.config.FEATURE_LOG_DIR,
-                f"feature_importance_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"
-            )
-            self.feature_importance.to_csv(fi_path, index=False)
-        sf = os.path.join(self.config.FEATURE_LOG_DIR, "selected_features.json")
-        with open(sf, "w", encoding="utf-8") as f:
-            json.dump(
-                {"features": self.selected_features or [], "count": len(self.selected_features or [])},
-                f, indent=2
-            )
-
-    def load_model(self, filepath=None) -> bool:
-        if filepath is None:
-            filepath = os.path.join(self.config.MODEL_DIR, "current_model.pkl")
-        if not os.path.exists(filepath):
-            return False
-        data = joblib.load(filepath)
-        self.models = data["models"]
-        self.scaler = data["scaler"]
-        self.selected_features = data["selected_features"]
-        self.feature_importance = data.get("feature_importance")
-        return True
-
-
-# ---------------- Optimizer (선택) ----------------
-class ModelOptimizer:
-    def __init__(self, config):
-        self.config = config
-        self.trainer = TimeSeriesModelTrainer(config)
-
-    def initial_training(self, df: pd.DataFrame):
-        print("="*50); print("초기 모델 학습 시작"); print("="*50)
-        X, y = self.trainer._prepare_xy(df)
+        valid = y.notna() & (y.index >= 200)
+        X, y = X[valid], y[valid]
         print(f"유효 샘플: {len(X)}")
-        self.trainer.feature_selection_temporal(X, y, top_k=50)
-        metrics = self.trainer.train_ensemble_temporal(X, y)
+
+        print("\n미래 누출 점검...")
+        if not fe.validate_no_future_leak(X, y):
+            print("⚠️ 누출 의심 존재")
+        else:
+            print("✓ 누출 없음")
+
+        print("\n피처 선택...")
+        topk = int(getattr(self.config, 'TOP_K_FEATURES', 30))
+        self.trainer.feature_selection_temporal(X, y, top_k=topk)
+
+        print("\n학습 + 캘리브레이션...")
+        metrics = self.trainer.train_ensemble_temporal(X, y, test_size=0.2)
+
+        print("\n결과:")
+        for split, m in metrics.items():
+            print(f"\n{split.upper()}:")
+            for k, v in m.items():
+                print(f"  {k}: {v:.4f}")
+
         self.trainer.save_model()
+        print("\n모델 저장 완료")
+
+        # 로그 저장
+        os.makedirs(self.config.MODEL_DIR, exist_ok=True)
         pd.DataFrame(metrics).T.to_csv(
-            os.path.join(self.config.MODEL_DIR, f"training_results_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv")
+            os.path.join(self.config.MODEL_DIR, f'training_results_{datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")}.csv')
         )
         return metrics
 
-    def retrain_model(self, df: pd.DataFrame):
-        print("\n모델 재학습 시작...")
-        # old/new 비교 후 더 좋은 쪽 유지 로직은 필요 시 이전 버전 그대로 사용 가능
-        new = TimeSeriesModelTrainer(self.config)
-        X, y = new._prepare_xy(df)
-        if new.selected_features is None:
-            # 기존 모델 피처 재사용
-            old = TimeSeriesModelTrainer(self.config)
-            if old.load_model():
-                new.selected_features = old.selected_features
-        metrics_new = new.train_ensemble_temporal(X, y)
-        new.save_model()  # 간단화(필요시 A/B 비교 추가)
-        self.trainer = new
-        return metrics_new
+    def retrain_model(self, new_df):
+        print("\n재학습 시작...")
+        if 'timestamp' in new_df.columns:
+            new_df['timestamp'] = pd.to_datetime(new_df['timestamp'], utc=True)
+
+        fe = FeatureEngineer()
+        X = fe.create_feature_pool(new_df, lookback_window=200)
+        y = fe.create_target(new_df, window=self.config.PREDICTION_WINDOW)
+
+        valid = y.notna() & (y.index >= 200)
+        X, y = X[valid], y[valid]
+
+        old = ModelTrainer(self.config)
+        old.load_model()
+
+        new = ModelTrainer(self.config)
+        new.selected_features = old.selected_features
+
+        new_metrics = new.train_ensemble_temporal(X, y, test_size=0.2)
+
+        # 최근 10% 비교
+        n = len(X)
+        if n > 0:
+            start = int(n * 0.9)
+            X_te, y_te = X.iloc[start:], y.iloc[start:]
+            old_pred = old.predict(X_te)
+            new_pred = new.predict(X_te)
+            old_acc = accuracy_score(y_te, old_pred)
+            new_acc = accuracy_score(y_te, new_pred)
+
+            print("\n모델 비교(최근 10%):")
+            print(f"  old acc: {old_acc:.4f}")
+            print(f"  new acc: {new_acc:.4f}")
+
+            if new_acc > old_acc:
+                print("→ 새 모델 채택")
+                bkp = os.path.join(self.config.MODEL_DIR,
+                                   f'backup/model_{datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")}.pkl')
+                os.makedirs(os.path.dirname(bkp), exist_ok=True)
+                old.save_model(bkp)
+                new.save_model()
+                self.trainer = new
+            else:
+                print("→ 기존 모델 유지")
+                self.trainer = old
+
+        return new_metrics
+
+    def analyze_failures(self, trade_log_df):
+        """실패 거래에서 패턴을 찾아 간단 필터 제안(후속 시스템에서 활용)"""
+        if 'result' not in trade_log_df.columns:
+            return {}
+
+        fails = trade_log_df[trade_log_df['result'] == 0].copy()
+        if fails.empty:
+            print("실패 거래 없음.")
+            return {}
+
+        print("\n" + "="*60)
+        print(f"실패 패턴 분석 (n={len(fails)})")
+        print("="*60)
+
+        patterns = {}
+
+        # 변동성 기반
+        if 'atr_14' in fails.columns:
+            f_atr = fails['atr_14'].dropna()
+            s_atr = trade_log_df[trade_log_df['result'] == 1]['atr_14'].dropna()
+            if len(f_atr) > 5 and len(s_atr) > 5:
+                if f_atr.quantile(0.75) > s_atr.quantile(0.75) * 1.2:
+                    th = float(f_atr.quantile(0.6))
+                    patterns['high_volatility'] = {
+                        'type': 'num', 'name': 'High ATR',
+                        'field': 'atr_14', 'operator': '>',
+                        'threshold': th,
+                        'condition': f"atr_14>{th:.6f}",
+                        'reason': f"실패 ATR↑ (median {f_atr.median():.6f} vs 성공 {s_atr.median():.6f})",
+                        'improvement': 0.0
+                    }
+                    print(f"✓ 변동성 필터: ATR>{th:.6f}")
+
+        # 거래량 기반
+        if 'volume_ratio' in fails.columns:
+            f_v = fails['volume_ratio'].dropna()
+            s_v = trade_log_df[trade_log_df['result'] == 1]['volume_ratio'].dropna()
+            if len(f_v) > 5 and len(s_v) > 5:
+                high_total = len(trade_log_df[trade_log_df['volume_ratio'] > 1.5])
+                if high_total > 0:
+                    high_fail = len(f_v[f_v > 1.5])
+                    rate = high_fail / high_total if high_total else 0
+                    if rate > 0.6:
+                        patterns['high_volume'] = {
+                            'type': 'num', 'name': 'High Volume',
+                            'field': 'volume_ratio', 'operator': '>',
+                            'threshold': 1.5,
+                            'condition': "volume_ratio>1.5",
+                            'reason': f"고거래량 실패율 {rate:.1%}",
+                            'improvement': 0.0
+                        }
+                        print(f"✓ 고거래량 필터: volume_ratio>1.5")
+
+                low_total = len(trade_log_df[trade_log_df['volume_ratio'] < 0.5])
+                if low_total > 0:
+                    low_fail = len(f_v[f_v < 0.5])
+                    rate = low_fail / low_total if low_total else 0
+                    if rate > 0.6:
+                        patterns['low_volume'] = {
+                            'type': 'num', 'name': 'Low Volume',
+                            'field': 'volume_ratio', 'operator': '<',
+                            'threshold': 0.5,
+                            'condition': "volume_ratio<0.5",
+                            'reason': f"저거래량 실패율 {rate:.1%}",
+                            'improvement': 0.0
+                        }
+                        print(f"✓ 저거래량 필터: volume_ratio<0.5")
+
+        # RSI 극단
+        if 'rsi_14' in fails.columns:
+            ext_fail = fails[(fails['rsi_14'] < 30) | (fails['rsi_14'] > 70)]
+            ext_all  = trade_log_df[(trade_log_df['rsi_14'] < 30) | (trade_log_df['rsi_14'] > 70)]
+            if len(ext_all) > 5:
+                rate = len(ext_fail) / len(ext_all)
+                if rate > 0.6:
+                    patterns['rsi_extreme'] = {
+                        'type': 'range', 'name': 'RSI extreme',
+                        'field': 'rsi_14', 'operator': 'extreme',
+                        'lower_threshold': 30.0, 'upper_threshold': 70.0,
+                        'condition': "rsi_14<30 or rsi_14>70",
+                        'reason': f"극단 RSI에서 실패↑ ({rate:.1%})",
+                        'improvement': 0.0
+                    }
+                    print("✓ RSI 극단값 필터")
+
+        # 저장(필요하면 외부에서 개선도 계산 후 active 필터화)
+        os.makedirs(self.config.MODEL_DIR, exist_ok=True)
+        fpath = os.path.join(self.config.MODEL_DIR, 'adaptive_filters.json')
+        with open(fpath, 'w') as f:
+            json.dump({'active_filters': [], 'filter_history': [patterns]}, f, indent=2)
+        print(f"\n임시 필터 제안 저장: {fpath}\n")
+        return patterns
+
+
+# ===============================
+# Quick sample run
+# ===============================
+if __name__ == "__main__":
+    from config import Config
+    Config.create_directories()
+
+    # 샘플 데이터 생성(UTC 1분봉)
+    print("샘플 데이터 생성...")
+    periods = 1000
+    ts = pd.date_range(end=datetime.now(timezone.utc), periods=periods, freq='1min', tz='UTC')
+    np.random.seed(42)
+    base = 42000 + np.random.randn(periods).cumsum() * 20
+
+    rows = []
+    for i, t in enumerate(ts):
+        b = base[i]
+        o = b + np.random.uniform(-20, 20)
+        c = b + np.random.uniform(-20, 20)
+        h = max(o, c) + np.random.uniform(0, 30)
+        l = min(o, c) - np.random.uniform(0, 30)
+        v = np.random.uniform(100, 1000)
+        rows.append({'timestamp': t, 'open': o, 'high': h, 'low': l, 'close': c, 'volume': v})
+    df = pd.DataFrame(rows)
+    df.to_csv('sample_data.csv', index=False)
+
+    # 상위봉 레짐 설정(원하면 config.py에 REGIME_TF='15min', REGIME_ADX_THR=20 정의)
+    opt = ModelOptimizer(Config)
+    metrics = opt.initial_training(df)
+
+    print("\n학습 결과 요약:")
+    for split, m in metrics.items():
+        print(f"  {split}: acc={m['accuracy']:.4f}, prec={m['precision']:.4f}, rec={m['recall']:.4f}, f1={m['f1']:.4f}, win={m['win_rate']:.4f}")
