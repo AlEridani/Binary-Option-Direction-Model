@@ -363,22 +363,32 @@ class ModelTrainer:
         if regime_col not in X.columns:
             return self.feature_selection_temporal(X, y, top_k)
 
+        # 인덱스 정렬 및 리셋 (핵심 수정)
         X = X.reset_index(drop=True)
         y = y.reset_index(drop=True)
+        
+        # 길이 맞추기
+        min_len = min(len(X), len(y))
+        X = X.iloc[:min_len]
+        y = y.iloc[:min_len]
 
         all_selected = set()
 
         for rval in [1, -1, 0]:
             rname = self._regime_to_name(rval)
-            mask = (X[regime_col] == rval)
-            Xr = X[mask]
-            yr = y[mask]
+            mask = (X[regime_col] == rval).values  # .values로 numpy array 변환
+            Xr = X[mask].copy()
+            yr = y[mask].copy()
 
             if len(Xr) < 100:
                 print(f"  레짐 {rname}: 샘플 부족 ({len(Xr)}개) → 스킵")
                 continue
 
             print(f"\n레짐 {rname} 피처 선택 (n={len(Xr)})...")
+
+            # 다시 인덱스 리셋
+            Xr = Xr.reset_index(drop=True)
+            yr = yr.reset_index(drop=True)
 
             train_size = int(len(Xr) * 0.7)
             X_tr, y_tr = Xr.iloc[:train_size], yr.iloc[:train_size]
@@ -495,8 +505,13 @@ class ModelTrainer:
         if regime_col not in X.columns:
             return self.train_ensemble_temporal(X, y, test_size)
 
+        # 인덱스 정렬 및 길이 맞추기
         X = X.reset_index(drop=True)
         y = y.reset_index(drop=True)
+        
+        min_len = min(len(X), len(y))
+        X = X.iloc[:min_len]
+        y = y.iloc[:min_len]
 
         if not self.selected_features:
             self.selected_features = [c for c in X.columns if c not in ['timestamp', 'regime', 'htf_regime']][:50]
@@ -509,14 +524,18 @@ class ModelTrainer:
             print(f"레짐 {rname} ({rval}) 학습 시작")
             print(f"{'='*60}")
 
-            mask = (X[regime_col] == rval)
-            Xr = X[mask]
-            yr = y[mask]
+            mask = (X[regime_col] == rval).values  # .values로 numpy array 변환
+            Xr = X[mask].copy()
+            yr = y[mask].copy()
 
             if len(Xr) < 200:
                 print(f"  샘플 부족 ({len(Xr)}개) → 스킵")
                 self.bundles[rname] = None
                 continue
+
+            # 인덱스 리셋
+            Xr = Xr.reset_index(drop=True)
+            yr = yr.reset_index(drop=True)
 
             Xs = Xr[self.selected_features]
             Xs = _safe_prep(Xs)

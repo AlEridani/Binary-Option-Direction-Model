@@ -750,25 +750,48 @@ class RealTimeTrader:
         if end_date:
             historical_data = historical_data[historical_data['timestamp'] <= end_date]
 
+        # 인덱스 리셋
+        historical_data = historical_data.reset_index(drop=True)
+
         from model_train import FeatureEngineer
         fe = FeatureEngineer()
-        features = fe.create_feature_pool(historical_data)
+        features = fe.create_feature_pool(historical_data, lookback_window=200)
         target = fe.create_target(historical_data, window=self.config.PREDICTION_WINDOW)
 
-        valid_idx = target.notna()
-        features = features[valid_idx]
-        target = target[valid_idx]
+        # 인덱스 정렬 및 길이 맞추기
+        features = features.reset_index(drop=True)
+        target = target.reset_index(drop=True)
+        
+        min_len = min(len(features), len(target))
+        features = features.iloc[:min_len]
+        target = target.iloc[:min_len]
+
+        # valid 체크 (numpy array로 변환) ← 핵심 수정
+        valid_idx = (target.notna()).values  # .values 추가!
+        features = features[valid_idx].reset_index(drop=True)
+        target = target[valid_idx].reset_index(drop=True)
 
         trades = []
 
         for i in range(len(features) - self.config.PREDICTION_WINDOW):
             X_current = features.iloc[[i]]
-            p_up_arr = np.ravel(self.model_trainer.predict_proba(X_current))
-            if len(p_up_arr) == 0 or not np.isfinite(p_up_arr[-1]):
-                continue
-            p_up = float(p_up_arr[-1])
-
+            
+            # 레짐 추출
             regime = int(features['regime'].iloc[i]) if 'regime' in features.columns else 0
+            
+            # 레짐별 모델로 예측
+            p_up = self.model_trainer.predict_proba(X_current, regime=regime)
+            
+            # numpy array면 스칼라로 변환
+            if isinstance(p_up, np.ndarray):
+                p_up = float(p_up[-1]) if len(p_up) > 0 else 0.5
+            else:
+                p_up = float(p_up)
+            
+            if not np.isfinite(p_up):
+                continue
+
+            # 레짐 기반 진입 결정
             side = self.model_trainer.decide_from_proba_regime(p_up, regime)
             if side is None:
                 continue
@@ -776,7 +799,7 @@ class RealTimeTrader:
             actual = int(target.iloc[i])
 
             trades.append({
-                'timestamp': historical_data['timestamp'].iloc[i],
+                'timestamp': historical_data['timestamp'].iloc[i] if 'timestamp' in historical_data.columns else i,
                 'p_up': p_up,
                 'regime': regime,
                 'decision': side,
@@ -802,6 +825,17 @@ class RealTimeTrader:
         print(f"- 승률: {win_rate:.2%}")
         print(f"- 총 손익(가정): ${profit:.2f}")
         print(f"- 평균 손익/거래: ${profit/total_trades if total_trades > 0 else 0:.2f}")
+        
+        # 레짐별 통계
+        if total_trades > 0 and 'regime' in trades_df.columns:
+            print(f"\n레짐별 성과:")
+            for regime_val in [1, -1, 0]:
+                regime_name = "UP" if regime_val == 1 else ("DOWN" if regime_val == -1 else "FLAT")
+                regime_trades = trades_df[trades_df['regime'] == regime_val]
+                if len(regime_trades) > 0:
+                    regime_wins = regime_trades['correct'].sum()
+                    regime_wr = regime_wins / len(regime_trades)
+                    print(f"  [{regime_name:5s}] 거래: {len(regime_trades):4d}  승률: {regime_wr:.2%}")
 
         return trades_df
 

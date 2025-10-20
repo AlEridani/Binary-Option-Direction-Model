@@ -1,5 +1,3 @@
-# start.py - 간단한 시작 스크립트
-
 import sys
 import os
 from datetime import datetime
@@ -41,29 +39,45 @@ def quick_start():
     print("\n초기 모델 학습 중... (약 1-2분 소요)")
     metrics = pipeline.model_optimizer.initial_training(initial_data)
     
-    print("\n학습 결과:")
-    print(f"- 학습 승률: {metrics['train']['win_rate']:.2%}")
-    print(f"- 검증 승률: {metrics['validation']['win_rate']:.2%}")
-    print(f"- 테스트 승률: {metrics['test']['win_rate']:.2%}")
+    # 레짐별 결과 출력
+    print("\n학습 결과 (레짐별):")
+    print("="*60)
+    
+    for regime_name in ['UP', 'DOWN', 'FLAT']:
+        if regime_name in metrics:
+            regime_metrics = metrics[regime_name]
+            print(f"\n[{regime_name} 레짐]")
+            print(f"  - 학습 승률:   {regime_metrics['train']['win_rate']:.2%}")
+            print(f"  - 검증 승률:   {regime_metrics['validation']['win_rate']:.2%}")
+            print(f"  - 테스트 승률: {regime_metrics['test']['win_rate']:.2%}")
+    
+    # 전체 평균 계산
+    all_test_rates = []
+    for regime_name, regime_metrics in metrics.items():
+        all_test_rates.append(regime_metrics['test']['win_rate'])
+    
+    if all_test_rates:
+        avg_test_rate = sum(all_test_rates) / len(all_test_rates)
+        print(f"\n전체 평균 테스트 승률: {avg_test_rate:.2%}")
     
     # 5. 백테스팅
-    print("\n백테스팅 실행 중...")
-    test_data = initial_data.tail(10000)  # 최근 10000개 데이터로 백테스트
-    if pipeline.real_trader is not None:  # None 체크 추가
+    if pipeline.real_trader is not None:
         print("\n백테스팅 실행 중...")
-        test_data = initial_data.tail(10000)
+        test_data = initial_data.tail(10000)  # 최근 10000개 데이터로 백테스트
         results = pipeline.real_trader.backtest(test_data)
     else:
         print("\n⚠️  실시간 거래 모듈이 초기화되지 않았습니다.")
         print("시스템 초기화 중...")
-    if pipeline.initialize_system():
-        results = pipeline.real_trader.backtest(test_data)
+        if pipeline.initialize_system():
+            test_data = initial_data.tail(10000)
+            results = pipeline.real_trader.backtest(test_data)
+    
     return pipeline
 
 def main_menu():
     """메인 메뉴"""
     print("\n" + "="*60)
-    print("바이너리 옵션 예측 시스템 v1.0")
+    print("바이너리 옵션 예측 시스템 v1.0 (레짐 스위칭)")
     print("="*60)
     print("\n실행 모드를 선택하세요:")
     print("1. 빠른 시작 (시뮬레이션)")
@@ -83,8 +97,10 @@ def main_menu():
         # 시뮬레이션 거래 시작
         print("\n시뮬레이션 거래를 시작하시겠습니까? (y/n): ", end="")
         if input().lower() == 'y':
-            print("시뮬레이션 거래 시작 (1시간)...")
-            pipeline.real_trader.run_live_trading(duration_hours=1)
+            duration = input("실행 시간 (시간, Enter=1): ").strip()
+            duration = int(duration) if duration else 1
+            print(f"시뮬레이션 거래 시작 ({duration}시간)...")
+            pipeline.real_trader.run_live_trading(duration_hours=duration)
             
     elif choice == "2":
         # 실시간 거래
@@ -92,7 +108,18 @@ def main_menu():
         print("API 키를 설정하셨습니까? (y/n): ", end="")
         if input().lower() == 'y':
             pipeline = MainPipeline()
-            pipeline.start()
+            
+            # 모델이 없으면 먼저 학습
+            if not os.path.exists(os.path.join(Config.MODEL_DIR, 'bundle_UP.pkl')):
+                print("\n학습된 모델이 없습니다. 초기 학습을 진행합니다...")
+                initial_data = pipeline.generate_simulation_data(days=270)
+                pipeline.model_optimizer.initial_training(initial_data)
+            
+            duration = input("실행 시간 (시간, Enter=무제한): ").strip()
+            duration = int(duration) if duration else 99999
+            
+            if pipeline.initialize_system():
+                pipeline.real_trader.run_live_trading(duration_hours=duration)
         else:
             print("config.py에서 API 키를 설정해주세요.")
             
@@ -103,7 +130,18 @@ def main_menu():
         end_date = input("종료 날짜 (YYYY-MM-DD, Enter로 스킵): ").strip()
         
         pipeline = MainPipeline()
-        pipeline.run_backtest(
+        
+        # 모델 체크
+        if not pipeline.initialize_system():
+            print("\n모델을 먼저 학습해주세요. (메뉴 1번)")
+            return
+        
+        # 데이터 생성 또는 로드
+        print("\n데이터 생성 중...")
+        data = pipeline.generate_simulation_data(days=90)
+        
+        results = pipeline.real_trader.backtest(
+            data,
             start_date=pd.to_datetime(start_date) if start_date else None,
             end_date=pd.to_datetime(end_date) if end_date else None
         )
@@ -111,18 +149,34 @@ def main_menu():
     elif choice == "4":
         # 모델 재학습
         pipeline = MainPipeline()
-        if pipeline.initialize_system():
-            pipeline.retrain_pipeline()
+        
+        print("\n새로운 데이터 생성 중...")
+        new_data = pipeline.generate_simulation_data(days=270)
+        
+        print("\n모델 재학습 중...")
+        metrics = pipeline.model_optimizer.retrain_model(new_data)
+        
+        print("\n재학습 완료!")
+        for regime_name in ['UP', 'DOWN', 'FLAT']:
+            if regime_name in metrics:
+                regime_metrics = metrics[regime_name]
+                print(f"\n[{regime_name}]")
+                print(f"  테스트 승률: {regime_metrics['test']['win_rate']:.2%}")
 
     elif choice == "5":
         # 성능 리포트
         pipeline = MainPipeline()
+        
+        if not pipeline.initialize_system():
+            print("\n거래 기록이 없거나 모델이 없습니다.")
+            return
+        
         pipeline.monitor.generate_report()
         
     elif choice == "6":
         # 하이퍼파라미터 최적화
-        pipeline = MainPipeline()
-        pipeline.optimize_hyperparameters()
+        print("\n하이퍼파라미터 최적화는 개발 중입니다.")
+        print("현재는 config.py에서 수동으로 조정해주세요.")
         
     elif choice == "0":
         print("프로그램을 종료합니다.")
@@ -286,12 +340,6 @@ python main_pipe.py --mode optimize
 3. **필터 최적화**
    - 거래 시간대 분석
    - 변동성 임계값 조정
-
-## 라이선스 및 책임
-
-- 이 시스템은 교육 목적으로 제작됨
-- 실제 거래로 인한 손실에 대한 책임은 사용자에게 있음
-- 투자는 항상 신중하게 결정하세요
 
 ================================================================================
 """
