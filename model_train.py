@@ -1205,7 +1205,9 @@ class ModelOptimizer:
         return metrics
 
     def retrain_model(self, new_df):
-        print("\n재학습 시작 (레짐별)...")
+        print("\n" + "="*60)
+        print("재학습 시작 (홀드아웃 테스트셋 비교)")
+        print("="*60)
         
         total_steps = 6
         
@@ -1214,6 +1216,7 @@ class ModelOptimizer:
         
         if 'timestamp' in new_df.columns:
             new_df['timestamp'] = pd.to_datetime(new_df['timestamp'], utc=True)
+            print(f"기간: {new_df['timestamp'].min()} ~ {new_df['timestamp'].max()}")
 
         fe = FeatureEngineer()
         X = fe.create_feature_pool(new_df, lookback_window=200)
@@ -1221,98 +1224,240 @@ class ModelOptimizer:
 
         valid = y.notna() & (y.index >= 200)
         X, y = X[valid], y[valid]
+        print(f"유효 샘플: {len(X):,}건")
+        
+        # ★ 학습/테스트 분리 (시간순, 85% / 15%)
+        split_point = int(len(X) * 0.85)
+        
+        X_train_full = X.iloc[:split_point].reset_index(drop=True)
+        y_train_full = y.iloc[:split_point].reset_index(drop=True)
+        
+        X_test = X.iloc[split_point:].reset_index(drop=True)
+        y_test = y.iloc[split_point:].reset_index(drop=True)
+        
+        print(f"  - 학습: {len(X_train_full):,}건 (85%)")
+        print(f"  - 테스트: {len(X_test):,}건 (15%) ← 비교용, 학습 미사용")
+        
+        if len(X_test) < 100:
+            print("❌ 테스트셋 부족 - 재학습 중단")
+            self.pending_retrain = False
+            return None
 
         # Step 2: 기존 모델 로드
         self.update_progress(2, total_steps, "기존 모델 로드 중")
         
         old = ModelTrainer(self.config)
-        old.load_model()
+        has_old_model = old.load_model()
+        
+        if not has_old_model:
+            print("⚠️ 기존 모델 없음 → 초기 학습 모드")
+            # 초기 학습과 동일하게 처리
+            self.trainer.feature_selection_regime(X_train_full, y_train_full, regime_col='regime', top_k=30)
+            self.trainer._progress_callback = lambda regime: self.update_progress(
+                3, total_steps, f"초기 학습 중", regime
+            )
+            metrics = self.trainer.train_ensemble_regime(X_train_full, y_train_full, regime_col='regime', test_size=0.15)
+            self.trainer.save_model()
+            
+            flag_path = os.path.join(self.config.BASE_DIR, '.retrain_complete')
+            with open(flag_path, 'w', encoding='utf-8') as f:
+                f.write(datetime.now(timezone.utc).isoformat())
+            
+            return metrics
 
         # Step 3: 새 모델 학습
         self.update_progress(3, total_steps, "새 모델 학습 중")
         
+        print("\n새 모델 학습 중...")
         new = ModelTrainer(self.config)
-        new.selected_features = old.selected_features
         
-        # 진행 상황 콜백 설정
+        # 기존 피처 재사용
+        if old.selected_features:
+            print(f"  기존 피처 재사용: {len(old.selected_features)}개")
+            new.selected_features = old.selected_features
+        else:
+            print("  새 피처 선택...")
+            new.feature_selection_regime(X_train_full, y_train_full, regime_col='regime', top_k=30)
+        
         new._progress_callback = lambda regime: self.update_progress(
             3, total_steps, f"새 모델 학습 중", regime
         )
-
-        new_metrics = new.train_ensemble_regime(X, y, regime_col='regime', test_size=0.2)
-
-        # Step 4: 모델 비교
-        self.update_progress(4, total_steps, "모델 성능 비교 중")
         
-        n = len(X)
-        if n > 0:
-            start = int(n * 0.9)
-            X_te = X.iloc[start:].reset_index(drop=True)
-            y_te = y.iloc[start:].reset_index(drop=True)
+        new_metrics = new.train_ensemble_regime(X_train_full, y_train_full, regime_col='regime', test_size=0.15)
+
+        # Step 4: 테스트셋으로 공정 비교
+        self.update_progress(4, total_steps, "모델 성능 비교 중 (테스트셋)")
+        
+        print("\n" + "="*60)
+        print("테스트셋 성능 비교 (학습에 사용 안한 데이터)")
+        print("="*60)
+        
+        regime_accs = {'old': {}, 'new': {}}
+
+        X_test_valid = X_test.copy()
+        y_test_valid = y_test.copy()
+        
+        # 레짐이 있는 데이터만 필터링
+        if 'regime' in X_test.columns:
+            X_test_valid = X_test_valid.reset_index(drop=True)
+            y_test_valid = y_test_valid.reset_index(drop=True)
+
+            # boolean mask 생성
+            valid_regime = X_test_valid['regime'].notna()
+
+            # 정수 인덱스로 변환
+            valid_indices = valid_regime[valid_regime].index.tolist()
+
+            if len(valid_indices) > 0:
+                X_test_valid = X_test_valid.loc[valid_indices].reset_index(drop=True)
+                y_test_valid = y_test_valid.loc[valid_indices].reset_index(drop=True)
+                print(f"레짐 정보 있는 테스트 샘플: {len(X_test_valid):,}건")
+            else:
+                print("⚠️ 레짐 정보 있는 테스트 샘플 없음")
+        else:
+            X_test_valid = X_test_valid.reset_index(drop=True)
+            y_test_valid = y_test_valid.reset_index(drop=True)
+
+            # 최종 길이 확인
+            min_len = min(len(X_test_valid), len(y_test_valid))
+            X_test_valid = X_test_valid.iloc[:min_len]
+            y_test_valid = y_test_valid.iloc[:min_len]
+
+        # 전체 성능
+        try:
+            old_pred_all = old.predict(X_test_valid)
+            new_pred_all = new.predict(X_test_valid)
             
-            regime_accs = {'old': {}, 'new': {}}
+            # 길이 맞추기
+            min_len = min(len(old_pred_all), len(new_pred_all), len(y_test_valid))
+            old_pred_all = old_pred_all[:min_len]
+            new_pred_all = new_pred_all[:min_len]
+            y_test_sub = y_test_valid.iloc[:min_len]
+            
+            old_acc_all = accuracy_score(y_test_sub, old_pred_all)
+            new_acc_all = accuracy_score(y_test_sub, new_pred_all)
+            
+            print(f"\n[전체 테스트셋]")
+            print(f"  기존 모델: {old_acc_all:.4f}")
+            print(f"  새 모델:   {new_acc_all:.4f}")
+            print(f"  개선:      {new_acc_all - old_acc_all:+.4f}")
+            
+            regime_accs['old']['ALL'] = old_acc_all
+            regime_accs['new']['ALL'] = new_acc_all
+            
+        except Exception as e:
+            print(f"⚠️ 전체 비교 실패: {e}")
+        
+        # 레짐별 성능
+        if 'regime' in X_test_valid.columns:
+            print(f"\n[레짐별 성능]")
             
             for rval in [1, -1, 0]:
                 rname = self.trainer._regime_to_name(rval)
                 
-                # numpy array로 변환 후 적용
-                mask = (X_te['regime'] == rval).values
-                if mask.sum() < 10:
+                try:
+                    mask = (X_test_valid['regime'] == rval)
+                    mask_indices = mask[mask].index.tolist()
+                    
+                    if len(mask_indices) < 20:
+                        print(f"  [{rname}] 샘플 부족 ({len(mask_indices)}건) - 스킵")
+                        continue
+                    
+                    X_r = X_test_valid.loc[mask_indices].reset_index(drop=True)
+                    y_r = y_test_valid.loc[mask_indices].reset_index(drop=True)
+                    
+                    old_pred = old.predict(X_r, regime=rval)
+                    new_pred = new.predict(X_r, regime=rval)
+                    
+                    # 길이 맞추기
+                    min_len = min(len(old_pred), len(new_pred), len(y_r))
+                    old_pred = old_pred[:min_len]
+                    new_pred = new_pred[:min_len]
+                    y_r = y_r.iloc[:min_len]
+                    
+                    old_acc = accuracy_score(y_r, old_pred)
+                    new_acc = accuracy_score(y_r, new_pred)
+                    
+                    regime_accs['old'][rname] = old_acc
+                    regime_accs['new'][rname] = new_acc
+                    
+                    print(f"  [{rname:5s}] 기존: {old_acc:.4f} | 새: {new_acc:.4f} | 차이: {new_acc - old_acc:+.4f}")
+                    
+                except Exception as e:
+                    print(f"  [{rname}] 비교 실패: {e}")
                     continue
-                
-                # 마스크 적용 후 즉시 인덱스 리셋
-                X_r = X_te[mask].reset_index(drop=True)
-                y_r = y_te[mask].reset_index(drop=True)
-                
-                # 길이 확인 및 맞추기
-                min_len = min(len(X_r), len(y_r))
-                X_r = X_r.iloc[:min_len]
-                y_r = y_r.iloc[:min_len]
-                
-                if len(X_r) < 10:
-                    continue
-                
-                old_pred = old.predict(X_r, regime=rval)
-                new_pred = new.predict(X_r, regime=rval)
-                
-                old_acc = accuracy_score(y_r, old_pred)
-                new_acc = accuracy_score(y_r, new_pred)
-                
-                regime_accs['old'][rname] = old_acc
-                regime_accs['new'][rname] = new_acc
-
-            print("\n모델 비교(최근 10%, 레짐별):")
+        
+        # ★ 의사결정: 평균 성능으로 판단
+        old_scores = [v for v in regime_accs['old'].values() if v > 0]
+        new_scores = [v for v in regime_accs['new'].values() if v > 0]
+        
+        old_avg = np.mean(old_scores) if old_scores else 0
+        new_avg = np.mean(new_scores) if new_scores else 0
+        
+        print(f"\n{'='*60}")
+        print(f"최종 평가:")
+        print(f"  기존 모델 평균: {old_avg:.4f}")
+        print(f"  새 모델 평균:   {new_avg:.4f}")
+        print(f"  개선폭:         {new_avg - old_avg:+.4f}")
+        
+        # Step 5: 백업 및 저장
+        self.update_progress(5, total_steps, "모델 저장 중")
+        
+        if new_avg > old_avg:
+            print(f"\n→ ✅ 새 모델 채택 (성능 향상)")
+            
+            # 백업
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            backup_dir = os.path.join(self.config.MODEL_DIR, 'backup', f'backup_{timestamp}')
+            _ensure_dir(backup_dir)
+            
+            import shutil
             for rname in ['UP', 'DOWN', 'FLAT']:
-                if rname in regime_accs['old']:
-                    print(f"  [{rname}] old: {regime_accs['old'][rname]:.4f}, "
-                          f"new: {regime_accs['new'][rname]:.4f}")
+                src = os.path.join(self.config.MODEL_DIR, f"bundle_{rname}.pkl")
+                if os.path.exists(src):
+                    dst = os.path.join(backup_dir, f"bundle_{rname}.pkl")
+                    shutil.copy2(src, dst)
             
-            old_avg = np.mean(list(regime_accs['old'].values())) if regime_accs['old'] else 0
-            new_avg = np.mean(list(regime_accs['new'].values())) if regime_accs['new'] else 0
-
-            # Step 5: 모델 저장
-            self.update_progress(5, total_steps, "모델 저장 중")
+            src = os.path.join(self.config.MODEL_DIR, 'current_model.pkl')
+            if os.path.exists(src):
+                dst = os.path.join(backup_dir, 'current_model.pkl')
+                shutil.copy2(src, dst)
             
-            if new_avg > old_avg:
-                print("→ 새 모델 채택")
-                bkp = os.path.join(self.config.MODEL_DIR,
-                                   f'backup/model_{datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")}.pkl')
-                _ensure_dir(os.path.dirname(bkp))
-                old.save_model(bkp)
-                new.save_model()
-                self.trainer = new
-            else:
-                print("→ 기존 모델 유지")
-                self.trainer = old
-
+            # 성능 비교 결과도 저장
+            comparison_path = os.path.join(backup_dir, 'comparison.json')
+            with open(comparison_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'timestamp': timestamp,
+                    'old_avg': float(old_avg),
+                    'new_avg': float(new_avg),
+                    'improvement': float(new_avg - old_avg),
+                    'regime_scores': {
+                        'old': {k: float(v) for k, v in regime_accs['old'].items()},
+                        'new': {k: float(v) for k, v in regime_accs['new'].items()}
+                    }
+                }, f, indent=2)
+            
+            print(f"  백업 완료: {backup_dir}")
+            
+            # 새 모델 저장
+            new.save_model()
+            self.trainer = new
+            print(f"  새 모델 저장 완료")
+            
+        else:
+            print(f"\n→ ⚠️ 기존 모델 유지 (성능 저하 or 동등)")
+            print(f"  새 모델은 저장하지 않습니다.")
+            self.trainer = old
+        
+        print("="*60)
+        
         # Step 6: 완료
         self.update_progress(6, total_steps, "재학습 완료")
         
-        # 완료 플래그 생성
         flag_path = os.path.join(self.config.BASE_DIR, '.retrain_complete')
         with open(flag_path, 'w', encoding='utf-8') as f:
             f.write(datetime.now(timezone.utc).isoformat())
-
+        
         return new_metrics
 
     def analyze_failures(self, trade_log_df):

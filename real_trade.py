@@ -622,86 +622,106 @@ class RealTimeTrader:
 
     # ---------- 재학습 ----------
     def execute_retrain_process(self):
-        """재학습 프로세스 (모델/필터 리로드) - 진행 상황 표시"""
+        """재학습 프로세스 (자동 실행 + 플래그 기록)"""
         print(f"\n{'='*60}")
         print("재학습 및 필터 업데이트 프로세스 시작")
         print(f"{'='*60}")
 
-        self.trigger_retrain()
+        # ★ 트리거 기록 (로깅/추적용)
+        self.trigger_retrain()  # 플래그 파일 생성 (언제 재학습했는지 기록)
 
-        flag_path = os.path.join(self.config.BASE_DIR, '.retrain_complete')
-        progress_file = os.path.join(self.config.BASE_DIR, '.retrain_progress.json')
-        
-        # 기존 완료 플래그 삭제
-        if os.path.exists(flag_path):
-            os.remove(flag_path)
-        
-        print("\n재학습 진행 중...")
-        print("(별도 프로세스에서 model_train.py를 실행하세요)")
-        print("-" * 60)
-        
-        last_status = None
-        check_count = 0
-        
-        while not os.path.exists(flag_path):
-            # 진행 상황 파일 읽기
-            if os.path.exists(progress_file):
-                try:
-                    with open(progress_file, 'r', encoding='utf-8') as f:
-                        progress = json.load(f)
-                    
-                    status = progress.get('status', 'unknown')
-                    current_step = progress.get('current_step', '')
-                    total_steps = progress.get('total_steps', 0)
-                    step_num = progress.get('step_num', 0)
-                    regime = progress.get('regime', '')
-                    
-                    # 상태가 변경되었을 때만 출력
-                    current_status = f"{step_num}/{total_steps}: {current_step}"
-                    if current_status != last_status:
-                        timestamp = datetime.now(timezone.utc).strftime('%H:%M:%S')
-                        if regime:
-                            print(f"[{timestamp}] {current_status} ({regime})")
-                        else:
-                            print(f"[{timestamp}] {current_status}")
-                        last_status = current_status
-                        
-                except Exception as e:
-                    pass
-            else:
-                # 진행 상황 파일이 없으면 대기 중 표시
-                if check_count % 6 == 0:  # 30초마다
-                    print(f"  대기 중... ({check_count * 5}초 경과)")
+        try:
+            # ★ 1. 데이터 병합
+            print("\n[1/4] 데이터 병합 중...")
+            from data_merge import DataMerger
+            merger = DataMerger(self.config)
+            merged_data = merger.merge_all_data()
             
-            check_count += 1
-            time.sleep(5)
-        
-        # 완료 플래그 삭제
-        if os.path.exists(flag_path):
-            os.remove(flag_path)
-        
-        # 진행 상황 파일 삭제
-        if os.path.exists(progress_file):
-            os.remove(progress_file)
-        
-        print("-" * 60)
-        print("✓ 재학습 완료!")
-
-        # 모델 및 필터 리로드
-        print("\n모델 및 필터 리로드 중...")
-        self.model_trainer.load_model()
-        self.adaptive_filters = self.load_adaptive_filters()
-
-        self.trades_since_last_check = 0
-        self.pending_retrain = False
-        print("✓ 거래 재개 준비 완료")
-
-    def trigger_retrain(self):
-        """재학습 트리거 파일 생성"""
-        flag_path = os.path.join(self.config.BASE_DIR, '.retrain_required')
-        with open(flag_path, 'w', encoding='utf-8') as f:
-            f.write(datetime.now(timezone.utc).isoformat())
-        print("재학습 플래그 설정")
+            if merged_data is None or merged_data.empty:
+                print("❌ 병합 데이터 없음 - 재학습 중단")
+                self.pending_retrain = False
+                return
+            
+            merged_data = merged_data.dropna(subset=['open', 'high', 'low', 'close', 'volume'])
+            
+            if len(merged_data) < 1000:
+                print(f"❌ 데이터 부족 ({len(merged_data)}건) - 재학습 중단")
+                self.pending_retrain = False
+                return
+            
+            print(f"✓ 병합 완료: {len(merged_data):,}건")
+            
+            # ★ 2. 모델 재학습
+            print("\n[2/4] 모델 재학습 중...")
+            from model_train import ModelOptimizer
+            
+            optimizer = ModelOptimizer(self.config)
+            metrics = optimizer.retrain_model(merged_data)
+            
+            print("✓ 재학습 완료!")
+            
+            # ★ 3. 적응형 필터 생성
+            print("\n[3/4] 적응형 필터 생성 중...")
+            
+            trades_log = merger.load_trade_logs()
+            
+            if not trades_log.empty and 'result' in trades_log.columns:
+                if 'regime' in trades_log.columns:
+                    trades_log = trades_log[trades_log['regime'].notna()]
+                
+                if len(trades_log) >= 50:
+                    features_log = merger.load_feature_logs()
+                    
+                    if not features_log.empty and 'trade_id' in features_log.columns:
+                        trade_features = pd.merge(
+                            trades_log,
+                            features_log,
+                            on='trade_id',
+                            how='inner',
+                            suffixes=('', '_feat')
+                        )
+                        
+                        if len(trade_features) >= 50:
+                            print(f"  분석 대상: {len(trade_features)}건")
+                            patterns = optimizer.analyze_failures(trade_features)
+                            
+                            if patterns:
+                                print(f"✓ {len(patterns)}개 패턴 발견")
+                            else:
+                                print("  새로운 패턴 없음")
+                        else:
+                            print("  ⚠️ 거래-피처 병합 데이터 부족")
+                    else:
+                        print("  ⚠️ 피처 로그 없음")
+                else:
+                    print(f"  ⚠️ 거래 데이터 부족 ({len(trades_log)}건)")
+            else:
+                print("  ⚠️ 거래 로그 없음")
+            
+            # ★ 4. 모델 및 필터 리로드
+            print("\n[4/4] 모델 및 필터 리로드 중...")
+            self.model_trainer.load_model()
+            self.adaptive_filters = self.load_adaptive_filters()
+            
+            # ★ 완료 플래그 생성 (추적용)
+            flag_path = os.path.join(self.config.BASE_DIR, '.retrain_complete')
+            with open(flag_path, 'w', encoding='utf-8') as f:
+                f.write(datetime.now(timezone.utc).isoformat())
+            
+            self.trades_since_last_check = 0
+            self.pending_retrain = False
+            
+            print("\n" + "="*60)
+            print("✓ 재학습 완료 - 거래 재개")
+            print("="*60 + "\n")
+            
+        except Exception as e:
+            print(f"\n❌ 재학습 실패: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            self.pending_retrain = False
+            print("\n⚠️ 기존 모델로 거래 계속")
 
     # ---------- 메인 루프 ----------
     def run_live_trading(self, duration_hours=99999, trade_interval_minutes=1):
@@ -718,6 +738,7 @@ class RealTimeTrader:
         self.is_running = True
         end_time = datetime.now(timezone.utc) + timedelta(hours=duration_hours)
         self._cool_seconds = int(trade_interval_minutes * 60)
+
 
         if not self.model_trainer.models:
             print("모델 로딩 중...")
@@ -818,37 +839,80 @@ class RealTimeTrader:
 
         from model_train import FeatureEngineer
         fe = FeatureEngineer()
+        
+        # 피처 생성
         features = fe.create_feature_pool(historical_data)
         target = fe.create_target(historical_data, window=self.config.PREDICTION_WINDOW)
 
+        # ★ 인덱스 정렬 후 필터링
+        features = features.reset_index(drop=True)
+        target = target.reset_index(drop=True)
+        
+        # 길이 맞추기
+        min_len = min(len(features), len(target))
+        features = features.iloc[:min_len]
+        target = target.iloc[:min_len]
+        
+        # 유효한 데이터만 필터링
         valid_idx = target.notna()
-        features = features[valid_idx]
-        target = target[valid_idx]
+        valid_indices = valid_idx[valid_idx].index.tolist()
+        
+        if len(valid_indices) == 0:
+            print("❌ 유효한 타겟 데이터가 없습니다.")
+            return pd.DataFrame()
+        
+        features = features.loc[valid_indices].reset_index(drop=True)
+        target = target.loc[valid_indices].reset_index(drop=True)
+        
+        print(f"백테스트 데이터: {len(features):,}건")
 
         trades = []
 
         for i in range(len(features) - self.config.PREDICTION_WINDOW):
-            X_current = features.iloc[[i]]
-            p_up_arr = np.ravel(self.model_trainer.predict_proba(X_current))
-            if len(p_up_arr) == 0 or not np.isfinite(p_up_arr[-1]):
+            try:
+                X_current = features.iloc[[i]]
+                
+                # 예측
+                p_up_arr = np.ravel(self.model_trainer.predict_proba(X_current))
+                if len(p_up_arr) == 0 or not np.isfinite(p_up_arr[-1]):
+                    continue
+                p_up = float(p_up_arr[-1])
+
+                # 레짐 추출
+                regime = int(features['regime'].iloc[i]) if 'regime' in features.columns else 0
+                
+                # 진입 결정
+                side = self.model_trainer.decide_from_proba_regime(p_up, regime)
+                if side is None:
+                    continue
+
+                # 실제 결과
+                actual = int(target.iloc[i])
+
+                # 타임스탬프 추출
+                if 'timestamp' in features.columns:
+                    ts = features['timestamp'].iloc[i]
+                elif i < len(historical_data):
+                    ts = historical_data['timestamp'].iloc[i]
+                else:
+                    ts = pd.Timestamp.now()
+
+                trades.append({
+                    'timestamp': ts,
+                    'p_up': p_up,
+                    'regime': regime,
+                    'decision': side,
+                    'actual': actual,
+                    'correct': int(side == actual)
+                })
+                
+            except Exception as e:
+                # 개별 거래 실패는 스킵
                 continue
-            p_up = float(p_up_arr[-1])
 
-            regime = int(features['regime'].iloc[i]) if 'regime' in features.columns else 0
-            side = self.model_trainer.decide_from_proba_regime(p_up, regime)
-            if side is None:
-                continue
-
-            actual = int(target.iloc[i])
-
-            trades.append({
-                'timestamp': historical_data['timestamp'].iloc[i],
-                'p_up': p_up,
-                'regime': regime,
-                'decision': side,
-                'actual': actual,
-                'correct': int(side == actual)
-            })
+        if not trades:
+            print("❌ 백테스트 거래가 생성되지 않았습니다.")
+            return pd.DataFrame()
 
         trades_df = pd.DataFrame(trades)
 
@@ -868,6 +932,18 @@ class RealTimeTrader:
         print(f"- 승률: {win_rate:.2%}")
         print(f"- 총 손익(가정): ${profit:.2f}")
         print(f"- 평균 손익/거래: ${profit/total_trades if total_trades > 0 else 0:.2f}")
+        
+        # 레짐별 성과
+        if 'regime' in trades_df.columns and total_trades > 0:
+            print(f"\n[레짐별 성과]")
+            regime_labels = {0: "UP", 1: "DOWN", 2: "FLAT"}
+            for regime_val in sorted(trades_df['regime'].unique()):
+                regime_trades = trades_df[trades_df['regime'] == regime_val]
+                regime_wins = regime_trades['correct'].sum()
+                regime_total = len(regime_trades)
+                regime_wr = regime_wins / regime_total if regime_total > 0 else 0
+                regime_name = regime_labels.get(regime_val, f"REGIME-{regime_val}")
+                print(f"  {regime_name}: {regime_total}건, 승률 {regime_wr:.2%}")
 
         return trades_df
 
