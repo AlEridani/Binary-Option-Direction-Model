@@ -28,6 +28,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import calibration_curve
+import time
+
 
 import matplotlib
 matplotlib.use("Agg")
@@ -319,6 +321,13 @@ class ModelTrainer:
 
         # 레짐별 번들
         self.bundles = {'UP': None, 'DOWN': None, 'FLAT': None}
+        self.models = []
+        self.scaler = StandardScaler()
+        self.feature_importance = None
+        self.selected_features = None
+        self.calibrator = None
+        self.calib_method = 'isotonic'
+        self._progress_callback = None
 
         # Legacy 호환
         self.models = []
@@ -525,15 +534,18 @@ class ModelTrainer:
         X = X.iloc[:min_len]
         y = y.iloc[:min_len]
 
-        # ★ regime 정보 없는 레거시 데이터 필터링
-        if regime_col in X.columns:
-            valid_regime_mask = X[regime_col].notna()
-            invalid_count = (~valid_regime_mask).sum()
+        if X[regime_col].isna().any():
+                nan_count = X[regime_col].isna().sum()
+                X[regime_col] = X[regime_col].fillna(0)
+                print(f"\nℹ️  레짐 NaN {nan_count:,}건 → FLAT(0)으로 변환")
             
-            if invalid_count > 0:
-                print(f"\nℹ️  레짐 정보 없는 레거시 데이터 {invalid_count:,}건 제외")
-                X = X[valid_regime_mask].reset_index(drop=True)
-                y = y[valid_regime_mask].reset_index(drop=True)
+            # 레짐 분포 확인
+        print(f"\n레짐 분포:")
+        regime_counts = X[regime_col].value_counts().sort_index()
+        for rval in [1, -1, 0]:
+            rname = self._regime_to_name(rval)
+            count = int(regime_counts.get(rval, 0))
+            print(f"  {rname:5s}: {count:4d}건")
 
         if not self.selected_features:
             self.selected_features = [c for c in X.columns if c not in ['timestamp', 'regime', 'htf_regime']][:50]
@@ -1205,9 +1217,94 @@ class ModelOptimizer:
         return metrics
 
     def retrain_model(self, new_df):
+        """재학습 - 랜덤 시드 동적 생성"""
         print("\n" + "="*60)
         print("재학습 시작 (홀드아웃 테스트셋 비교)")
         print("="*60)
+
+        try:
+            print("\n최신 데이터 수집 중...")
+            from real_trade import BinanceAPIClient
+            from data_merge import DataMerger
+            
+            api = BinanceAPIClient()
+            merger = DataMerger(self.config)
+            
+            # ✅ 기존 가격 데이터의 마지막 시간 확인
+            existing_price = merger.load_price_data()
+            
+            if not existing_price.empty and 'timestamp' in existing_price.columns:
+                last_time = pd.to_datetime(existing_price['timestamp']).max()
+                print(f"  기존 데이터 마지막 시간: {last_time}")
+                
+                # 마지막 시간부터 현재까지의 분 수 계산
+                now = datetime.now(timezone.utc)
+                time_diff = now - last_time.replace(tzinfo=timezone.utc)
+                minutes_gap = int(time_diff.total_seconds() / 60)
+                
+                print(f"  시간 차이: {minutes_gap}분")
+                
+                if minutes_gap > 0:
+                    # API는 최대 1000개까지만 가져올 수 있으므로
+                    fetch_limit = min(minutes_gap + 10, 1000)  # 여유분 10개 추가
+                    
+                    print(f"  수집할 캔들 수: {fetch_limit}개")
+                    
+                    # 최신 데이터 수집
+                    recent_candles = api.get_klines(
+                        symbol="BTCUSDT", 
+                        interval="1m", 
+                        limit=fetch_limit
+                    )
+                    
+                    if not recent_candles.empty:
+                        # ✅ 중복 제거: 기존 마지막 시간 이후 데이터만
+                        recent_candles['timestamp'] = pd.to_datetime(recent_candles['timestamp'], utc=True)
+                        new_candles = recent_candles[recent_candles['timestamp'] > last_time]
+                        
+                        if not new_candles.empty:
+                            merger.add_new_price_data(new_candles)
+                            latest_time = new_candles['timestamp'].max()
+                            print(f"  ✓ 신규 데이터 {len(new_candles)}건 추가")
+                            print(f"  ✓ 최신 시간: {latest_time}")
+                        else:
+                            print(f"  → 이미 최신 상태 (신규 데이터 없음)")
+                    else:
+                        print("  ⚠️ API에서 데이터를 가져올 수 없음")
+                else:
+                    print(f"  → 이미 최신 상태")
+            else:
+                # 기존 데이터 없음 - 처음 1000개 수집
+                print(f"  기존 데이터 없음 - 초기 수집")
+                recent_candles = api.get_klines(
+                    symbol="BTCUSDT", 
+                    interval="1m", 
+                    limit=1000
+                )
+                if not recent_candles.empty:
+                    merger.add_new_price_data(recent_candles)
+                    print(f"  ✓ 초기 데이터 {len(recent_candles)}건 수집")
+            
+            # ✅ 데이터 재병합
+            print("\n데이터 재병합 중...")
+            new_df = merger.merge_all_data()
+            
+            if new_df is None or new_df.empty:
+                print("❌ 재병합 실패 - 기존 데이터 사용")
+            else:
+                print(f"✓ 재병합 완료: {len(new_df):,}건")
+                
+        except Exception as e:
+            print(f"⚠️ 최신 데이터 수집 실패: {e}")
+            print("  → 기존 병합 데이터로 계속 진행")
+            import traceback
+            traceback.print_exc()
+
+        
+        # ✅ 1. 타임스탬프 기반 시드 생성
+        seed = int(time.time()) % 100000
+        np.random.seed(seed)
+        print(f"랜덤 시드: {seed}")
         
         total_steps = 6
         
@@ -1226,7 +1323,20 @@ class ModelOptimizer:
         X, y = X[valid], y[valid]
         print(f"유효 샘플: {len(X):,}건")
         
-        # ★ 학습/테스트 분리 (시간순, 85% / 15%)
+        # ✅ 2. 신규 데이터 검증
+        info_file = os.path.join(self.config.MODEL_DIR, 'last_training_info.json')
+        if os.path.exists(info_file):
+            with open(info_file, 'r', encoding='utf-8') as f:
+                last_info = json.load(f)
+                last_count = last_info.get('data_count', 0)
+                print(f"  - 이전 데이터: {last_count:,}건")
+                print(f"  - 신규 증가: {len(X) - last_count:,}건")
+                
+                if len(X) <= last_count + 10:
+                    print("❌ 신규 데이터 부족 (<10건) - 재학습 의미 없음")
+                    return None
+        
+        # 학습/테스트 분리
         split_point = int(len(X) * 0.85)
         
         X_train_full = X.iloc[:split_point].reset_index(drop=True)
@@ -1236,11 +1346,10 @@ class ModelOptimizer:
         y_test = y.iloc[split_point:].reset_index(drop=True)
         
         print(f"  - 학습: {len(X_train_full):,}건 (85%)")
-        print(f"  - 테스트: {len(X_test):,}건 (15%) ← 비교용, 학습 미사용")
+        print(f"  - 테스트: {len(X_test):,}건 (15%)")
         
         if len(X_test) < 100:
             print("❌ 테스트셋 부족 - 재학습 중단")
-            self.pending_retrain = False
             return None
 
         # Step 2: 기존 모델 로드
@@ -1251,13 +1360,20 @@ class ModelOptimizer:
         
         if not has_old_model:
             print("⚠️ 기존 모델 없음 → 초기 학습 모드")
-            # 초기 학습과 동일하게 처리
             self.trainer.feature_selection_regime(X_train_full, y_train_full, regime_col='regime', top_k=30)
             self.trainer._progress_callback = lambda regime: self.update_progress(
                 3, total_steps, f"초기 학습 중", regime
             )
             metrics = self.trainer.train_ensemble_regime(X_train_full, y_train_full, regime_col='regime', test_size=0.15)
             self.trainer.save_model()
+            
+            # ✅ 학습 정보 저장 (추가)
+            with open(info_file, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'data_count': len(X),
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'seed': seed
+                }, f, indent=2)
             
             flag_path = os.path.join(self.config.BASE_DIR, '.retrain_complete')
             with open(flag_path, 'w', encoding='utf-8') as f:
@@ -1271,7 +1387,6 @@ class ModelOptimizer:
         print("\n새 모델 학습 중...")
         new = ModelTrainer(self.config)
         
-        # 기존 피처 재사용
         if old.selected_features:
             print(f"  기존 피처 재사용: {len(old.selected_features)}개")
             new.selected_features = old.selected_features
@@ -1283,13 +1398,14 @@ class ModelOptimizer:
             3, total_steps, f"새 모델 학습 중", regime
         )
         
+        # ✅ 랜덤 시드 적용한 학습 (매번 다른 모델 생성)
         new_metrics = new.train_ensemble_regime(X_train_full, y_train_full, regime_col='regime', test_size=0.15)
 
         # Step 4: 테스트셋으로 공정 비교
-        self.update_progress(4, total_steps, "모델 성능 비교 중 (테스트셋)")
+        self.update_progress(4, total_steps, "모델 성능 비교 중")
         
         print("\n" + "="*60)
-        print("테스트셋 성능 비교 (학습에 사용 안한 데이터)")
+        print("테스트셋 성능 비교")
         print("="*60)
         
         regime_accs = {'old': {}, 'new': {}}
@@ -1297,28 +1413,20 @@ class ModelOptimizer:
         X_test_valid = X_test.copy()
         y_test_valid = y_test.copy()
         
-        # 레짐이 있는 데이터만 필터링
         if 'regime' in X_test.columns:
             X_test_valid = X_test_valid.reset_index(drop=True)
             y_test_valid = y_test_valid.reset_index(drop=True)
 
-            # boolean mask 생성
             valid_regime = X_test_valid['regime'].notna()
-
-            # 정수 인덱스로 변환
             valid_indices = valid_regime[valid_regime].index.tolist()
 
             if len(valid_indices) > 0:
                 X_test_valid = X_test_valid.loc[valid_indices].reset_index(drop=True)
                 y_test_valid = y_test_valid.loc[valid_indices].reset_index(drop=True)
-                print(f"레짐 정보 있는 테스트 샘플: {len(X_test_valid):,}건")
-            else:
-                print("⚠️ 레짐 정보 있는 테스트 샘플 없음")
         else:
             X_test_valid = X_test_valid.reset_index(drop=True)
             y_test_valid = y_test_valid.reset_index(drop=True)
 
-            # 최종 길이 확인
             min_len = min(len(X_test_valid), len(y_test_valid))
             X_test_valid = X_test_valid.iloc[:min_len]
             y_test_valid = y_test_valid.iloc[:min_len]
@@ -1328,7 +1436,6 @@ class ModelOptimizer:
             old_pred_all = old.predict(X_test_valid)
             new_pred_all = new.predict(X_test_valid)
             
-            # 길이 맞추기
             min_len = min(len(old_pred_all), len(new_pred_all), len(y_test_valid))
             old_pred_all = old_pred_all[:min_len]
             new_pred_all = new_pred_all[:min_len]
@@ -1369,7 +1476,6 @@ class ModelOptimizer:
                     old_pred = old.predict(X_r, regime=rval)
                     new_pred = new.predict(X_r, regime=rval)
                     
-                    # 길이 맞추기
                     min_len = min(len(old_pred), len(new_pred), len(y_r))
                     old_pred = old_pred[:min_len]
                     new_pred = new_pred[:min_len]
@@ -1387,7 +1493,7 @@ class ModelOptimizer:
                     print(f"  [{rname}] 비교 실패: {e}")
                     continue
         
-        # ★ 의사결정: 평균 성능으로 판단
+        # 의사결정
         old_scores = [v for v in regime_accs['old'].values() if v > 0]
         new_scores = [v for v in regime_accs['new'].values() if v > 0]
         
@@ -1423,7 +1529,6 @@ class ModelOptimizer:
                 dst = os.path.join(backup_dir, 'current_model.pkl')
                 shutil.copy2(src, dst)
             
-            # 성능 비교 결과도 저장
             comparison_path = os.path.join(backup_dir, 'comparison.json')
             with open(comparison_path, 'w', encoding='utf-8') as f:
                 json.dump({
@@ -1451,6 +1556,19 @@ class ModelOptimizer:
         
         print("="*60)
         
+        # ✅ 학습 정보 저장
+        with open(info_file, 'w', encoding='utf-8') as f:
+            json.dump({
+                'data_count': len(X),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'seed': seed,
+                'performance': {
+                    'old_avg': float(old_avg),
+                    'new_avg': float(new_avg),
+                    'improvement': float(new_avg - old_avg)
+                }
+            }, f, indent=2)
+        
         # Step 6: 완료
         self.update_progress(6, total_steps, "재학습 완료")
         
@@ -1461,98 +1579,218 @@ class ModelOptimizer:
         return new_metrics
 
     def analyze_failures(self, trade_log_df):
-        """실패 거래 패턴 분석"""
+        """의사결정 트리로 실패 패턴 자동 발견"""
         if 'result' not in trade_log_df.columns:
             return {}
-
-        fails = trade_log_df[trade_log_df['result'] == 0].copy()
-        if fails.empty:
-            print("실패 거래 없음.")
-            return {}
-
+        
         print("\n" + "="*60)
-        print(f"실패 패턴 분석 (n={len(fails)})")
+        print(f"데이터 기반 패턴 분석 (전체 {len(trade_log_df)}건)")
         print("="*60)
-
-        patterns = {}
-
-        # 변동성 기반
-        if 'atr_14' in fails.columns:
-            f_atr = fails['atr_14'].dropna()
-            s_atr = trade_log_df[trade_log_df['result'] == 1]['atr_14'].dropna()
-            if len(f_atr) > 5 and len(s_atr) > 5:
-                if f_atr.quantile(0.75) > s_atr.quantile(0.75) * 1.2:
-                    th = float(f_atr.quantile(0.6))
-                    patterns['high_volatility'] = {
-                        'type': 'num', 'name': 'High ATR',
-                        'field': 'atr_14', 'operator': '>',
-                        'threshold': th,
-                        'condition': f"atr_14>{th:.6f}",
-                        'reason': f"실패 ATR↑ (median {f_atr.median():.6f} vs 성공 {s_atr.median():.6f})",
-                        'improvement': 0.0
-                    }
-                    print(f"✓ 변동성 필터: ATR>{th:.6f}")
-
-        # 거래량 기반
-        if 'volume_ratio' in fails.columns:
-            f_v = fails['volume_ratio'].dropna()
-            s_v = trade_log_df[trade_log_df['result'] == 1]['volume_ratio'].dropna()
-            if len(f_v) > 5 and len(s_v) > 5:
-                high_total = len(trade_log_df[trade_log_df['volume_ratio'] > 1.5])
-                if high_total > 0:
-                    high_fail = len(f_v[f_v > 1.5])
-                    rate = high_fail / high_total if high_total else 0
-                    if rate > 0.6:
-                        patterns['high_volume'] = {
-                            'type': 'num', 'name': 'High Volume',
-                            'field': 'volume_ratio', 'operator': '>',
-                            'threshold': 1.5,
-                            'condition': "volume_ratio>1.5",
-                            'reason': f"고거래량 실패율 {rate:.1%}",
-                            'improvement': 0.0
-                        }
-                        print(f"✓ 고거래량 필터: volume_ratio>1.5")
-
-                low_total = len(trade_log_df[trade_log_df['volume_ratio'] < 0.5])
-                if low_total > 0:
-                    low_fail = len(f_v[f_v < 0.5])
-                    rate = low_fail / low_total if low_total else 0
-                    if rate > 0.6:
-                        patterns['low_volume'] = {
-                            'type': 'num', 'name': 'Low Volume',
-                            'field': 'volume_ratio', 'operator': '<',
-                            'threshold': 0.5,
-                            'condition': "volume_ratio<0.5",
-                            'reason': f"저거래량 실패율 {rate:.1%}",
-                            'improvement': 0.0
-                        }
-                        print(f"✓ 저거래량 필터: volume_ratio<0.5")
-
-        # RSI 극단
-        if 'rsi_14' in fails.columns:
-            ext_fail = fails[(fails['rsi_14'] < 30) | (fails['rsi_14'] > 70)]
-            ext_all  = trade_log_df[(trade_log_df['rsi_14'] < 30) | (trade_log_df['rsi_14'] > 70)]
-            if len(ext_all) > 5:
-                rate = len(ext_fail) / len(ext_all)
-                if rate > 0.6:
-                    patterns['rsi_extreme'] = {
-                        'type': 'range', 'name': 'RSI extreme',
-                        'field': 'rsi_14', 'operator': 'extreme',
-                        'lower_threshold': 30.0, 'upper_threshold': 70.0,
-                        'condition': "rsi_14<30 or rsi_14>70",
-                        'reason': f"극단 RSI에서 실패↑ ({rate:.1%})",
-                        'improvement': 0.0
-                    }
-                    print("✓ RSI 극단값 필터")
-
-        # 저장
+        
+        from sklearn.tree import DecisionTreeClassifier, export_text
+        from sklearn.tree import _tree
+        
+        # ✅ 피처 선택 (가능한 모든 피처)
+        feature_cols = [
+            'atr_14', 'atr_ratio_14', 'atr_28', 'atr_ratio_28',
+            'volume_ratio', 'volume_trend', 'volume_sma_10', 'volume_sma_50',
+            'rsi_14', 'rsi_28',
+            'macd', 'macd_signal', 'macd_histogram',
+            'bb_position_20', 'bb_width_20', 'bb_position_50', 'bb_width_50',
+            'volatility_10', 'volatility_30', 'volatility_ratio_10', 'volatility_ratio_30',
+            'adx_14', 'di_plus_14', 'di_minus_14',
+            'stoch_14',
+            'hour', 'day_of_week',
+            'return_1', 'return_2', 'return_3', 'return_5', 'return_10', 'return_15', 'return_30',
+            'price_to_ma_5', 'price_to_ma_10', 'price_to_ma_20', 'price_to_ma_50',
+            'ma_5_slope', 'ma_10_slope', 'ma_20_slope',
+            'trend_strength_10', 'trend_strength_20', 'trend_strength_50',
+            'body_size', 'upper_shadow', 'lower_shadow', 'body_position'
+        ]
+        
+        # 사용 가능한 피처만 선택
+        available_features = [f for f in feature_cols if f in trade_log_df.columns]
+        
+        if len(available_features) < 3:
+            print("❌ 분석 가능한 피처 부족")
+            return {}
+        
+        # 데이터 준비
+        X = trade_log_df[available_features].copy()
+        y = trade_log_df['result'].copy()
+        
+        # 결측치 제거
+        valid_mask = X.notna().all(axis=1) & y.notna()
+        X = X[valid_mask]
+        y = y[valid_mask]
+        
+        if len(X) < 50:
+            print("❌ 유효 샘플 부족 (50건 미만)")
+            return {}
+        
+        fail_count = (y == 0).sum()
+        success_count = (y == 1).sum()
+        
+        print(f"✓ 분석 샘플: {len(X)}건 (성공: {success_count}, 실패: {fail_count})")
+        print(f"✓ 사용 피처: {len(available_features)}개")
+        
+        # ✅ 실패 거래만 분리하는 규칙 학습
+        # (실패=1, 성공=0으로 반전하여 실패 조건 학습)
+        y_fail = (y == 0).astype(int)
+        
+        # Decision Tree 학습 (간단한 규칙 생성)
+        tree = DecisionTreeClassifier(
+            max_depth=4,           # 깊이 제한으로 간단한 규칙
+            min_samples_split=50,  # 최소 50개 이상 샘플
+            min_samples_leaf=20,   # 리프 노드 최소 20개
+            max_features=0.7,      # 피처의 70%만 사용
+            class_weight='balanced',  # 클래스 불균형 해결
+            random_state=42
+        )
+        
+        tree.fit(X, y_fail)
+        
+        # ✅ 규칙 텍스트 출력
+        tree_rules = export_text(tree, feature_names=available_features, max_depth=4)
+        print("\n[학습된 의사결정 트리]")
+        print(tree_rules[:1000])  # 처음 1000자만 출력
+        if len(tree_rules) > 1000:
+            print("  ... (생략)")
+        
+        # ✅ 중요 피처 확인
+        importances = pd.DataFrame({
+            'feature': available_features,
+            'importance': tree.feature_importances_
+        }).sort_values('importance', ascending=False)
+        
+        print("\n[중요 피처 Top 10]")
+        for idx, row in importances.head(10).iterrows():
+            if row['importance'] > 0:
+                print(f"  {row['feature']:20s}: {row['importance']:.4f}")
+        
+        # ✅ 규칙을 필터로 변환
+        patterns = self._extract_rules_from_tree(tree, available_features, X, y_fail)
+        
+        # 기존 필터 로드
         _ensure_dir(self.config.MODEL_DIR)
         fpath = os.path.join(self.config.MODEL_DIR, 'adaptive_filters.json')
-        with open(fpath, 'w') as f:
-            json.dump({'active_filters': [], 'filter_history': [patterns]}, f, indent=2)
-        print(f"\n임시 필터 제안 저장: {fpath}\n")
+        
+        existing_filters = []
+        filter_history = []
+        
+        if os.path.exists(fpath):
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    existing_filters = data.get('active_filters', [])
+                    filter_history = data.get('filter_history', [])
+            except Exception:
+                pass
+        
+        # 신규 필터 추가 (중복 제거)
+        new_filters = list(patterns.values())
+        existing_names = {f['name'] for f in existing_filters}
+        
+        added_count = 0
+        for new_filter in new_filters:
+            if new_filter['name'] not in existing_names:
+                existing_filters.append(new_filter)
+                added_count += 1
+                print(f"\n  ✓ 신규 필터 추가: {new_filter['name']}")
+                print(f"     조건: {new_filter['condition']}")
+                print(f"     이유: {new_filter['reason']}")
+        
+        # 저장
+        save_data = {
+            'active_filters': existing_filters,
+            'filter_history': filter_history + [patterns] if patterns else filter_history,
+            'last_updated': datetime.now(timezone.utc).isoformat(),
+            'tree_info': {
+                'n_samples': int(len(X)),
+                'n_features': len(available_features),
+                'max_depth': int(tree.get_depth()),
+                'n_leaves': int(tree.get_n_leaves()),
+                'top_features': importances.head(5).to_dict('records')
+            }
+        }
+        
+        with open(fpath, 'w', encoding='utf-8') as f:
+            json.dump(save_data, f, indent=2, ensure_ascii=False)
+        
+        if added_count > 0:
+            print(f"\n✓ {added_count}개 신규 필터 추가 (데이터 기반 자동 학습)")
+            print(f"✓ 총 활성 필터: {len(existing_filters)}개")
+        else:
+            print("\n  → 새로운 패턴 없음 (기존 규칙으로 충분)")
+        
+        print(f"필터 저장: {fpath}\n")
+        
         return patterns
-
+    
+    
+    def _extract_rules_from_tree(self, tree, feature_names, X, y):
+        """의사결정 트리에서 규칙 추출"""
+        from sklearn.tree import _tree
+        
+        patterns = {}
+        tree_ = tree.tree_
+        feature_name = [
+            feature_names[i] if i != _tree.TREE_UNDEFINED else "undefined!"
+            for i in tree_.feature
+        ]
+        
+        def recurse(node, depth, conditions):
+            """재귀적으로 트리 탐색"""
+            if tree_.feature[node] != _tree.TREE_UNDEFINED:
+                name = feature_name[node]
+                threshold = tree_.threshold[node]
+                
+                # 왼쪽 가지 (<=)
+                left_conditions = conditions + [(name, '<=', threshold)]
+                recurse(tree_.children_left[node], depth + 1, left_conditions)
+                
+                # 오른쪽 가지 (>)
+                right_conditions = conditions + [(name, '>', threshold)]
+                recurse(tree_.children_right[node], depth + 1, right_conditions)
+            else:
+                # 리프 노드 - 규칙 완성
+                n_samples = tree_.n_node_samples[node]
+                n_fail = tree_.value[node][0][1]  # 실패 클래스 (y_fail=1)
+                
+                # 실패율 60% 이상이고 샘플 20개 이상인 규칙만 채택
+                if n_samples >= 20 and n_fail / n_samples > 0.6:
+                    rule_id = f"auto_rule_{len(patterns) + 1}"
+                    
+                    # 조건 문자열 생성
+                    condition_parts = []
+                    for feat, op, val in conditions:
+                        if op == '<=':
+                            condition_parts.append(f"{feat} <= {val:.4f}")
+                        else:
+                            condition_parts.append(f"{feat} > {val:.4f}")
+                    
+                    condition_str = " AND ".join(condition_parts)
+                    
+                    patterns[rule_id] = {
+                        'type': 'compound',
+                        'name': f'Auto Rule {len(patterns) + 1}',
+                        'conditions': [
+                            {
+                                'field': c[0],
+                                'operator': c[1],
+                                'threshold': float(c[2])
+                            } for c in conditions
+                        ],
+                        'condition': condition_str,
+                        'reason': f"데이터 기반 학습: 실패율 {n_fail/n_samples:.1%} (샘플 {int(n_samples)}건)",
+                        'improvement': 0.0,
+                        'samples': int(n_samples),
+                        'fail_rate': float(n_fail/n_samples)
+                    }
+        
+        recurse(0, 1, [])
+        return patterns
+    
 
 # ===============================
 # Quick sample run

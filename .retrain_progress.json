@@ -1,8 +1,8 @@
 {
   "status": "training",
-  "step_num": 5,
-  "total_steps": 5,
-  "current_step": "모델 저장 중",
+  "step_num": 6,
+  "total_steps": 6,
+  "current_step": "재학습 완료",
   "regime": "",
-  "timestamp": "2025-10-21T00:44:59.232509+00:00"
+  "timestamp": "2025-10-24T10:02:03.768467+00:00"
 }

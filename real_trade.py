@@ -1,14 +1,13 @@
-# real_trade.py - 실시간 거래/백테스트 (ADX 레짐 + 캘리브레이션 확률, 10분 칼만기)
-
+# real_trade.py - 실시간 거래/백테스트 (ADX 레짐 + 캘리브레이션 + 적응형 필터)
 import pandas as pd
 import numpy as np
 import json
 import time
 import os
 from datetime import datetime, timedelta, timezone
+from collections import defaultdict, deque
 import requests
 import uuid
-from collections import deque
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -17,7 +16,6 @@ warnings.filterwarnings('ignore')
 # ================================
 class BinanceAPIClient:
     """바이낸스 API 클라이언트 (시뮬레이션 fallback)"""
-
     def __init__(self, api_key=None, api_secret=None):
         self.api_key = api_key
         self.api_secret = api_secret
@@ -32,7 +30,6 @@ class BinanceAPIClient:
             data = response.json()
             return float(data['price'])
         except Exception:
-            # API 실패 시 시뮬레이션 값
             return float(np.random.uniform(40000, 45000))
 
     def get_klines(self, symbol="BTCUSDT", interval="1m", limit=500):
@@ -82,13 +79,11 @@ class BinanceAPIClient:
 
         return pd.DataFrame(data)
 
-
 # ===========================================
-# 실시간 트레이더 (적응형 필터 + 칼만기 + ADX 레짐)
+# 실시간 트레이더 (레짐 + 필터)
 # ===========================================
 class RealTimeTrader:
     """실시간 거래 실행 클래스"""
-
     def __init__(self, config, model_trainer, api_client=None):
         self.config = config
         self.model_trainer = model_trainer
@@ -100,8 +95,8 @@ class RealTimeTrader:
 
         # 거래 상태
         self.is_running = False
-        self.active_positions = {}           # trade_id -> position dict
-        self.max_positions = 999             # 데이터 수집용 무제한
+        self.active_positions = {}
+        self.max_positions = 999
         self.trade_history = deque(maxlen=self.config.EVALUATION_WINDOW)
 
         # 재학습 관련
@@ -130,18 +125,11 @@ class RealTimeTrader:
         self.next_entry_after = None
         self.last_attempt_time = None
         self._last_pred_log = {"t": None, "sig": None}
-        self._last_signal = {"dir": None, "p": None, "t": None}  # 같은 방향/확률 반복 차단
-
-        self._retrain = {
-            "active": False,
-            "triggered": False,
-            "trigger_time": None,
-            "last_progress_print": 0
-        }
+        self._last_signal = {"dir": None, "p": None, "t": None}
 
     # ---------- 적응형 필터 ----------
     def load_adaptive_filters(self):
-        """적응형 필터 로드 (model_train.py가 생성)"""
+        """적응형 필터 로드"""
         filter_path = os.path.join(self.config.MODEL_DIR, 'adaptive_filters.json')
 
         if os.path.exists(filter_path):
@@ -164,16 +152,53 @@ class RealTimeTrader:
         return {'active_filters': [], 'filter_history': []}
 
     def apply_adaptive_filters(self, features_row):
-        """적응형 필터를 현재 피처에 적용"""
+        """적응형 필터 적용 (복합 조건 지원)"""
         active_filters = self.adaptive_filters.get('active_filters', [])
         if not active_filters:
             return True, []
 
         blocked_reasons = []
+        
         for fc in active_filters:
+            filter_type = fc.get('type', 'num')
+            
+            # ✅ 복합 조건 필터 (Decision Tree 규칙)
+            if filter_type == 'compound':
+                conditions = fc.get('conditions', [])
+                all_met = True
+                
+                for cond in conditions:
+                    field = cond.get('field')
+                    operator = cond.get('operator')
+                    threshold = cond.get('threshold')
+                    
+                    if field not in features_row:
+                        all_met = False
+                        break
+                    
+                    value = features_row[field]
+                    if pd.isna(value):
+                        all_met = False
+                        break
+                    
+                    if operator == '<=':
+                        if not (value <= threshold):
+                            all_met = False
+                            break
+                    elif operator == '>':
+                        if not (value > threshold):
+                            all_met = False
+                            break
+                
+                if all_met:
+                    blocked_reasons.append(f"{fc['name']}: {fc['reason']}")
+                    continue
+            
+            # 기존 단일 조건 필터들
             field = fc.get('field')
             if not field or field not in features_row:
                 continue
+            
             value = features_row[field]
             if pd.isna(value):
                 continue
@@ -213,7 +238,7 @@ class RealTimeTrader:
         return features
 
     def _maybe_log_signal(self, p_up, side, force=False):
-        """예측 로그 과다 방지(1분 디바운스). side: 1=LONG, 0=SHORT, None"""
+        """예측 로그 디바운스"""
         now = datetime.now(timezone.utc)
         sig = (side, round(float(p_up), 4))
         if not force:
@@ -226,13 +251,7 @@ class RealTimeTrader:
         self._last_pred_log = {"t": now, "sig": sig}
 
     def make_prediction(self, features, debug=False):
-        """
-        레짐 기반 진입 결정:
-          - features에서 regime 추출
-          - model_trainer.predict_proba(features, regime) → 레짐별 모델로 p_up 계산
-          - model_trainer.decide_from_proba_regime(p_up, regime) → 1/0/None
-          - 적응형 필터 통과 시에만 side 반환
-        """
+
         if not self.model_trainer.models:
             print("❌ 모델이 로드되지 않았습니다.")
             return None, 0.5
@@ -245,7 +264,6 @@ class RealTimeTrader:
             X_cur = features.iloc[[-1]]
             p_up = self.model_trainer.predict_proba(X_cur, regime=regime)
             
-            # numpy array면 스칼라로 변환
             if isinstance(p_up, np.ndarray):
                 p_up = float(p_up[-1]) if len(p_up) > 0 else 0.5
             else:
@@ -260,7 +278,7 @@ class RealTimeTrader:
             if debug:
                 self._maybe_log_signal(p_up, side, force=False)
 
-            # 적응형 필터 체크 (trade 여부만 막음)
+            # 적응형 필터 체크
             if side is not None:
                 ok, reasons = self.apply_adaptive_filters(features.iloc[-1])
                 if not ok:
@@ -270,7 +288,7 @@ class RealTimeTrader:
                             print(f"     - {r}")
                     return None, p_up
 
-            # 동일 신호 디바운스: 같은 방향 & 거의 같은 확률이 3~5분 내 반복되면 무시
+            # 동일 신호 디바운스
             if side is not None:
                 EPS = 1e-4
                 now = datetime.now(timezone.utc)
@@ -282,20 +300,21 @@ class RealTimeTrader:
                     return None, p_up
 
             return side, p_up
-
+        
         except Exception as e:
             print(f"❌ 예측 오류: {e}")
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
             return None, 0.5
 
     # ---------- 거래/청산/통계 ----------
     def _binary_payout(self, direction, entry_price, exit_price):
-        """바이너리 옵션 페이아웃: 방향 적중시 +WIN_RATE, 미적중시 -1 (배팅액 기준)"""
+        """바이너리 옵션 페이아웃"""
         hit = (exit_price > entry_price) if direction == 1 else (exit_price < entry_price)
         return self.config.WIN_RATE if hit else -1.0
 
     def execute_trade(self, side, p_up, amount=100):
-        """거래 실행 - 레짐 정보 포함"""
+        """거래 실행"""
         if len(self.active_positions) >= self.max_positions:
             return None
 
@@ -304,13 +323,11 @@ class RealTimeTrader:
         expiry_time = entry_time + timedelta(minutes=self.config.PREDICTION_WINDOW)
         entry_price = self.api_client.get_current_price()
         
-        # ★ 현재 레짐 정보 추출
         try:
             df = self.api_client.get_klines(limit=500)
             features = self.prepare_features(df)
             current_regime = int(features['regime'].iloc[-1]) if 'regime' in features.columns else None
-        except Exception as e:
-            print(f"⚠️ 레짐 정보 추출 실패: {e}")
+        except Exception:
             current_regime = None
 
         info = {
@@ -318,27 +335,22 @@ class RealTimeTrader:
             'entry_time': entry_time.isoformat(),
             'expiry_time': expiry_time.isoformat(),
             'entry_price': entry_price,
-            'direction': int(side),                         # 1=LONG, 0=SHORT
-            'p_up': float(p_up),                            # 예측 확률
-            'regime': current_regime,                        # ★ 레짐 정보 (0:UP, 1:DOWN, 2:FLAT)
+            'direction': int(side),
+            'p_up': float(p_up),
+            'regime': current_regime,
             'amount': amount,
             'status': 'open'
         }
         self.active_positions[trade_id] = info
         self.save_trade_log(info)
 
-        # 쿨다운
         self.next_entry_after = entry_time + timedelta(seconds=self._cool_seconds)
-
-        # 동일 신호 디바운스 메모
         self._last_signal = {"dir": side, "p": p_up, "t": entry_time}
 
-        # 알림 로그
         direction = "롱 (UP)" if side == 1 else "숏 (DOWN)"
         emoji = "🟢⬆️" if side == 1 else "🔴⬇️"
         
-        # 레짐 표시
-        regime_labels = {0: "UP 트렌드🟢", 1: "DOWN 트렌드🔴", 2: "FLAT 횡보⚪", None: "알 수 없음❓"}
+        regime_labels = {1: "UP 트렌드🟢", -1: "DOWN 트렌드🔴", 0: "FLAT 횡보⚪", None: "알 수 없음❓"}
         regime_text = regime_labels.get(current_regime, f"REGIME-{current_regime}")
 
         print("\n" + "="*70)
@@ -348,16 +360,13 @@ class RealTimeTrader:
         print("="*70)
         print(f"  🆔 거래 ID     : {trade_id}")
         print(f"  ⏰ 진입 시간   : {entry_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
-        print(f"  ⏱️  만기 시간   : {expiry_time.strftime('%H:%M:%S')} UTC ({self.config.PREDICTION_WINDOW}분 후, 칼만기)")
+        print(f"  ⏱️  만기 시간   : {expiry_time.strftime('%H:%M:%S')} UTC ({self.config.PREDICTION_WINDOW}분 후)")
         print(f"  📊 방향        : {direction} {emoji}")
-        print(f"  🎯 레짐        : {regime_text}")  # ★ 레짐 정보 표시
+        print(f"  🎯 레짐        : {regime_text}")
         print(f"  📈 P(UP)       : {p_up:.2%}")
         print(f"  💰 진입가      : ${entry_price:,.2f}")
         print(f"  💵 배팅 금액   : ${amount}")
         print(f"  📈 활성 포지션 : {len(self.active_positions)}/{self.max_positions}")
-        afc = len(self.adaptive_filters.get('active_filters', []))
-        if afc > 0:
-            print(f"  🛡️  활성 필터   : {afc}개 통과 ✓")
         print("="*70)
         print("🔔" * 35)
         print("="*70 + "\n")
@@ -371,7 +380,7 @@ class RealTimeTrader:
         return trade_id
 
     def check_trade_result(self, trade_id):
-        """거래 결과 확인 — ★ 엔트리+10분 '칼만기' 기준으로만 청산"""
+        """거래 결과 확인"""
         pos = self.active_positions.get(trade_id)
         if not pos:
             return None
@@ -381,12 +390,12 @@ class RealTimeTrader:
         now = datetime.now(timezone.utc)
 
         if now < expiry_time:
-            return None  # 아직 만기 전
+            return None
 
         entry_price = pos['entry_price']
         exit_price = self.api_client.get_current_price()
 
-        direction = pos['direction']  # 1=LONG, 0=SHORT
+        direction = pos['direction']
         pnl_unit = self._binary_payout(direction, entry_price, exit_price)
         amount = pos['amount']
         profit = amount * pnl_unit
@@ -398,7 +407,6 @@ class RealTimeTrader:
         pos['profit_loss'] = profit
         pos['status'] = 'closed'
 
-        # 성능/로그 업데이트
         self.update_performance(result == 1, profit, direction)
         self.trade_history.append(result)
         self.update_trade_log(trade_id, result, profit)
@@ -407,8 +415,7 @@ class RealTimeTrader:
         result_emoji = "✅ 승리!" if result == 1 else "❌ 패배"
         result_color = "🟢" if result == 1 else "🔴"
         
-        # 레짐 정보
-        regime_labels = {0: "UP🟢", 1: "DOWN🔴", 2: "FLAT⚪", None: "N/A"}
+        regime_labels = {1: "UP🟢", -1: "DOWN🔴", 0: "FLAT⚪", None: "N/A"}
         regime_text = regime_labels.get(pos.get('regime'), "N/A")
 
         print("\n" + "="*70)
@@ -417,7 +424,7 @@ class RealTimeTrader:
         print(f"  ⏰ 진입시각    : {entry_time.strftime('%H:%M:%S')} UTC")
         print(f"  ⏱️  만기시각    : {expiry_time.strftime('%H:%M:%S')} UTC  (칼만기)")
         print(f"  ⏳ 청산시각    : {now.strftime('%H:%M:%S')} UTC")
-        print(f"  🎯 레짐        : {regime_text}")  # ★ 레짐 정보 표시
+        print(f"  🎯 레짐        : {regime_text}")
         print(f"  📊 예측 방향   : {'롱 (UP)' if direction==1 else '숏 (DOWN)'}")
         print(f"  📈 실제 방향   : {actual_dir}")
         print(f"  💰 진입가      : ${entry_price:,.2f}")
@@ -426,10 +433,8 @@ class RealTimeTrader:
         print(f"  🎯 결과        : {result_emoji}")
         print("="*70 + "\n")
 
-        # 활성 포지션 제거
         del self.active_positions[trade_id]
 
-        # 재학습 평가 트리거
         if self.trades_since_last_check >= self.config.EVALUATION_WINDOW:
             if self.check_retrain_needed():
                 self.pending_retrain = True
@@ -511,10 +516,20 @@ class RealTimeTrader:
                 return False
 
         return False
+    
+    def trigger_retrain(self):
+        try:
+            flag_path = os.path.join(self.config.BASE_DIR, '.retrain_required')
+            timestamp = datetime.now(timezone.utc).isoformat()
+            with open(flag_path, 'w', encoding='utf-8') as f:
+                f.write(timestamp)
+            print(f"✓ 재학습 트리거 기록: {timestamp}")
+        except Exception as e:
+            print(f"⚠️ 트리거 파일 생성 실패 (계속 진행): {e}")
 
     # ---------- 로깅/저장 ----------
     def save_trade_log(self, trade_info):
-        """거래 로그 저장 (append) — regime 컬럼 포함"""
+        """거래 로그 저장"""
         try:
             log_path = os.path.join(self.config.TRADE_LOG_DIR, 'trades.csv')
             os.makedirs(self.config.TRADE_LOG_DIR, exist_ok=True)
@@ -525,17 +540,15 @@ class RealTimeTrader:
             
         except Exception as e:
             print(f"  ❌ 거래 로그 저장 실패: {e}")
-            import traceback
-            traceback.print_exc()
 
     def update_trade_log(self, trade_id, result, profit_loss):
-        """거래 결과 업데이트 (exit_time/exit_price/result/profit_loss 등)"""
+        """거래 결과 업데이트"""
         from data_merge import DataMerger
         merger = DataMerger(self.config)
         merger.update_trade_result(trade_id, result, profit_loss)
 
     def save_feature_log(self, features, trade_id):
-        """피처 로그 저장 (append)"""
+        """피처 로그 저장"""
         current_features = features.iloc[[-1]].copy()
         current_features['trade_id'] = trade_id
         current_features['timestamp'] = datetime.now(timezone.utc)
@@ -548,7 +561,7 @@ class RealTimeTrader:
         current_features.to_csv(log_path, mode='a', header=write_header, index=False, encoding='utf-8-sig')
 
     def print_trading_statistics(self):
-        """1분마다 거래 통계"""
+        """거래 통계 출력"""
         metrics = self.performance_metrics
         active_longs = sum(1 for p in self.active_positions.values() if p['direction'] == 1)
         active_shorts = len(self.active_positions) - active_longs
@@ -622,16 +635,14 @@ class RealTimeTrader:
 
     # ---------- 재학습 ----------
     def execute_retrain_process(self):
-        """재학습 프로세스 (자동 실행 + 플래그 기록)"""
+        """재학습 프로세스"""
         print(f"\n{'='*60}")
         print("재학습 및 필터 업데이트 프로세스 시작")
         print(f"{'='*60}")
 
-        # ★ 트리거 기록 (로깅/추적용)
-        self.trigger_retrain()  # 플래그 파일 생성 (언제 재학습했는지 기록)
+        self.trigger_retrain()
 
         try:
-            # ★ 1. 데이터 병합
             print("\n[1/4] 데이터 병합 중...")
             from data_merge import DataMerger
             merger = DataMerger(self.config)
@@ -642,7 +653,7 @@ class RealTimeTrader:
                 self.pending_retrain = False
                 return
             
-            merged_data = merged_data.dropna(subset=['open', 'high', 'low', 'close', 'volume'])
+            merged_data = merged_data.dropna(subset=['open','high','low','close','volume'])
             
             if len(merged_data) < 1000:
                 print(f"❌ 데이터 부족 ({len(merged_data)}건) - 재학습 중단")
@@ -651,7 +662,6 @@ class RealTimeTrader:
             
             print(f"✓ 병합 완료: {len(merged_data):,}건")
             
-            # ★ 2. 모델 재학습
             print("\n[2/4] 모델 재학습 중...")
             from model_train import ModelOptimizer
             
@@ -660,7 +670,6 @@ class RealTimeTrader:
             
             print("✓ 재학습 완료!")
             
-            # ★ 3. 적응형 필터 생성
             print("\n[3/4] 적응형 필터 생성 중...")
             
             trades_log = merger.load_trade_logs()
@@ -698,12 +707,10 @@ class RealTimeTrader:
             else:
                 print("  ⚠️ 거래 로그 없음")
             
-            # ★ 4. 모델 및 필터 리로드
             print("\n[4/4] 모델 및 필터 리로드 중...")
             self.model_trainer.load_model()
             self.adaptive_filters = self.load_adaptive_filters()
             
-            # ★ 완료 플래그 생성 (추적용)
             flag_path = os.path.join(self.config.BASE_DIR, '.retrain_complete')
             with open(flag_path, 'w', encoding='utf-8') as f:
                 f.write(datetime.now(timezone.utc).isoformat())
@@ -726,19 +733,18 @@ class RealTimeTrader:
     # ---------- 메인 루프 ----------
     def run_live_trading(self, duration_hours=99999, trade_interval_minutes=1):
         """실시간 거래 실행"""
-        print(f"\n실시간 거래 시작 (레짐 기반 + 캘리, ADX 레짐, 적응형 필터)")
+        print(f"\n실시간 거래 시작 (레짐 + 캘리 + 필터)")
         print(f"- 실행 기간: {'무제한 (Ctrl+C로 종료)' if duration_hours >= 99999 else f'{duration_hours}시간'}")
-        print(f"- 진입 간격: {trade_interval_minutes}분 (만기 {self.config.PREDICTION_WINDOW}분, 칼만기)")
-        print(f"- 최대 포지션: {self.max_positions} (데이터 수집용)")
+        print(f"- 진입 간격: {trade_interval_minutes}분 (만기 {self.config.PREDICTION_WINDOW}분)")
+        print(f"- 최대 포지션: {self.max_positions}")
         print(f"- 재학습 평가: {self.config.EVALUATION_WINDOW}회마다")
         afc = len(self.adaptive_filters.get('active_filters', []))
-        print(f"- 적응형 필터: {afc}개 {'활성' if afc > 0 else '대기중 (재학습 후 생성)'}")
+        print(f"- 적응형 필터: {afc}개")
         print("="*60 + "\n")
 
         self.is_running = True
         end_time = datetime.now(timezone.utc) + timedelta(hours=duration_hours)
         self._cool_seconds = int(trade_interval_minutes * 60)
-
 
         if not self.model_trainer.models:
             print("모델 로딩 중...")
@@ -755,16 +761,16 @@ class RealTimeTrader:
             while datetime.now(timezone.utc) < end_time and self.is_running:
                 now = datetime.now(timezone.utc)
 
-                # 1) 1분마다 통계 출력
+                # 1분마다 통계 출력
                 if (now - last_stat_time).total_seconds() >= 60:
                     self.print_trading_statistics()
                     last_stat_time = now
 
-                # 2) 열린 포지션 결과 체크 (만기 도달 시 칼청산)
+                # 열린 포지션 결과 체크
                 for trade_id in list(self.active_positions.keys()):
                     self.check_trade_result(trade_id)
 
-                # 3) 재학습 대기: 모든 포지션 종료 시 재학습 수행
+                # 재학습 대기
                 if self.pending_retrain:
                     if len(self.active_positions) == 0:
                         print(f"\n모든 포지션 종료 → 재학습 진행")
@@ -772,7 +778,7 @@ class RealTimeTrader:
                     time.sleep(5)
                     continue
 
-                # 4) 신규 진입 시도 (쿨다운 + 최대 포지션 체크)
+                # 신규 진입 시도
                 if len(self.active_positions) < self.max_positions:
                     cooled = (self.next_entry_after is None) or (now >= self.next_entry_after)
                     throttled = (self.last_attempt_time is not None
@@ -780,7 +786,6 @@ class RealTimeTrader:
 
                     if cooled and not throttled:
                         self.last_attempt_time = now
-                        # 데이터/피처/예측
                         try:
                             df = self.api_client.get_klines(limit=500)
                             features = self.prepare_features(df)
@@ -794,21 +799,17 @@ class RealTimeTrader:
                             trade_id = self.execute_trade(side, p_up)
                             if trade_id:
                                 self.save_feature_log(features, trade_id)
-                                # 다음 진입 허용 시각은 execute_trade에서 설정됨
                                 self.last_attempt_time = None
                         else:
-                            # 미진입 안내(1분 스로틀)
                             now2 = datetime.now(timezone.utc)
                             if (self._last_skip_log_time is None) or ((now2 - self._last_skip_log_time).total_seconds() >= 60):
                                 print(f"  [미진입] 레짐/필터 미통과 (활성 {len(self.active_positions)}/{self.max_positions})")
                                 self._last_skip_log_time = now2
                     else:
-                        # 쿨다운 남은 시간 매분 안내
                         if not cooled and now.second == 0:
                             remain = int((self.next_entry_after - now).total_seconds())
                             if remain > 0:
-                                print(f"  [대기] 다음 진입까지 {remain}초 "
-                                      f"(활성: {len(self.active_positions)}/{self.max_positions})")
+                                print(f"  [대기] 다음 진입까지 {remain}초 (활성: {len(self.active_positions)}/{self.max_positions})")
 
                 time.sleep(1)
 
@@ -817,7 +818,6 @@ class RealTimeTrader:
         finally:
             self.is_running = False
 
-            # 남은 포지션 정리(만기까지 대기)
             if self.active_positions:
                 print(f"\n남은 포지션 {len(self.active_positions)}개 대기...")
                 while self.active_positions:
@@ -840,20 +840,16 @@ class RealTimeTrader:
         from model_train import FeatureEngineer
         fe = FeatureEngineer()
         
-        # 피처 생성
         features = fe.create_feature_pool(historical_data)
         target = fe.create_target(historical_data, window=self.config.PREDICTION_WINDOW)
 
-        # ★ 인덱스 정렬 후 필터링
         features = features.reset_index(drop=True)
         target = target.reset_index(drop=True)
         
-        # 길이 맞추기
         min_len = min(len(features), len(target))
         features = features.iloc[:min_len]
         target = target.iloc[:min_len]
         
-        # 유효한 데이터만 필터링
         valid_idx = target.notna()
         valid_indices = valid_idx[valid_idx].index.tolist()
         
@@ -872,24 +868,19 @@ class RealTimeTrader:
             try:
                 X_current = features.iloc[[i]]
                 
-                # 예측
                 p_up_arr = np.ravel(self.model_trainer.predict_proba(X_current))
                 if len(p_up_arr) == 0 or not np.isfinite(p_up_arr[-1]):
                     continue
                 p_up = float(p_up_arr[-1])
 
-                # 레짐 추출
                 regime = int(features['regime'].iloc[i]) if 'regime' in features.columns else 0
                 
-                # 진입 결정
                 side = self.model_trainer.decide_from_proba_regime(p_up, regime)
                 if side is None:
                     continue
 
-                # 실제 결과
                 actual = int(target.iloc[i])
 
-                # 타임스탬프 추출
                 if 'timestamp' in features.columns:
                     ts = features['timestamp'].iloc[i]
                 elif i < len(historical_data):
@@ -906,8 +897,7 @@ class RealTimeTrader:
                     'correct': int(side == actual)
                 })
                 
-            except Exception as e:
-                # 개별 거래 실패는 스킵
+            except Exception:
                 continue
 
         if not trades:
@@ -924,7 +914,7 @@ class RealTimeTrader:
         losses = total_trades - wins
         profit = (wins * 100 * self.config.WIN_RATE) - (losses * 100)
 
-        print(f"\n백테스팅 결과 (레짐 기반):")
+        print(f"\n백테스팅 결과:")
         if total_trades > 0:
             print(f"- 기간: {trades_df['timestamp'].min()} ~ {trades_df['timestamp'].max()}")
         print(f"- 총 거래: {total_trades}")
@@ -933,10 +923,9 @@ class RealTimeTrader:
         print(f"- 총 손익(가정): ${profit:.2f}")
         print(f"- 평균 손익/거래: ${profit/total_trades if total_trades > 0 else 0:.2f}")
         
-        # 레짐별 성과
         if 'regime' in trades_df.columns and total_trades > 0:
             print(f"\n[레짐별 성과]")
-            regime_labels = {0: "UP", 1: "DOWN", 2: "FLAT"}
+            regime_labels = {1: "UP", -1: "DOWN", 0: "FLAT"}
             for regime_val in sorted(trades_df['regime'].unique()):
                 regime_trades = trades_df[trades_df['regime'] == regime_val]
                 regime_wins = regime_trades['correct'].sum()
@@ -949,16 +938,16 @@ class RealTimeTrader:
 
 
 # =================================
-# 모니터 + 레짐별 분석
+# 모니터
 # =================================
 class TradingMonitor:
-    """거래 모니터링 클래스 (레짐별 분석 포함)"""
+    """거래 모니터링 클래스"""
 
     def __init__(self, config):
         self.config = config
 
     def analyze_recent_trades(self, days=7):
-        """최근 거래 분석 (레짐별 포함)"""
+        """최근 거래 분석"""
         from data_merge import DataMerger
         merger = DataMerger(self.config)
         trades = merger.load_trade_logs()
@@ -978,7 +967,6 @@ class TradingMonitor:
             print(f"최근 {days}일간 거래 기록이 없습니다.")
             return None
 
-        # result, profit_loss를 숫자로 변환
         if 'result' in recent_trades.columns:
             recent_trades['result'] = pd.to_numeric(recent_trades['result'], errors='coerce')
         
@@ -996,13 +984,11 @@ class TradingMonitor:
             stats['win_rate'] = stats['wins'] / stats['total_trades']
             stats['avg_profit'] = stats['total_profit'] / stats['total_trades']
 
-        # ★ 레짐별 성과 분석
+        # 레짐별 성과 분석
         if 'regime' in recent_trades.columns and 'result' in recent_trades.columns:
             try:
-                # regime 컬럼을 숫자로 변환
                 recent_trades['regime'] = pd.to_numeric(recent_trades['regime'], errors='coerce')
                 
-                # 레짐 정보가 있는 데이터만 필터링
                 trades_with_regime = recent_trades[recent_trades['regime'].notna()]
                 
                 if len(trades_with_regime) > 0:
@@ -1014,7 +1000,6 @@ class TradingMonitor:
                     regime_stats.columns = ['_'.join(col).strip() for col in regime_stats.columns.values]
                     stats['regime_performance'] = regime_stats
                     
-                    # 레짐별 롱/숏 성과
                     if 'direction' in trades_with_regime.columns:
                         trades_with_regime['direction'] = pd.to_numeric(trades_with_regime['direction'], errors='coerce')
                         regime_direction_stats = trades_with_regime.groupby(['regime', 'direction']).agg({
@@ -1045,7 +1030,7 @@ class TradingMonitor:
         return stats
 
     def generate_report(self):
-        """종합 리포트 생성 (레짐 분석 포함)"""
+        """종합 리포트 생성"""
         print("\n" + "="*60)
         print("거래 시스템 종합 리포트")
         print("="*60)
@@ -1059,10 +1044,9 @@ class TradingMonitor:
             print(f"총 손익: ${week_stats['total_profit']:.2f}")
             print(f"평균 손익: ${week_stats.get('avg_profit', 0):.2f}")
             
-            # ★ 레짐별 성과
             if week_stats.get('regime_performance') is not None:
                 print("\n[레짐별 성과]")
-                regime_labels = {0: "UP 트렌드", 1: "DOWN 트렌드", 2: "FLAT 횡보"}
+                regime_labels = {1: "UP 트렌드", -1: "DOWN 트렌드", 0: "FLAT 횡보"}
                 rp = week_stats['regime_performance']
                 for regime_idx in rp.index:
                     regime_name = regime_labels.get(regime_idx, f"REGIME-{regime_idx}")
@@ -1096,5 +1080,8 @@ if __name__ == "__main__":
     trainer.load_model()
 
     trader = RealTimeTrader(Config, trainer)
-    # PREDICTION_WINDOW=10 (옵션 칼만기), 진입 간격은 1분 권장
+    
+    # 실시간 거래 시작
+    # - 레짐 기반 진입
+    # - 적응형 필터
     trader.run_live_trading(duration_hours=99999, trade_interval_minutes=1)

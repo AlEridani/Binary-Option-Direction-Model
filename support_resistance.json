@@ -1,0 +1,829 @@
+{
+  "timestamp": "2025-10-23T14:10:49.551096+00:00",
+  "levels": {
+    "108336.98": {
+      "price": 108336.98073954984,
+      "touches": 5002,
+      "type": "support",
+      "strength": 50.02,
+      "distance_pct": 0.22831000363570286,
+      "last_updated": "2025-10-23T05:09:45.775852+00:00"
+    },
+    "108673.44": {
+      "price": 108673.44203703705,
+      "touches": 678,
+      "type": "support",
+      "strength": 6.78,
+      "distance_pct": 0.03871076034012864,
+      "last_updated": "2025-10-23T05:09:45.775852+00:00"
+    },
+    "108327.0": {
+      "price": 108326.9978369906,
+      "touches": 4583,
+      "type": "support",
+      "strength": 45.83,
+      "distance_pct": 0.21864778787602795,
+      "last_updated": "2025-10-23T05:19:46.226487+00:00"
+    },
+    "108716.38": {
+      "price": 108716.37541666666,
+      "touches": 1124,
+      "type": "support",
+      "strength": 11.24,
+      "distance_pct": 0.07811307129519877,
+      "last_updated": "2025-10-23T05:19:46.226487+00:00"
+    },
+    "108388.28": {
+      "price": 108388.27961783439,
+      "touches": 4285,
+      "type": "support",
+      "strength": 42.85,
+      "distance_pct": 0.2302119107214585,
+      "last_updated": "2025-10-23T05:29:46.963421+00:00"
+    },
+    "108758.94": {
+      "price": 108758.94394736842,
+      "touches": 862,
+      "type": "resistance",
+      "strength": 8.62,
+      "distance_pct": 0.07241789985779626,
+      "last_updated": "2025-10-23T05:29:46.963421+00:00"
+    },
+    "108397.33": {
+      "price": 108397.32577319587,
+      "touches": 3771,
+      "type": "support",
+      "strength": 37.71,
+      "distance_pct": 0.2385771885176939,
+      "last_updated": "2025-10-23T05:39:47.742645+00:00"
+    },
+    "108754.7": {
+      "price": 108754.69739583333,
+      "touches": 1077,
+      "type": "resistance",
+      "strength": 10.77,
+      "distance_pct": 0.0685105184100811,
+      "last_updated": "2025-10-23T05:39:47.743622+00:00"
+    },
+    "108424.32": {
+      "price": 108424.32224806202,
+      "touches": 3371,
+      "type": "support",
+      "strength": 33.71,
+      "distance_pct": 0.2635417179503658,
+      "last_updated": "2025-10-23T05:49:48.209084+00:00"
+    },
+    "108754.43": {
+      "price": 108754.43285714288,
+      "touches": 1264,
+      "type": "support",
+      "strength": 12.64,
+      "distance_pct": 0.06826710830126297,
+      "last_updated": "2025-10-23T05:49:48.209084+00:00"
+    },
+    "108491.4": {
+      "price": 108491.4008058608,
+      "touches": 3614,
+      "type": "support",
+      "strength": 36.14,
+      "distance_pct": 0.25372283207778284,
+      "last_updated": "2025-10-23T05:59:48.455497+00:00"
+    },
+    "108796.55": {
+      "price": 108796.54833333334,
+      "touches": 667,
+      "type": "support",
+      "strength": 6.67,
+      "distance_pct": 0.031102875446052083,
+      "last_updated": "2025-10-23T05:59:48.455497+00:00"
+    },
+    "108491.24": {
+      "price": 108491.24186813187,
+      "touches": 3599,
+      "type": "support",
+      "strength": 35.99,
+      "distance_pct": 0.25388167990266436,
+      "last_updated": "2025-10-23T06:09:49.383955+00:00"
+    },
+    "108816.46": {
+      "price": 108816.4641935484,
+      "touches": 783,
+      "type": "support",
+      "strength": 7.83,
+      "distance_pct": 0.04918419711083178,
+      "last_updated": "2025-10-23T06:09:49.383955+00:00"
+    },
+    "108499.41": {
+      "price": 108499.40860465117,
+      "touches": 1716,
+      "type": "support",
+      "strength": 17.16,
+      "distance_pct": 0.26160437798254993,
+      "last_updated": "2025-10-23T06:19:50.384770+00:00"
+    },
+    "108813.59": {
+      "price": 108813.59333333332,
+      "touches": 383,
+      "type": "support",
+      "strength": 3.83,
+      "distance_pct": 0.047068962558135044,
+      "last_updated": "2025-10-23T06:19:50.384770+00:00"
+    },
+    "108506.82": {
+      "price": 108506.82299145297,
+      "touches": 1508,
+      "type": "support",
+      "strength": 15.08,
+      "distance_pct": 0.2670011567893965,
+      "last_updated": "2025-10-23T06:29:50.443674+00:00"
+    },
+    "108815.44": {
+      "price": 108815.444137931,
+      "touches": 369,
+      "type": "support",
+      "strength": 3.69,
+      "distance_pct": 0.04728046823848268,
+      "last_updated": "2025-10-23T06:29:50.443674+00:00"
+    },
+    "109911.81": {
+      "price": 109911.80944444444,
+      "touches": 151,
+      "type": "resistance",
+      "strength": 1.51,
+      "distance_pct": 0.025945202268625265,
+      "last_updated": "2025-10-23T06:29:50.443674+00:00"
+    },
+    "108531.31": {
+      "price": 108531.3071681416,
+      "touches": 1409,
+      "type": "support",
+      "strength": 14.09,
+      "distance_pct": 0.2794978233074968,
+      "last_updated": "2025-10-23T06:39:51.360640+00:00"
+    },
+    "108821.76": {
+      "price": 108821.75642857143,
+      "touches": 356,
+      "type": "support",
+      "strength": 3.56,
+      "distance_pct": 0.046865921685432105,
+      "last_updated": "2025-10-23T06:39:51.360640+00:00"
+    },
+    "109928.75": {
+      "price": 109928.74913043478,
+      "touches": 713,
+      "type": "resistance",
+      "strength": 7.13,
+      "distance_pct": 0.09167887553943953,
+      "last_updated": "2025-10-23T06:39:51.361617+00:00"
+    },
+    "108619.25": {
+      "price": 108619.24622047244,
+      "touches": 1635,
+      "type": "support",
+      "strength": 16.35,
+      "distance_pct": 0.23895854531280478,
+      "last_updated": "2025-10-23T06:49:52.427446+00:00"
+    },
+    "109944.62": {
+      "price": 109944.6246753247,
+      "touches": 861,
+      "type": "support",
+      "strength": 8.61,
+      "distance_pct": 0.10490329987631958,
+      "last_updated": "2025-10-23T06:49:52.427446+00:00"
+    },
+    "108619.23": {
+      "price": 108619.2299236641,
+      "touches": 1656,
+      "type": "support",
+      "strength": 16.56,
+      "distance_pct": 0.24003507933673218,
+      "last_updated": "2025-10-23T06:59:52.997163+00:00"
+    },
+    "109995.0": {
+      "price": 109995.00137614679,
+      "touches": 1160,
+      "type": "support",
+      "strength": 11.6,
+      "distance_pct": 0.15177450708909904,
+      "last_updated": "2025-10-23T06:59:52.997163+00:00"
+    },
+    "108627.82": {
+      "price": 108627.82137096775,
+      "touches": 1500,
+      "type": "support",
+      "strength": 15.0,
+      "distance_pct": 0.24521615118915682,
+      "last_updated": "2025-10-23T07:09:53.124292+00:00"
+    },
+    "110010.91": {
+      "price": 110010.91450819671,
+      "touches": 1508,
+      "type": "resistance",
+      "strength": 15.08,
+      "distance_pct": 0.16626360561927683,
+      "last_updated": "2025-10-23T07:09:53.125270+00:00"
+    },
+    "108647.82": {
+      "price": 108647.82067307693,
+      "touches": 1253,
+      "type": "support",
+      "strength": 12.53,
+      "distance_pct": 0.26367214466766964,
+      "last_updated": "2025-10-23T07:19:54.054410+00:00"
+    },
+    "109991.33": {
+      "price": 109991.33392592592,
+      "touches": 1774,
+      "type": "resistance",
+      "strength": 17.74,
+      "distance_pct": 0.18356343296546665,
+      "last_updated": "2025-10-23T07:19:54.054410+00:00"
+    },
+    "108648.28": {
+      "price": 108648.28303921569,
+      "touches": 1129,
+      "type": "support",
+      "strength": 11.29,
+      "distance_pct": 0.26409883087877073,
+      "last_updated": "2025-10-23T07:29:54.840177+00:00"
+    },
+    "109978.86": {
+      "price": 109978.8581118881,
+      "touches": 1859,
+      "type": "resistance",
+      "strength": 18.59,
+      "distance_pct": 0.20733978721718518,
+      "last_updated": "2025-10-23T07:29:54.840177+00:00"
+    },
+    "108646.07": {
+      "price": 108646.07023529414,
+      "touches": 916,
+      "type": "support",
+      "strength": 9.16,
+      "distance_pct": 0.26205678488524914,
+      "last_updated": "2025-10-23T07:39:55.741850+00:00"
+    },
+    "109863.43": {
+      "price": 109863.43285714288,
+      "touches": 1148,
+      "type": "resistance",
+      "strength": 11.48,
+      "distance_pct": 0.3730688606102112,
+      "last_updated": "2025-10-23T07:39:55.741850+00:00"
+    },
+    "110101.48": {
+      "price": 110101.47825396823,
+      "touches": 744,
+      "type": "resistance",
+      "strength": 7.44,
+      "distance_pct": 0.08945955232724655,
+      "last_updated": "2025-10-23T07:39:55.742826+00:00"
+    },
+    "108665.51": {
+      "price": 108665.51210526316,
+      "touches": 804,
+      "type": "support",
+      "strength": 8.04,
+      "distance_pct": 0.2799983622162662,
+      "last_updated": "2025-10-23T07:49:56.057025+00:00"
+    },
+    "109760.58": {
+      "price": 109760.58450450451,
+      "touches": 1423,
+      "type": "resistance",
+      "strength": 14.23,
+      "distance_pct": 0.2872411063887064,
+      "last_updated": "2025-10-23T07:49:56.057025+00:00"
+    },
+    "110096.74": {
+      "price": 110096.73606060608,
+      "touches": 791,
+      "type": "resistance",
+      "strength": 7.91,
+      "distance_pct": 0.09322861562604404,
+      "last_updated": "2025-10-23T07:49:56.057025+00:00"
+    },
+    "108742.14": {
+      "price": 108742.14152542374,
+      "touches": 647,
+      "type": "support",
+      "strength": 6.47,
+      "distance_pct": 0.3128987960417491,
+      "last_updated": "2025-10-23T07:59:56.110509+00:00"
+    },
+    "109496.13": {
+      "price": 109496.13177272727,
+      "touches": 9784,
+      "type": "resistance",
+      "strength": 89.86,
+      "distance_pct": 0.2495264738389138,
+      "last_updated": "2025-10-23T11:10:08.744563+00:00"
+    },
+    "110007.05": {
+      "price": 110007.05170542635,
+      "touches": 1723,
+      "type": "resistance",
+      "strength": 17.23,
+      "distance_pct": 0.17292536313895704,
+      "last_updated": "2025-10-23T07:59:56.110509+00:00"
+    },
+    "108753.99": {
+      "price": 108753.99157894737,
+      "touches": 631,
+      "type": "support",
+      "strength": 6.31,
+      "distance_pct": 0.17531794612246018,
+      "last_updated": "2025-10-23T08:09:57.213990+00:00"
+    },
+    "109477.55": {
+      "price": 109477.5488659794,
+      "touches": 1014,
+      "type": "support",
+      "strength": 10.14,
+      "distance_pct": 0.19460855820903794,
+      "last_updated": "2025-10-23T08:09:57.213990+00:00"
+    },
+    "110004.09": {
+      "price": 110004.08557251909,
+      "touches": 1745,
+      "type": "resistance",
+      "strength": 17.45,
+      "distance_pct": 0.17555165539787712,
+      "last_updated": "2025-10-23T08:09:57.213990+00:00"
+    },
+    "108755.74": {
+      "price": 108755.7355737705,
+      "touches": 670,
+      "type": "support",
+      "strength": 6.7,
+      "distance_pct": 0.1772565625496738,
+      "last_updated": "2025-10-23T08:19:57.773021+00:00"
+    },
+    "109528.63": {
+      "price": 109528.62708955222,
+      "touches": 1401,
+      "type": "support",
+      "strength": 14.01,
+      "distance_pct": 0.24144744273313598,
+      "last_updated": "2025-10-23T08:19:57.773999+00:00"
+    },
+    "110003.79": {
+      "price": 110003.78876811595,
+      "touches": 3816,
+      "type": "resistance",
+      "strength": 19.2,
+      "distance_pct": 0.1744056179841689,
+      "last_updated": "2025-10-23T08:29:58.543921+00:00"
+    },
+    "108768.95": {
+      "price": 108768.95035087719,
+      "touches": 638,
+      "type": "support",
+      "strength": 6.38,
+      "distance_pct": 0.09557839677599504,
+      "last_updated": "2025-10-23T08:29:58.543921+00:00"
+    },
+    "109545.5": {
+      "price": 109545.49616438354,
+      "touches": 1663,
+      "type": "support",
+      "strength": 16.63,
+      "distance_pct": 0.2568861506129409,
+      "last_updated": "2025-10-23T08:29:58.543921+00:00"
+    },
+    "108770.19": {
+      "price": 108770.19098360655,
+      "touches": 676,
+      "type": "support",
+      "strength": 6.76,
+      "distance_pct": 0.09467519128480166,
+      "last_updated": "2025-10-23T08:39:58.551966+00:00"
+    },
+    "109554.5": {
+      "price": 109554.5003888889,
+      "touches": 2197,
+      "type": "support",
+      "strength": 21.97,
+      "distance_pct": 0.2642826702287242,
+      "last_updated": "2025-10-23T08:39:58.552942+00:00"
+    },
+    "110004.19": {
+      "price": 110004.19373333332,
+      "touches": 6270,
+      "type": "resistance",
+      "strength": 20.9,
+      "distance_pct": 0.17332396232435357,
+      "last_updated": "2025-10-23T08:59:58.671334+00:00"
+    },
+    "108755.69": {
+      "price": 108755.69347826086,
+      "touches": 466,
+      "type": "support",
+      "strength": 4.66,
+      "distance_pct": 0.08133400767982663,
+      "last_updated": "2025-10-23T08:49:58.632557+00:00"
+    },
+    "109557.43": {
+      "price": 109557.43020304569,
+      "touches": 5223,
+      "type": "resistance",
+      "strength": 27.32,
+      "distance_pct": 0.2669640362496945,
+      "last_updated": "2025-10-23T08:59:58.671334+00:00"
+    },
+    "108770.61": {
+      "price": 108770.60666666664,
+      "touches": 241,
+      "type": "support",
+      "strength": 2.41,
+      "distance_pct": 0.09274577492319187,
+      "last_updated": "2025-10-23T08:59:58.670358+00:00"
+    },
+    "109069.98": {
+      "price": 109069.97976190477,
+      "touches": 440,
+      "type": "support",
+      "strength": 4.4,
+      "distance_pct": 0.2692107568784908,
+      "last_updated": "2025-10-23T09:09:59.275324+00:00"
+    },
+    "109604.41": {
+      "price": 109604.41023255813,
+      "touches": 3216,
+      "type": "resistance",
+      "strength": 32.16,
+      "distance_pct": 0.25725583383479933,
+      "last_updated": "2025-10-23T09:09:59.276302+00:00"
+    },
+    "110035.14": {
+      "price": 110035.14045801527,
+      "touches": 1773,
+      "type": "resistance",
+      "strength": 17.73,
+      "distance_pct": 0.1487739679736224,
+      "last_updated": "2025-10-23T09:09:59.276302+00:00"
+    },
+    "109214.32": {
+      "price": 109214.32148148149,
+      "touches": 609,
+      "type": "support",
+      "strength": 6.09,
+      "distance_pct": 0.39734621868002873,
+      "last_updated": "2025-10-23T09:19:59.567516+00:00"
+    },
+    "109605.84": {
+      "price": 109605.84417431193,
+      "touches": 3269,
+      "type": "resistance",
+      "strength": 32.69,
+      "distance_pct": 0.2540372959085566,
+      "last_updated": "2025-10-23T09:19:59.567516+00:00"
+    },
+    "110037.66": {
+      "price": 110037.65558139535,
+      "touches": 1742,
+      "type": "resistance",
+      "strength": 17.42,
+      "distance_pct": 0.14656037052773388,
+      "last_updated": "2025-10-23T09:19:59.567516+00:00"
+    },
+    "109482.53": {
+      "price": 109482.53396396396,
+      "touches": 6690,
+      "type": "resistance",
+      "strength": 33.92,
+      "distance_pct": 0.24999099342617095,
+      "last_updated": "2025-10-23T09:40:00.751003+00:00"
+    },
+    "109977.57": {
+      "price": 109977.56830508474,
+      "touches": 5006,
+      "type": "resistance",
+      "strength": 25.03,
+      "distance_pct": 0.20002939656231017,
+      "last_updated": "2025-10-23T09:40:00.751003+00:00"
+    },
+    "109480.82": {
+      "price": 109480.81946938777,
+      "touches": 3842,
+      "type": "resistance",
+      "strength": 38.42,
+      "distance_pct": 0.2490636464964707,
+      "last_updated": "2025-10-23T09:50:01.721088+00:00"
+    },
+    "109974.75": {
+      "price": 109974.74836734694,
+      "touches": 2784,
+      "type": "resistance",
+      "strength": 27.84,
+      "distance_pct": 0.2001806635457889,
+      "last_updated": "2025-10-23T09:50:01.721088+00:00"
+    },
+    "109480.57": {
+      "price": 109480.56753968255,
+      "touches": 4153,
+      "type": "resistance",
+      "strength": 41.53,
+      "distance_pct": 0.24981518223986268,
+      "last_updated": "2025-10-23T10:00:03.419256+00:00"
+    },
+    "109974.37": {
+      "price": 109974.3748,
+      "touches": 2847,
+      "type": "resistance",
+      "strength": 28.47,
+      "distance_pct": 0.1993655720038305,
+      "last_updated": "2025-10-23T10:00:03.419256+00:00"
+    },
+    "109481.93": {
+      "price": 109481.93307692309,
+      "touches": 4757,
+      "type": "support",
+      "strength": 47.57,
+      "distance_pct": 0.24999155464873116,
+      "last_updated": "2025-10-23T10:10:04.353519+00:00"
+    },
+    "109975.54": {
+      "price": 109975.53907407408,
+      "touches": 3064,
+      "type": "resistance",
+      "strength": 30.64,
+      "distance_pct": 0.19915738736734848,
+      "last_updated": "2025-10-23T10:10:04.353519+00:00"
+    },
+    "109495.87": {
+      "price": 109495.86758064515,
+      "touches": 22457,
+      "type": "support",
+      "strength": 59.46,
+      "distance_pct": 0.24936719721044479,
+      "last_updated": "2025-10-23T10:50:07.296743+00:00"
+    },
+    "109982.47": {
+      "price": 109982.47401673639,
+      "touches": 2920,
+      "type": "resistance",
+      "strength": 29.2,
+      "distance_pct": 0.19356291950113194,
+      "last_updated": "2025-10-23T10:20:05.313136+00:00"
+    },
+    "109969.42": {
+      "price": 109969.42454106282,
+      "touches": 1980,
+      "type": "resistance",
+      "strength": 19.8,
+      "distance_pct": 0.18167490303618558,
+      "last_updated": "2025-10-23T10:30:06.003350+00:00"
+    },
+    "110013.11": {
+      "price": 110013.10827272729,
+      "touches": 1061,
+      "type": "resistance",
+      "strength": 10.61,
+      "distance_pct": 0.22147059554276016,
+      "last_updated": "2025-10-23T10:40:06.693594+00:00"
+    },
+    "109863.01": {
+      "price": 109863.00533333333,
+      "touches": 452,
+      "type": "resistance",
+      "strength": 4.52,
+      "distance_pct": 0.08472746044760354,
+      "last_updated": "2025-10-23T10:50:07.296743+00:00"
+    },
+    "109497.06": {
+      "price": 109497.06082621081,
+      "touches": 6952,
+      "type": "resistance",
+      "strength": 69.52,
+      "distance_pct": 0.24970704895284074,
+      "last_updated": "2025-10-23T11:00:07.841230+00:00"
+    },
+    "109805.69": {
+      "price": 109805.69368421054,
+      "touches": 403,
+      "type": "resistance",
+      "strength": 4.03,
+      "distance_pct": 0.03127745179665676,
+      "last_updated": "2025-10-23T11:00:07.841230+00:00"
+    },
+    "109805.31": {
+      "price": 109805.30840000002,
+      "touches": 530,
+      "type": "resistance",
+      "strength": 5.3,
+      "distance_pct": 0.032238704373680226,
+      "last_updated": "2025-10-23T11:10:08.744563+00:00"
+    },
+    "109496.63": {
+      "price": 109496.63239828694,
+      "touches": 19818,
+      "type": "support",
+      "strength": 98.34,
+      "distance_pct": 0.24984714704599106,
+      "last_updated": "2025-10-23T11:30:10.215560+00:00"
+    },
+    "109784.35": {
+      "price": 109784.34739130436,
+      "touches": 192,
+      "type": "resistance",
+      "strength": 1.92,
+      "distance_pct": 0.012432635761964886,
+      "last_updated": "2025-10-23T11:20:09.300127+00:00"
+    },
+    "109773.63": {
+      "price": 109773.62833333334,
+      "touches": 48,
+      "type": "resistance",
+      "strength": 0.48,
+      "distance_pct": 0.0026676821167617576,
+      "last_updated": "2025-10-23T11:30:10.215560+00:00"
+    },
+    "109462.55": {
+      "price": 109462.5461013216,
+      "touches": 9558,
+      "type": "resistance",
+      "strength": 95.58,
+      "distance_pct": 0.24999281187966424,
+      "last_updated": "2025-10-23T11:40:10.538058+00:00"
+    },
+    "109756.6": {
+      "price": 109756.60147058823,
+      "touches": 359,
+      "type": "resistance",
+      "strength": 3.59,
+      "distance_pct": 0.018117427410100334,
+      "last_updated": "2025-10-23T11:40:10.538058+00:00"
+    },
+    "109449.89": {
+      "price": 109449.89205298014,
+      "touches": 18541,
+      "type": "resistance",
+      "strength": 92.39,
+      "distance_pct": 0.24946713209223642,
+      "last_updated": "2025-10-23T12:00:11.751793+00:00"
+    },
+    "109749.97": {
+      "price": 109749.97355555557,
+      "touches": 966,
+      "type": "resistance",
+      "strength": 4.83,
+      "distance_pct": 0.024163980570391,
+      "last_updated": "2025-10-23T12:00:11.751793+00:00"
+    },
+    "109445.82": {
+      "price": 109445.8206354515,
+      "touches": 5671,
+      "type": "resistance",
+      "strength": 56.71,
+      "distance_pct": 0.24937412548796534,
+      "last_updated": "2025-10-23T12:10:12.737802+00:00"
+    },
+    "109748.22": {
+      "price": 109748.21656249999,
+      "touches": 339,
+      "type": "resistance",
+      "strength": 3.39,
+      "distance_pct": 0.02580804621586103,
+      "last_updated": "2025-10-23T12:10:12.737802+00:00"
+    },
+    "109234.31": {
+      "price": 109234.31230452676,
+      "touches": 4265,
+      "type": "resistance",
+      "strength": 42.65,
+      "distance_pct": 0.2788771013294049,
+      "last_updated": "2025-10-23T12:20:43.900343+00:00"
+    },
+    "109598.53": {
+      "price": 109598.53321428571,
+      "touches": 2309,
+      "type": "resistance",
+      "strength": 23.09,
+      "distance_pct": 0.11205503595560448,
+      "last_updated": "2025-10-23T12:20:43.900343+00:00"
+    },
+    "109211.07": {
+      "price": 109211.06581469649,
+      "touches": 5034,
+      "type": "resistance",
+      "strength": 50.34,
+      "distance_pct": 0.25794141425614237,
+      "last_updated": "2025-10-23T12:30:44.253938+00:00"
+    },
+    "109571.36": {
+      "price": 109571.35837606837,
+      "touches": 2126,
+      "type": "resistance",
+      "strength": 21.26,
+      "distance_pct": 0.08689409204936335,
+      "last_updated": "2025-10-23T12:30:44.253938+00:00"
+    },
+    "109126.69": {
+      "price": 109126.68997067449,
+      "touches": 4767,
+      "type": "resistance",
+      "strength": 47.67,
+      "distance_pct": 0.25247151994218625,
+      "last_updated": "2025-10-23T12:40:44.411916+00:00"
+    },
+    "109526.35": {
+      "price": 109526.35488235296,
+      "touches": 3538,
+      "type": "resistance",
+      "strength": 35.38,
+      "distance_pct": 0.11774018920254925,
+      "last_updated": "2025-10-23T12:40:44.411916+00:00"
+    },
+    "109123.95": {
+      "price": 109123.94762569832,
+      "touches": 10899,
+      "type": "support",
+      "strength": 55.8,
+      "distance_pct": 0.24995218336471636,
+      "last_updated": "2025-10-23T13:00:45.304197+00:00"
+    },
+    "109517.68": {
+      "price": 109517.67867549669,
+      "touches": 3136,
+      "type": "resistance",
+      "strength": 31.36,
+      "distance_pct": 0.10980929234401127,
+      "last_updated": "2025-10-23T12:50:44.458861+00:00"
+    },
+    "109490.59": {
+      "price": 109490.58579831931,
+      "touches": 2592,
+      "type": "resistance",
+      "strength": 25.92,
+      "distance_pct": 0.08504376772542879,
+      "last_updated": "2025-10-23T13:00:45.304197+00:00"
+    },
+    "109108.51": {
+      "price": 109108.51106936416,
+      "touches": 24645,
+      "type": "support",
+      "strength": 67.24,
+      "distance_pct": 0.25683509851616926,
+      "last_updated": "2025-10-23T14:10:49.497388+00:00"
+    },
+    "109478.02": {
+      "price": 109478.02429629628,
+      "touches": 8151,
+      "type": "resistance",
+      "strength": 26.33,
+      "distance_pct": 0.09586838920027825,
+      "last_updated": "2025-10-23T13:30:47.480897+00:00"
+    },
+    "109107.41": {
+      "price": 109107.41104651162,
+      "touches": 5193,
+      "type": "resistance",
+      "strength": 51.93,
+      "distance_pct": 0.2558243175179636,
+      "last_updated": "2025-10-23T13:20:46.583305+00:00"
+    },
+    "109096.23": {
+      "price": 109096.22871559636,
+      "touches": 5294,
+      "type": "resistance",
+      "strength": 52.94,
+      "distance_pct": 0.24554917861632172,
+      "last_updated": "2025-10-23T13:30:47.479895+00:00"
+    },
+    "109105.77": {
+      "price": 109105.77035190615,
+      "touches": 5975,
+      "type": "support",
+      "strength": 59.75,
+      "distance_pct": 0.2543167279917549,
+      "last_updated": "2025-10-23T13:40:47.804776+00:00"
+    },
+    "109500.18": {
+      "price": 109500.17888888887,
+      "touches": 3053,
+      "type": "resistance",
+      "strength": 30.53,
+      "distance_pct": 0.11612435562475816,
+      "last_updated": "2025-10-23T13:40:47.805751+00:00"
+    },
+    "109504.59": {
+      "price": 109504.59370588235,
+      "touches": 3570,
+      "type": "support",
+      "strength": 35.7,
+      "distance_pct": 0.12016082726901778,
+      "last_updated": "2025-10-23T13:50:48.216831+00:00"
+    },
+    "109509.81": {
+      "price": 109509.8081111111,
+      "touches": 8045,
+      "type": "resistance",
+      "strength": 40.66,
+      "distance_pct": 0.12492836324584614,
+      "last_updated": "2025-10-23T14:10:49.497388+00:00"
+    }
+  }
+}
