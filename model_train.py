@@ -1,1810 +1,775 @@
-# model_train.py
-# 레짐별 스위칭 모델 (UP/DOWN/FLAT 각각 독립 학습)
-# - 상위봉(기본 15분) ADX 레짐을 'regime' 컬럼으로 제공
-# - 각 레짐마다 별도 LGBM 앙상블 + 캘리브레이터 학습
-# - Isotonic/Platt 캘리브레이션 선택 가능
+"""
+model_trainer.py
+모델 학습/저장/로드 (30분봉 시스템)
+- LightGBM 기반 학습
+- 시계열 CV
+- 앙상블 (3개 모델)
+- 피처 선택 (Top K)
+- 캘리브레이션 (Isotonic/Platt)
+- 레짐별 모델 분리 학습
+- 모델 버전 관리
+"""
 
-import os
-import json
-import joblib
-import warnings
-warnings.filterwarnings('ignore')
-
-try:
-    import lightgbm as lgb
-    _LGBM_ERR = None
-except Exception as e:
-    lgb, _LGBM_ERR = None, e
-
-import numpy as np
 import pandas as pd
-
+import numpy as np
 from datetime import datetime, timezone
-
+from pathlib import Path
+from typing import Optional, Dict, Tuple, List
+import pickle
+import json
+import lightgbm as lgb
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score, brier_score_loss
+    accuracy_score, precision_score, recall_score, 
+    f1_score, roc_auc_score, log_loss, classification_report
 )
-from sklearn.preprocessing import StandardScaler
-from sklearn.isotonic import IsotonicRegression
-from sklearn.linear_model import LogisticRegression
-from sklearn.calibration import calibration_curve
-import time
+
+from config import Config
 
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
-def _safe_prep(df):
-    return df.fillna(method='ffill').fillna(0).replace([np.inf, -np.inf], 0)
-
-def _ensure_dir(p):
-    os.makedirs(p, exist_ok=True)
-
-
-# ===============================
-# Feature Engineering
-# ===============================
-class FeatureEngineer:
-    """피처 엔지니어링 (미래 누출 방지)"""
-
-    @staticmethod
-    def _compute_adx_core(high, low, close, w: int = 14):
-        up_move   = high.diff()
-        down_move = (-low.diff())
-
-        plus_dm  = np.where((up_move > down_move) & (up_move > 0),  up_move, 0.0)
-        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-        tr1 = (high - low)
-        tr2 = (high - close.shift()).abs()
-        tr3 = (low  - close.shift()).abs()
-        tr  = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-        alpha = 1.0 / w
-        tr_s       = tr.ewm(alpha=alpha, adjust=False, min_periods=w).mean()
-        plus_dm_s  = pd.Series(plus_dm,  index=high.index).ewm(alpha=alpha, adjust=False, min_periods=w).mean()
-        minus_dm_s = pd.Series(minus_dm, index=high.index).ewm(alpha=alpha, adjust=False, min_periods=w).mean()
-
-        plus_di  = 100.0 * (plus_dm_s / (tr_s + 1e-9))
-        minus_di = 100.0 * (minus_dm_s / (tr_s + 1e-9))
-        dx       = 100.0 * (plus_di.subtract(minus_di).abs() / (plus_di + minus_di + 1e-9))
-        adx      = dx.ewm(alpha=alpha, adjust=False, min_periods=w).mean()
-        return plus_di, minus_di, adx
-
-    @staticmethod
-    def _compute_adx(df: pd.DataFrame, w: int = 14):
-        high  = df['high'].astype(float)
-        low   = df['low'].astype(float)
-        close = df['close'].astype(float)
-        return FeatureEngineer._compute_adx_core(high, low, close, w=w)
-
-    @staticmethod
-    def _htf_regime_features(df, tf='15min', adx_thr=20, w=14):
-        """상위봉 레짐 계산"""
-        if 'timestamp' in df.columns:
-            idx = pd.to_datetime(df['timestamp'], utc=True)
-        else:
-            idx = pd.to_datetime(df.index, utc=True)
-        src = df.set_index(idx).sort_index()
-        ohlc = src[['open','high','low','close','volume']]
-
-        htf = pd.DataFrame({
-            'open':   ohlc['open'].resample(tf).first(),
-            'high':   ohlc['high'].resample(tf).max(),
-            'low':    ohlc['low'].resample(tf).min(),
-            'close':  ohlc['close'].resample(tf).last(),
-            'volume': ohlc['volume'].resample(tf).sum(),
-        }).dropna()
-
-        pdi, mdi, adx = FeatureEngineer._compute_adx_core(htf['high'], htf['low'], htf['close'], w=w)
-        up   = (adx > adx_thr) & (pdi > mdi)
-        down = (adx > adx_thr) & (mdi > pdi)
-        regime = np.select([up, down], [1, -1], default=0).astype(int)
-
-        out = pd.DataFrame({
-            'htf_pdi_14': pdi,
-            'htf_mdi_14': mdi,
-            'htf_adx_14': adx,
-            'htf_regime': regime,
-        }, index=htf.index)
-
-        out_1m = out.reindex(src.index, method='ffill')
-        return out_1m.reset_index(drop=True)
-
-    @staticmethod
-    def create_feature_pool(df, lookback_window=200):
-        features = pd.DataFrame(index=df.index)
-
-        if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
-            features['timestamp'] = df['timestamp']
-
-        # 기본 과거 캔들
-        features['prev_open']   = df['open'].shift(1)
-        features['prev_high']   = df['high'].shift(1)
-        features['prev_low']    = df['low'].shift(1)
-        features['prev_close']  = df['close'].shift(1)
-        features['prev_volume'] = df['volume'].shift(1)
-
-        # 수익률/체결량 변화율
-        for period in [1, 2, 3, 5, 10, 15, 30, 60]:
-            features[f'return_{period}']        = df['close'].shift(1) / df['close'].shift(period+1) - 1
-            features[f'volume_change_{period}'] = df['volume'].shift(1) / df['volume'].shift(period+1) - 1
-
-        # 이동평균
-        for period in [5, 10, 20, 50, 100, 200]:
-            ma = df['close'].shift(1).rolling(window=period, min_periods=period).mean()
-            features[f'ma_{period}'] = ma
-            features[f'price_to_ma_{period}'] = df['close'].shift(1) / (ma + 1e-9) - 1
-            features[f'ma_{period}_slope'] = ma.diff(5) / (ma.shift(5) + 1e-9)
-
-        # EMA
-        for period in [12, 26, 50]:
-            ema = df['close'].shift(1).ewm(span=period, adjust=False, min_periods=period).mean()
-            features[f'ema_{period}'] = ema
-            features[f'price_to_ema_{period}'] = df['close'].shift(1) / (ema + 1e-9) - 1
-
-        # 볼린저
-        for period in [20, 50]:
-            sc  = df['close'].shift(1)
-            ma  = sc.rolling(window=period, min_periods=period).mean()
-            std = sc.rolling(window=period, min_periods=period).std()
-            upper = ma + 2 * std
-            lower = ma - 2 * std
-            features[f'bb_upper_{period}'] = upper
-            features[f'bb_lower_{period}'] = lower
-            features[f'bb_width_{period}'] = 4 * std / (ma + 1e-9)
-            features[f'bb_position_{period}'] = (sc - lower) / ((upper - lower) + 1e-9)
-
-        # RSI
-        for period in [14, 28]:
-            sc = df['close'].shift(1)
-            delta = sc.diff()
-            gain = delta.where(delta > 0, 0).rolling(window=period, min_periods=period).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=period, min_periods=period).mean()
-            rs = gain / (loss + 1e-9)
-            features[f'rsi_{period}'] = 100 - (100 / (1 + rs))
-
-        # MACD
-        sc = df['close'].shift(1)
-        ema12 = sc.ewm(span=12, adjust=False, min_periods=12).mean()
-        ema26 = sc.ewm(span=26, adjust=False, min_periods=26).mean()
-        macd = ema12 - ema26
-        signal = macd.ewm(span=9, adjust=False, min_periods=9).mean()
-        features['macd'] = macd
-        features['macd_signal'] = signal
-        features['macd_histogram'] = macd - signal
-
-        # Stochastic
-        for period in [14]:
-            sh = df['high'].shift(1); sl = df['low'].shift(1); sc = df['close'].shift(1)
-            low_min  = sl.rolling(window=period, min_periods=period).min()
-            high_max = sh.rolling(window=period, min_periods=period).max()
-            features[f'stoch_{period}'] = (sc - low_min) / ((high_max - low_min) + 1e-9) * 100
-
-        # ATR
-        for period in [14, 28]:
-            sh = df['high'].shift(1); sl = df['low'].shift(1); sc = df['close'].shift(1)
-            tr = pd.concat([
-                sh - sl,
-                (sh - sc.shift(1)).abs(),
-                (sl - sc.shift(1)).abs()
-            ], axis=1).max(axis=1)
-            atr = tr.rolling(window=period, min_periods=period).mean()
-            features[f'atr_{period}'] = atr
-            features[f'atr_ratio_{period}'] = atr / (sc + 1e-9)
-
-        # 거래량
-        sv = df['volume'].shift(1)
-        features['volume_sma_10'] = sv.rolling(window=10, min_periods=10).mean()
-        features['volume_sma_50'] = sv.rolling(window=50, min_periods=50).mean()
-        features['volume_ratio'] = sv / (features['volume_sma_10'] + 1e-9)
-        features['volume_trend'] = features['volume_sma_10'] / (features['volume_sma_50'] + 1e-9)
-
-        # OBV
-        price_diff = df['close'].diff().shift(1)
-        obv = (np.sign(price_diff) * df['volume'].shift(1)).cumsum()
-        features['obv'] = obv
-        features['obv_ema'] = obv.ewm(span=20, adjust=False, min_periods=20).mean()
-        features['obv_signal'] = obv / (features['obv_ema'] + 1e-9) - 1
-
-        # 캔들 패턴
-        po = df['open'].shift(1); pc = df['close'].shift(1); ph = df['high'].shift(1); pl = df['low'].shift(1)
-        features['body_size'] = (pc - po).abs() / (po + 1e-9)
-        features['upper_shadow'] = (ph - pd.concat([po, pc], axis=1).max(axis=1)) / (po + 1e-9)
-        features['lower_shadow'] = (pd.concat([po, pc], axis=1).min(axis=1) - pl) / (po + 1e-9)
-        features['body_position'] = (pc - po) / ((ph - pl) + 1e-9)
-
-        for i in range(1, 4):
-            features[f'candle_direction_{i}'] = np.sign(df['close'].shift(i) - df['open'].shift(i))
-            features[f'candle_size_{i}'] = (df['high'].shift(i) - df['low'].shift(i)) / (df['close'].shift(i) + 1e-9)
-
-        # 시간
-        if 'timestamp' in df.columns:
-            dt = pd.to_datetime(df['timestamp'], utc=True)
-            features['hour'] = dt.dt.hour
-            features['minute'] = dt.dt.minute
-            features['day_of_week'] = dt.dt.dayofweek
-            features['day_of_month'] = dt.dt.day
-            features['hour_sin'] = np.sin(2*np.pi*features['hour']/24.0)
-            features['hour_cos'] = np.cos(2*np.pi*features['hour']/24.0)
-            features['dow_sin'] = np.sin(2*np.pi*features['day_of_week']/7.0)
-            features['dow_cos'] = np.cos(2*np.pi*features['day_of_week']/7.0)
-
-        # 마이크로구조
-        for period in [3, 5, 10]:
-            sh = df['high'].shift(1); sl = df['low'].shift(1); sc = df['close'].shift(1)
-            features[f'high_low_ratio_{period}'] = (sh / (sl + 1e-9) - 1).rolling(period, min_periods=period).mean()
-            features[f'close_position_{period}'] = (((sc - sl) / ((sh - sl) + 1e-9))
-                                                    .rolling(period, min_periods=period).mean())
-
-        # 추세 강도
-        for period in [10, 20, 50]:
-            sc = df['close'].shift(1)
-            ma = sc.rolling(window=period, min_periods=period).mean()
-            above = (sc > ma).astype(int)
-            features[f'trend_strength_{period}'] = above.rolling(window=period, min_periods=period).mean()
-
-        # 변동성
-        for period in [10, 30]:
-            sr = df['close'].shift(1).pct_change()
-            features[f'volatility_{period}'] = sr.rolling(window=period, min_periods=period).std()
-            features[f'volatility_ratio_{period}'] = (
-                features[f'volatility_{period}'] /
-                (sr.rolling(window=period*3, min_periods=period*3).std() + 1e-9)
-            )
-
-        # lookback 제거
-        features = features.iloc[lookback_window:]
-
-        # DI/ADX
-        pdi, mdi, adx = FeatureEngineer._compute_adx(df, w=14)
-        pdi  = pdi.shift(1).reindex(features.index)
-        mdi  = mdi.shift(1).reindex(features.index)
-        adx  = adx.shift(1).reindex(features.index)
-
-        features['di_plus_14']  = pdi
-        features['di_minus_14'] = mdi
-        features['adx_14']      = adx
-
-        # 상위봉 레짐
-        try:
-            from config import Config
-            tf = getattr(Config, 'REGIME_TF', '15min')
-            adx_thr = getattr(Config, 'REGIME_ADX_THR', 20)
-        except Exception:
-            tf = '15min'
-            adx_thr = 20
-
-        htf = FeatureEngineer._htf_regime_features(df.copy(), tf=tf, adx_thr=adx_thr, w=14)
-        htf = htf.iloc[lookback_window:].reset_index(drop=True)
-        features = features.reset_index(drop=True)
-        features = pd.concat([features, htf], axis=1)
-
-        features['regime'] = features['htf_regime'].astype('int16')
-
-        return features
-
-    @staticmethod
-    def create_target(df, window=10):
-        current = df['close']
-        future = df['close'].shift(-window)
-        return (future > current).astype(int)
-
-    @staticmethod
-    def validate_no_future_leak(features, target):
-        issues = []
-        for col in features.columns:
-            if col == 'timestamp':
-                continue
-            corr = features[col].corr(target)
-            if pd.notna(corr) and abs(corr) > 0.95:
-                issues.append(f"Suspicious correlation in {col}: {corr:.3f}")
-        if issues:
-            print("⚠️ 미래 데이터 누출 의심:")
-            for it in issues:
-                print("  -", it)
-            return False
-        return True
-
-
-# ===============================
-# Model Trainer
-# ===============================
 class ModelTrainer:
-    """레짐별 독립 LGBM 앙상블 + 확률 캘리브레이션"""
-    def __init__(self, config):
-        self.config = config
-        if lgb is None:
-            raise ImportError(f"lightgbm import failed: {_LGBM_ERR}")
-
-        # 레짐별 번들
-        self.bundles = {'UP': None, 'DOWN': None, 'FLAT': None}
-        self.models = []
-        self.scaler = StandardScaler()
-        self.feature_importance = None
+    """모델 학습 및 관리 (레짐별 분리 학습 지원)"""
+    
+    def __init__(self):
+        self.config = Config
+        self.models = {}  # {'overall': [...], 'regime_1': [...], 'regime_-1': [...], 'regime_0': [...]}
+        self.feature_importance = {}
         self.selected_features = None
-        self.calibrator = None
-        self.calib_method = 'isotonic'
-        self._progress_callback = None
-
-        # Legacy 호환
-        self.models = []
-        self.scaler = StandardScaler()
-        self.feature_importance = None
-        self.selected_features = None
-        self.calibrator = None
-        self.calib_method = 'isotonic'
+        self.calibrators = {}
+        self.metadata = {}
         
-        # 진행 상황 콜백
-        self._progress_callback = None
-
-    def _regime_to_name(self, regime_val: int) -> str:
-        if regime_val == 1:
-            return 'UP'
-        elif regime_val == -1:
-            return 'DOWN'
-        else:
-            return 'FLAT'
-
-    def _name_to_regime(self, name: str) -> int:
-        if name == 'UP':
-            return 1
-        elif name == 'DOWN':
-            return -1
-        else:
-            return 0
-
-    # --- 결정 함수 (real_trade 호환) ---
-    def decide_from_proba_simple(self, p_up: float) -> int:
-        return 1 if p_up >= 0.5 else 0
-
-    def decide_from_proba_regime(self, p_up, regime):
-        """레짐 기반 진입 결정"""
-        if regime == 1:
-            return 1
-        elif regime == -1:
-            return 0
-        else:
-            return 1 if p_up >= 0.5 else 0
-
-    # --- 피처 선택 ---
-    def feature_selection_regime(self, X, y, regime_col='regime', top_k=50):
-        """레짐별 피처 선택"""
-        if regime_col not in X.columns:
-            return self.feature_selection_temporal(X, y, top_k)
-
-        # 인덱스 정렬 및 리셋 (핵심 수정)
-        X = X.reset_index(drop=True)
-        y = y.reset_index(drop=True)
+        # 버전 정보
+        self.model_version = self.config.get_version_string()
+        self.feature_version = self.config.get_version_string()
+    
+    # ==========================================
+    # 피처 선택
+    # ==========================================
+    
+    def select_features(
+        self, 
+        X: pd.DataFrame, 
+        y: pd.Series,
+        top_k: Optional[int] = None
+    ) -> List[str]:
+        """
+        피처 선택 (Feature Importance 기반)
         
-        # 길이 맞추기
-        min_len = min(len(X), len(y))
-        X = X.iloc[:min_len]
-        y = y.iloc[:min_len]
-
-        # ★ regime 정보 없는 데이터 제외
-        if regime_col in X.columns:
-            valid_mask = X[regime_col].notna()
-            excluded = (~valid_mask).sum()
-            if excluded > 0:
-                print(f"\nℹ️  레짐 정보 없는 데이터 {excluded:,}건 제외 (피처 선택)")
-                X = X[valid_mask].reset_index(drop=True)
-                y = y[valid_mask].reset_index(drop=True)
-
-        all_selected = set()
-
-        for rval in [1, -1, 0]:
-            rname = self._regime_to_name(rval)
-            mask = (X[regime_col] == rval).values  # .values로 numpy array 변환
-            Xr = X[mask].copy()
-            yr = y[mask].copy()
-
-            if len(Xr) < 100:
-                print(f"  레짐 {rname}: 샘플 부족 ({len(Xr)}개) → 스킵")
-                continue
-
-            print(f"\n레짐 {rname} 피처 선택 (n={len(Xr)})...")
-
-            # 다시 인덱스 리셋
-            Xr = Xr.reset_index(drop=True)
-            yr = yr.reset_index(drop=True)
-
-            train_size = int(len(Xr) * 0.7)
-            X_tr, y_tr = Xr.iloc[:train_size], yr.iloc[:train_size]
-            X_va, y_va = Xr.iloc[train_size:], yr.iloc[train_size:]
-
-            cols = [c for c in X_tr.columns if c not in ['timestamp', 'regime', 'htf_regime']]
-            X_tr = _safe_prep(X_tr[cols])
-            X_va = _safe_prep(X_va[cols])
-
-            n_tr = min(len(X_tr), len(y_tr))
-            n_va = min(len(X_va), len(y_va))
-            X_tr, y_tr = X_tr.iloc[:n_tr], y_tr.iloc[:n_tr]
-            X_va, y_va = X_va.iloc[:n_va], y_va.iloc[:n_va]
-
-            dtr = lgb.Dataset(X_tr, y_tr)
-            dva = lgb.Dataset(X_va, y_va, reference=dtr)
-
-            params = {
-                'objective': 'binary',
-                'metric': 'binary_logloss',
-                'boosting_type': 'gbdt',
-                'learning_rate': 0.03,
-                'num_leaves': 31,
-                'max_depth': 7,
-                'min_data_in_leaf': 100,
-                'feature_fraction': 0.7,
-                'bagging_fraction': 0.7,
-                'bagging_freq': 1,
-                'lambda_l2': 10.0,
-                'verbose': -1
-            }
-
-            model = lgb.train(
-                params,
-                dtr,
-                valid_sets=[dva],
-                callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)]
-            )
-
-            imp = pd.DataFrame({
-                'feature': cols,
-                'importance': model.feature_importance(importance_type='gain')
-            }).sort_values('importance', ascending=False)
-
-            top_feats = set(imp.head(top_k)['feature'].tolist())
-            all_selected.update(top_feats)
-
-            print(f"  → 상위 {len(top_feats)}개 피처 선택")
-
-        self.selected_features = list(all_selected)
-        print(f"\n전체 선택 피처: {len(self.selected_features)}개")
-
-        return self.selected_features
-
-    def feature_selection_temporal(self, X, y, top_k=50):
-        """전체 데이터 피처 선택"""
-        X = X.reset_index(drop=True)
-        y = y.reset_index(drop=True)
-
-        train_size = int(len(X) * 0.7)
-        X_tr, y_tr = X.iloc[:train_size], y.iloc[:train_size]
-        X_va, y_va = X.iloc[train_size:], y.iloc[train_size:]
-
-        cols = [c for c in X.columns if c not in ['timestamp', 'regime', 'htf_regime']]
-        X_tr = _safe_prep(X_tr[cols])
-        X_va = _safe_prep(X_va[cols])
-
-        n_tr = min(len(X_tr), len(y_tr))
-        n_va = min(len(X_va), len(y_va))
-        X_tr, y_tr = X_tr.iloc[:n_tr], y_tr.iloc[:n_tr]
-        X_va, y_va = X_va.iloc[:n_va], y_va.iloc[:n_va]
-
-        dtr = lgb.Dataset(X_tr, y_tr)
-        dva = lgb.Dataset(X_va, y_va, reference=dtr)
-
+        Parameters:
+        -----------
+        X : DataFrame
+            피처
+        y : Series
+            타겟
+        top_k : int
+            선택할 피처 개수 (None이면 Config 사용)
+        
+        Returns:
+        --------
+        List[str]: 선택된 피처 리스트
+        """
+        if top_k is None:
+            top_k = self.config.TOP_K_FEATURES
+        
+        # 제외할 메타 컬럼
+        exclude_cols = [
+            'bar30_start', 'bar30_end', 'timestamp', 
+            'm1_index_entry', 'm1_index_label',
+            'regime', 'regime_final', 'is_weekend'
+        ]
+        
+        feature_cols = [c for c in X.columns if c not in exclude_cols]
+        
+        if len(feature_cols) <= top_k:
+            print(f"  전체 피처 사용: {len(feature_cols)}개")
+            return feature_cols
+        
+        # LightGBM으로 Feature Importance 계산
+        print(f"  피처 중요도 계산 중... (전체 {len(feature_cols)}개)")
+        
+        train_data = lgb.Dataset(
+            X[feature_cols].values, 
+            label=y.values
+        )
+        
         params = {
             'objective': 'binary',
             'metric': 'binary_logloss',
-            'boosting_type': 'gbdt',
-            'learning_rate': 0.03,
+            'verbose': -1,
             'num_leaves': 31,
-            'max_depth': 7,
-            'min_data_in_leaf': 200,
-            'feature_fraction': 0.7,
-            'bagging_fraction': 0.7,
-            'bagging_freq': 1,
-            'lambda_l2': 10.0,
+            'learning_rate': 0.05,
         }
-
+        
         model = lgb.train(
             params,
-            dtr,
-            valid_sets=[dva],
-            callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)]
+            train_data,
+            num_boost_round=100,
+            verbose_eval=False
         )
-
-        imp = pd.DataFrame({
-            'feature': cols,
+        
+        # Feature Importance 추출
+        importance = pd.DataFrame({
+            'feature': feature_cols,
             'importance': model.feature_importance(importance_type='gain')
         }).sort_values('importance', ascending=False)
-
-        self.feature_importance = imp
-        self.selected_features = imp.head(top_k)['feature'].tolist()
-
-        print("\n선택된 상위 피처(10):")
-        for _, row in imp.head(10).iterrows():
-            print(f"  {row['feature']}: {row['importance']:.2f}")
-
-        return self.selected_features
-
-    # --- 레짐별 학습 ---
-    def train_ensemble_regime(self, X, y, regime_col='regime', test_size=0.2):
-        """레짐별 독립 학습 - 시간 갭 추가"""
-        if regime_col not in X.columns:
-            return self.train_ensemble_temporal(X, y, test_size)
-
-        # 인덱스 정렬 및 길이 맞추기
-        X = X.reset_index(drop=True)
-        y = y.reset_index(drop=True)
         
-        min_len = min(len(X), len(y))
-        X = X.iloc[:min_len]
-        y = y.iloc[:min_len]
-
-        if X[regime_col].isna().any():
-                nan_count = X[regime_col].isna().sum()
-                X[regime_col] = X[regime_col].fillna(0)
-                print(f"\nℹ️  레짐 NaN {nan_count:,}건 → FLAT(0)으로 변환")
-            
-            # 레짐 분포 확인
-        print(f"\n레짐 분포:")
-        regime_counts = X[regime_col].value_counts().sort_index()
-        for rval in [1, -1, 0]:
-            rname = self._regime_to_name(rval)
-            count = int(regime_counts.get(rval, 0))
-            print(f"  {rname:5s}: {count:4d}건")
-
-        if not self.selected_features:
-            self.selected_features = [c for c in X.columns if c not in ['timestamp', 'regime', 'htf_regime']][:50]
-
-        all_metrics = {}
-
-        for rval in [1, -1, 0]:
-            rname = self._regime_to_name(rval)
-            print(f"\n{'='*60}")
-            print(f"레짐 {rname} ({rval}) 학습 시작")
-            print(f"{'='*60}")
-            
-            # 진행 상황 콜백 호출
-            if self._progress_callback:
-                self._progress_callback(rname)
-
-            mask = (X[regime_col] == rval).values
-            Xr = X[mask].copy()
-            yr = y[mask].copy()
-
-            if len(Xr) < 200:
-                print(f"  샘플 부족 ({len(Xr)}개) → 스킵")
-                self.bundles[rname] = None
-                continue
-
-            Xr = Xr.reset_index(drop=True)
-            yr = yr.reset_index(drop=True)
-
-            Xs = Xr[self.selected_features]
-            Xs = _safe_prep(Xs)
-
-            total = len(Xs)
-            
-            # ★ 시간 갭 추가
-            train_ratio = 0.60
-            gap_ratio = 0.10
-            val_ratio = 0.10
-            # test는 나머지 (0.20)
-            
-            train_end = int(total * train_ratio)
-            gap_end = int(total * (train_ratio + gap_ratio))
-            val_end = int(total * (train_ratio + gap_ratio + val_ratio))
-
-            if train_end < 50 or (val_end - gap_end) < 20 or (total - val_end) < 20:
-                print(f"  분할 후 샘플 부족 → 스킵")
-                self.bundles[rname] = None
-                continue
-
-            X_tr, y_tr = Xs.iloc[:train_end], yr.iloc[:train_end]
-            X_va, y_va = Xs.iloc[gap_end:val_end], yr.iloc[gap_end:val_end]
-            X_te, y_te = Xs.iloc[val_end:], yr.iloc[val_end:]
-
-            print(f"  데이터 분할: train={len(X_tr)}, GAP={gap_end-train_end}, val={len(X_va)}, test={len(X_te)}")
-
-            X_tr, y_tr = X_tr.reset_index(drop=True), y_tr.reset_index(drop=True)
-            X_va, y_va = X_va.reset_index(drop=True), y_va.reset_index(drop=True)
-            X_te, y_te = X_te.reset_index(drop=True), y_te.reset_index(drop=True)
-
-            n_tr = min(len(X_tr), len(y_tr))
-            n_va = min(len(X_va), len(y_va))
-            n_te = min(len(X_te), len(y_te))
-            X_tr, y_tr = X_tr.iloc[:n_tr], y_tr.iloc[:n_tr]
-            X_va, y_va = X_va.iloc[:n_va], y_va.iloc[:n_va]
-            X_te, y_te = X_te.iloc[:n_te], y_te.iloc[:n_te]
-
-            scaler = StandardScaler()
-            X_tr_s = scaler.fit_transform(X_tr)
-            X_va_s = scaler.transform(X_va)
-            X_te_s = scaler.transform(X_te)
-
-            pos, neg = int((y_tr == 1).sum()), int((y_tr == 0).sum())
-            params = {
-                'objective': 'binary',
-                'metric': 'binary_logloss',
-                'boosting_type': 'gbdt',
-                'learning_rate': 0.03,
-                'num_leaves': 31,
-                'max_depth': 7,
-                'min_data_in_leaf': 100,
-                'feature_fraction': 0.7,
-                'bagging_fraction': 0.7,
-                'bagging_freq': 1,
-                'lambda_l2': 10.0,
-                'verbose': -1
-            }
-            if pos > 0 and neg > 0:
-                params['scale_pos_weight'] = neg / max(1, pos)
-
-            n_models = int(getattr(self.config, 'ENSEMBLE_MODELS', 3))
-            n_models = max(1, min(5, n_models))
-            models = []
-
-            for i in range(n_models):
-                p = params.copy()
-                p['random_state'] = 42 + i
-                p['num_leaves'] = min(63, 31 + i * 8)
-                p['feature_fraction'] = max(0.5, 0.7 - i * 0.05)
-
-                start = int(i * len(X_tr_s) * 0.1)
-                dtr = lgb.Dataset(X_tr_s[start:], y_tr.iloc[start:])
-                dva = lgb.Dataset(X_va_s, y_va, reference=dtr)
-
-                model = lgb.train(
-                    p,
-                    dtr,
-                    valid_sets=[dva],
-                    callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)]
-                )
-                models.append(model)
-                print(f"  모델 {i+1}/{n_models} 학습 완료")
-
-            # 캘리브레이션
-            val_pred_raw = self._predict_proba_array_from_models(X_va_s, models)
-            method = getattr(self.config, 'CALIBRATION_METHOD', 'isotonic')
-            if method not in ('isotonic', 'platt'):
-                method = 'isotonic'
-
-            if method == 'isotonic':
-                calibrator = IsotonicRegression(out_of_bounds='clip')
-                calibrator.fit(val_pred_raw, y_va.values)
-                calib_method = 'isotonic'
-                print(f"  ✓ 캘리브레이션: IsotonicRegression")
-            else:
-                lr = LogisticRegression(max_iter=1000)
-                lr.fit(val_pred_raw.reshape(-1, 1), y_va.values)
-                calibrator = lr
-                calib_method = 'platt'
-                print(f"  ✓ 캘리브레이션: Platt")
-
-            # 번들 저장
-            self.bundles[rname] = {
-                'models': models,
-                'scaler': scaler,
-                'calibrator': calibrator,
-                'calib_method': calib_method,
-                'selected_features': self.selected_features,
-                'regime_value': rval
-            }
-
-            # 진단 저장
-            self._save_calibration_diagnostics_regime(
-                X_va_s, y_va, val_pred_raw, calibrator, calib_method, rname
-            )
-
-            # 성능 평가
-            tr_proba = self._predict_proba_from_bundle(X_tr, rname)
-            va_proba = self._predict_proba_from_bundle(X_va, rname)
-            te_proba = self._predict_proba_from_bundle(X_te, rname)
-
-            metrics = {
-                'train': self._evaluate_block(y_tr, tr_proba),
-                'validation': self._evaluate_block(y_va, va_proba),
-                'test': self._evaluate_block(y_te, te_proba),
-            }
-            all_metrics[rname] = metrics
-
-            print(f"\n레짐 {rname} 결과:")
-            for split, m in metrics.items():
-                print(f"  {split}: acc={m['accuracy']:.4f}, win={m['win_rate']:.4f}")
-
-        # Legacy 호환
-        if self.bundles['FLAT'] is not None:
-            self.models = self.bundles['FLAT']['models']
-            self.scaler = self.bundles['FLAT']['scaler']
-            self.calibrator = self.bundles['FLAT']['calibrator']
-            self.calib_method = self.bundles['FLAT']['calib_method']
-        elif self.bundles['UP'] is not None:
-            self.models = self.bundles['UP']['models']
-            self.scaler = self.bundles['UP']['scaler']
-            self.calibrator = self.bundles['UP']['calibrator']
-            self.calib_method = self.bundles['UP']['calib_method']
-        elif self.bundles['DOWN'] is not None:
-            self.models = self.bundles['DOWN']['models']
-            self.scaler = self.bundles['DOWN']['scaler']
-            self.calibrator = self.bundles['DOWN']['calibrator']
-            self.calib_method = self.bundles['DOWN']['calib_method']
-
-        return all_metrics
-
-    def train_ensemble_temporal(self, X, y, test_size=0.2):
-        """단일 모델 학습 (fallback)"""
-        self.models = []
-        X = X.reset_index(drop=True)
-        y = y.reset_index(drop=True)
-
-        if 'timestamp' in X.columns:
-            X = X.drop('timestamp', axis=1)
-        if 'regime' in X.columns:
-            X = X.drop('regime', axis=1)
-        if 'htf_regime' in X.columns:
-            X = X.drop('htf_regime', axis=1)
-
-        if not self.selected_features:
-            self.selected_features = list(X.columns)[:50]
-
-        Xs = _safe_prep(X[self.selected_features])
-
-        pos, neg = int((y == 1).sum()), int((y == 0).sum())
-        params = {
-            'objective': 'binary',
-            'metric': 'binary_logloss',
-            'boosting_type': 'gbdt',
-            'learning_rate': 0.03,
-            'num_leaves': 31,
-            'max_depth': 7,
-            'min_data_in_leaf': 200,
-            'feature_fraction': 0.7,
-            'bagging_fraction': 0.7,
-            'bagging_freq': 1,
-            'lambda_l2': 10.0,
-        }
-        if pos > 0 and neg > 0:
-            params['scale_pos_weight'] = neg / max(1, pos)
-
-        total = len(Xs)
-        val_size = int(total * test_size)
-        train_size = total - 2 * val_size
-
-        X_tr, y_tr = Xs.iloc[:train_size], y.iloc[:train_size]
-        X_va, y_va = Xs.iloc[train_size:train_size+val_size], y.iloc[train_size:train_size+val_size]
-        X_te, y_te = Xs.iloc[train_size+val_size:], y.iloc[train_size+val_size:]
-
-        print(f"\n데이터 분할: train={len(X_tr)}, val={len(X_va)}, test={len(X_te)}")
-
-        X_tr, y_tr = X_tr.reset_index(drop=True), y_tr.reset_index(drop=True)
-        X_va, y_va = X_va.reset_index(drop=True), y_va.reset_index(drop=True)
-        X_te, y_te = X_te.reset_index(drop=True), y_te.reset_index(drop=True)
-
-        n_tr = min(len(X_tr), len(y_tr))
-        n_va = min(len(X_va), len(y_va))
-        n_te = min(len(X_te), len(y_te))
-        X_tr, y_tr = X_tr.iloc[:n_tr], y_tr.iloc[:n_tr]
-        X_va, y_va = X_va.iloc[:n_va], y_va.iloc[:n_va]
-        X_te, y_te = X_te.iloc[:n_te], y_te.iloc[:n_te]
-
-        self.scaler = StandardScaler()
-        X_tr_s = self.scaler.fit_transform(X_tr)
-        X_va_s = self.scaler.transform(X_va)
-        X_te_s = self.scaler.transform(X_te)
-
-        n_models = int(getattr(self.config, 'ENSEMBLE_MODELS', 3))
+        # Top K 선택
+        selected = importance.head(top_k)['feature'].tolist()
+        
+        print(f"  ✓ Top {top_k} 피처 선택 완료")
+        print(f"    상위 5개: {selected[:5]}")
+        
+        self.feature_importance = importance
+        self.selected_features = selected
+        
+        return selected
+    
+    # ==========================================
+    # 앙상블 학습
+    # ==========================================
+    
+    def train_ensemble(
+        self,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        features: Optional[List[str]] = None,
+        n_models: Optional[int] = None
+    ) -> List:
+        """
+        앙상블 모델 학습
+        
+        Parameters:
+        -----------
+        X_train, y_train : 학습 데이터
+        X_val, y_val : 검증 데이터
+        features : 사용할 피처 (None이면 전체)
+        n_models : 앙상블 모델 개수 (None이면 Config 사용)
+        
+        Returns:
+        --------
+        List: 학습된 모델 리스트
+        """
+        if n_models is None:
+            n_models = self.config.ENSEMBLE_MODELS
+        
+        if features is None:
+            features = self.selected_features or list(X_train.columns)
+        
+        print(f"  앙상블 학습 시작: {n_models}개 모델, {len(features)}개 피처")
+        
+        models = []
+        
+        train_data = lgb.Dataset(
+            X_train[features].values,
+            label=y_train.values
+        )
+        
+        val_data = lgb.Dataset(
+            X_val[features].values,
+            label=y_val.values,
+            reference=train_data
+        )
+        
         for i in range(n_models):
-            p = params.copy()
-            p['random_state'] = 42 + i
-            p['num_leaves'] = min(63, 31 + i * 8)
-            p['feature_fraction'] = max(0.5, 0.7 - i * 0.05)
-
-            start = int(i * len(X_tr_s) * 0.1)
-            dtr = lgb.Dataset(X_tr_s[start:], y_tr.iloc[start:])
-            dva = lgb.Dataset(X_va_s, y_va, reference=dtr)
-
+            print(f"    [{i+1}/{n_models}] 학습 중...", end=' ')
+            
+            # 파라미터 (seed만 변경)
+            params = self.config.LGBM_PARAMS.copy()
+            params['random_state'] = 42 + i
+            params['verbose'] = -1
+            
+            # 학습
             model = lgb.train(
-                p,
-                dtr,
-                valid_sets=[dva],
-                callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)]
+                params,
+                train_data,
+                valid_sets=[val_data],
+                callbacks=[
+                    lgb.early_stopping(stopping_rounds=params.get('early_stopping_rounds', 10)),
+                    lgb.log_evaluation(period=0)
+                ]
             )
-            self.models.append(model)
-            print(f"  모델 {i+1}/{n_models} 학습 완료")
-
-        val_pred_raw = self._predict_proba_array(X_va_s)
-        method = getattr(self.config, 'CALIBRATION_METHOD', 'isotonic')
-        if method not in ('isotonic', 'platt'):
-            method = 'isotonic'
-
-        if method == 'isotonic':
-            self.calibrator = IsotonicRegression(out_of_bounds='clip')
-            self.calibrator.fit(val_pred_raw, y_va.values)
-            self.calib_method = 'isotonic'
-            print("✓ 캘리브레이션: IsotonicRegression")
-        else:
-            lr = LogisticRegression(max_iter=1000)
-            lr.fit(val_pred_raw.reshape(-1, 1), y_va.values)
-            self.calibrator = lr
-            self.calib_method = 'platt'
-            print("✓ 캘리브레이션: Platt")
-
-        self._save_calibration_diagnostics(X_va_s, y_va, val_pred_raw)
-
-        tr_proba = self.predict_proba_df(pd.DataFrame(X_tr, columns=X_tr.columns))
-        va_proba = self.predict_proba_df(pd.DataFrame(X_va, columns=X_va.columns))
-        te_proba = self.predict_proba_df(pd.DataFrame(X_te, columns=X_te.columns))
-
-        metrics = {
-            'train': self._evaluate_block(y_tr, tr_proba),
-            'validation': self._evaluate_block(y_va, va_proba),
-            'test': self._evaluate_block(y_te, te_proba),
-        }
-
-        return metrics
-
-    # --- Predict helpers ---
-    def _predict_proba_array_from_models(self, X_nd, models):
-        """특정 모델 리스트로 예측"""
-        preds = []
-        for m in models:
-            preds.append(m.predict(X_nd, num_iteration=m.best_iteration))
-        preds = np.vstack(preds)
-        n = preds.shape[0]
-        if n == 1:
-            w = np.array([1.0])
-        else:
-            w = np.linspace(1.0, 1.5, n)
-            w = w / w.sum()
-        return np.average(preds, axis=0, weights=w)
-
-    def _predict_proba_array(self, X_nd):
-        """self.models로 예측"""
-        return self._predict_proba_array_from_models(X_nd, self.models)
-
-    def _apply_calibration_with(self, p_raw, calibrator, method):
-        """특정 캘리브레이터 적용"""
-        if calibrator is None:
-            return p_raw
-        if method == 'isotonic':
-            return calibrator.predict(p_raw)
-        return calibrator.predict_proba(p_raw.reshape(-1, 1))[:, 1]
-
-    def _apply_calibration(self, p_raw):
-        """self.calibrator 적용"""
-        return self._apply_calibration_with(p_raw, self.calibrator, self.calib_method)
-
-    def _predict_proba_from_bundle(self, X_df, regime_name):
-        """특정 레짐 번들로 예측"""
-        bundle = self.bundles.get(regime_name)
-        if bundle is None:
-            return np.full(len(X_df), 0.5)
-
-        X_tmp = X_df[bundle['selected_features']].copy()
-        X_tmp = _safe_prep(X_tmp)
-        X_s = bundle['scaler'].transform(X_tmp)
-
-        p_raw = self._predict_proba_array_from_models(X_s, bundle['models'])
-        p = self._apply_calibration_with(p_raw, bundle['calibrator'], bundle['calib_method'])
-        return np.clip(p, 0.02, 0.98)
-
-    def predict_proba(self, X, regime=None):
-        """레짐별 예측"""
-        if isinstance(X, pd.DataFrame):
-            return self.predict_proba_df(X, regime)
-
-        if regime is not None:
-            rname = self._regime_to_name(regime)
-            bundle = self.bundles.get(rname)
-            if bundle is not None:
-                X_s = bundle['scaler'].transform(X)
-                p_raw = self._predict_proba_array_from_models(X_s, bundle['models'])
-                p = self._apply_calibration_with(p_raw, bundle['calibrator'], bundle['calib_method'])
-                return np.clip(p, 0.02, 0.98)
-
-        p_raw = self._predict_proba_array(X)
-        p = self._apply_calibration(p_raw)
-        return np.clip(p, 0.02, 0.98)
-
-    def predict_proba_df(self, X_df, regime=None):
-        """DataFrame으로 예측"""
-        X_tmp = X_df.copy()
-        if 'timestamp' in X_tmp.columns:
-            X_tmp = X_tmp.drop('timestamp', axis=1)
-
-        if regime is None and 'regime' in X_tmp.columns:
-            regime = int(X_tmp['regime'].iloc[-1])
-
-        if 'regime' in X_tmp.columns:
-            X_tmp = X_tmp.drop('regime', axis=1)
-        if 'htf_regime' in X_tmp.columns:
-            X_tmp = X_tmp.drop('htf_regime', axis=1)
-
-        if regime is not None:
-            rname = self._regime_to_name(regime)
-            bundle = self.bundles.get(rname)
-            if bundle is not None:
-                X_tmp = X_tmp[bundle['selected_features']]
-                X_tmp = _safe_prep(X_tmp)
-                X_s = bundle['scaler'].transform(X_tmp)
-                p_raw = self._predict_proba_array_from_models(X_s, bundle['models'])
-                p = self._apply_calibration_with(p_raw, bundle['calibrator'], bundle['calib_method'])
-                return np.clip(p, 0.02, 0.98)
-
-        if not self.selected_features:
-            self.selected_features = list(X_tmp.columns)[:50]
-        X_tmp = X_tmp[self.selected_features]
-        X_tmp = _safe_prep(X_tmp)
-        X_s = self.scaler.transform(X_tmp)
-        p_raw = self._predict_proba_array(X_s)
-        p = self._apply_calibration(p_raw)
-        return np.clip(p, 0.02, 0.98)
-
-    def predict(self, X, threshold=0.5, regime=None):
-        p = self.predict_proba(X, regime)
-        return (p > threshold).astype(int)
-
-    # --- Evaluation ---
-    def _evaluate_block(self, y_true, proba, th=0.5):
-        y_pred = (proba > th).astype(int)
+            
+            # 검증 성능
+            y_pred = model.predict(X_val[features].values)
+            y_pred_binary = (y_pred > 0.5).astype(int)
+            acc = accuracy_score(y_val, y_pred_binary)
+            auc = roc_auc_score(y_val, y_pred)
+            
+            print(f"✓ (Acc: {acc:.4f}, AUC: {auc:.4f})")
+            
+            models.append(model)
+        
+        return models
+    
+    # ==========================================
+    # 캘리브레이션
+    # ==========================================
+    
+    def calibrate_models(
+        self,
+        models: List,
+        X_val: pd.DataFrame,
+        y_val: pd.Series,
+        features: List[str],
+        method: Optional[str] = None
+    ) -> Dict:
+        """
+        모델 캘리브레이션
+        
+        Parameters:
+        -----------
+        models : List
+            학습된 모델 리스트
+        X_val, y_val : 검증 데이터
+        features : 피처 리스트
+        method : str
+            'isotonic' or 'platt' (None이면 Config 사용)
+        
+        Returns:
+        --------
+        Dict: {'models': List, 'calibrators': List}
+        """
+        if method is None:
+            method = self.config.CALIBRATION_METHOD
+        
+        print(f"  캘리브레이션 ({method}) 시작...")
+        
+        calibrators = []
+        
+        for i, model in enumerate(models):
+            print(f"    [{i+1}/{len(models)}] 캘리브레이션 중...", end=' ')
+            
+            # 예측 확률
+            y_pred = model.predict(X_val[features].values).reshape(-1, 1)
+            
+            # Dummy estimator (이미 확률이므로)
+            class DummyEstimator:
+                def predict(self, X):
+                    return X.ravel()
+            
+            dummy = DummyEstimator()
+            
+            # CalibratedClassifierCV
+            calibrator = CalibratedClassifierCV(
+                dummy,
+                method=method,
+                cv='prefit'
+            )
+            
+            calibrator.fit(y_pred, y_val.values)
+            
+            # 캘리브레이션 후 성능
+            y_cal = calibrator.predict_proba(y_pred)[:, 1]
+            y_cal_binary = (y_cal > 0.5).astype(int)
+            acc = accuracy_score(y_val, y_cal_binary)
+            
+            print(f"✓ (Acc: {acc:.4f})")
+            
+            calibrators.append(calibrator)
+        
         return {
-            'accuracy': accuracy_score(y_true, y_pred),
-            'precision': precision_score(y_true, y_pred, zero_division=0),
-            'recall': recall_score(y_true, y_pred, zero_division=0),
-            'f1': f1_score(y_true, y_pred, zero_division=0),
-            'win_rate': float(np.mean(y_pred == y_true))
+            'models': models,
+            'calibrators': calibrators
         }
-
-    def _save_calibration_diagnostics(self, X_val_s, y_val, val_pred_raw):
-        """단일 모델 진단"""
-        try:
-            val_pred_cal = self._apply_calibration(val_pred_raw)
-            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            outdir = os.path.join(self.config.MODEL_DIR, "diag")
-            _ensure_dir(outdir)
-
-            plt.figure(figsize=(9, 4))
-            plt.subplot(1, 2, 1)
-            plt.hist(val_pred_raw, bins=50)
-            plt.title("P(UP) raw (val)")
-            plt.xlabel("p_up"); plt.ylabel("freq")
-
-            plt.subplot(1, 2, 2)
-            plt.hist(val_pred_cal, bins=50)
-            plt.title(f"P(UP) calibrated ({self.calib_method})")
-            plt.xlabel("p_up"); plt.ylabel("freq")
-
-            hist_path = os.path.join(outdir, f"proba_hist_{ts}.png")
-            plt.tight_layout(); plt.savefig(hist_path); plt.close()
-
-            frac_raw, mean_raw = calibration_curve(y_val.values, val_pred_raw, n_bins=20, strategy="uniform")
-            frac_cal, mean_cal = calibration_curve(y_val.values, val_pred_cal, n_bins=20, strategy="uniform")
-
-            plt.figure(figsize=(5, 5))
-            plt.plot([0, 1], [0, 1], linestyle="--", label="ideal")
-            plt.plot(mean_raw, frac_raw, marker="o", label="raw")
-            plt.plot(mean_cal, frac_cal, marker="o", label=f"calibrated ({self.calib_method})")
-            plt.xlabel("predicted probability"); plt.ylabel("observed frequency")
-            plt.title("Reliability (validation)"); plt.legend()
-            rel_path = os.path.join(outdir, f"reliability_{ts}.png")
-            plt.tight_layout(); plt.savefig(rel_path); plt.close()
-
-            b_raw = brier_score_loss(y_val.values, val_pred_raw)
-            b_cal = brier_score_loss(y_val.values, val_pred_cal)
-            print(f"진단 저장: {hist_path}, {rel_path}")
-            print(f"Brier raw={b_raw:.4f} → calibrated={b_cal:.4f}")
-        except Exception as e:
-            print(f"(진단 저장 생략) {e}")
-
-    def _save_calibration_diagnostics_regime(self, X_val_s, y_val, val_pred_raw, calibrator, method, regime_name):
-        """레짐별 진단"""
-        try:
-            val_pred_cal = self._apply_calibration_with(val_pred_raw, calibrator, method)
-            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            outdir = os.path.join(self.config.MODEL_DIR, "diag", regime_name)
-            _ensure_dir(outdir)
-
-            plt.figure(figsize=(9, 4))
-            plt.subplot(1, 2, 1)
-            plt.hist(val_pred_raw, bins=50)
-            plt.title(f"P(UP) raw - {regime_name}")
-            plt.xlabel("p_up"); plt.ylabel("freq")
-
-            plt.subplot(1, 2, 2)
-            plt.hist(val_pred_cal, bins=50)
-            plt.title(f"P(UP) calibrated - {regime_name}")
-            plt.xlabel("p_up"); plt.ylabel("freq")
-
-            hist_path = os.path.join(outdir, f"proba_hist_{ts}.png")
-            plt.tight_layout(); plt.savefig(hist_path); plt.close()
-
-            frac_raw, mean_raw = calibration_curve(y_val.values, val_pred_raw, n_bins=20, strategy="uniform")
-            frac_cal, mean_cal = calibration_curve(y_val.values, val_pred_cal, n_bins=20, strategy="uniform")
-
-            plt.figure(figsize=(5, 5))
-            plt.plot([0, 1], [0, 1], linestyle="--", label="ideal")
-            plt.plot(mean_raw, frac_raw, marker="o", label="raw")
-            plt.plot(mean_cal, frac_cal, marker="o", label=f"calibrated")
-            plt.xlabel("predicted probability"); plt.ylabel("observed frequency")
-            plt.title(f"Reliability - {regime_name}"); plt.legend()
-            rel_path = os.path.join(outdir, f"reliability_{ts}.png")
-            plt.tight_layout(); plt.savefig(rel_path); plt.close()
-
-            b_raw = brier_score_loss(y_val.values, val_pred_raw)
-            b_cal = brier_score_loss(y_val.values, val_pred_cal)
-            print(f"  진단 저장: {hist_path}, {rel_path}")
-            print(f"  Brier raw={b_raw:.4f} → calibrated={b_cal:.4f}")
-        except Exception as e:
-            print(f"  (진단 저장 생략) {e}")
-
-    # --- Save / Load ---
-    def save_model(self, filepath=None):
-        """레짐별 번들 저장"""
-        if filepath is None:
-            filepath = os.path.join(self.config.MODEL_DIR, 'current_model.pkl')
-
-        # 레짐별 번들 개별 저장
-        for rname, bundle in self.bundles.items():
-            if bundle is not None:
-                bpath = os.path.join(self.config.MODEL_DIR, f"bundle_{rname}.pkl")
-                joblib.dump(bundle, bpath)
-                print(f"레짐 {rname} 번들 저장: {bpath}")
-
-        # Legacy 호환
-        data = {
-            'models': self.models,
-            'scaler': self.scaler,
+    
+    # ==========================================
+    # 레짐별 모델 학습
+    # ==========================================
+    
+    def train_regime_models(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        regime_col: str = 'regime'
+    ) -> Dict:
+        """
+        레짐별 모델 분리 학습
+        
+        Parameters:
+        -----------
+        X : DataFrame
+            전체 피처
+        y : Series
+            전체 타겟
+        regime_col : str
+            레짐 컬럼명
+        
+        Returns:
+        --------
+        Dict: {
+            'overall': {...},  # 전체 모델
+            'regime_1': {...},  # UP 모델
+            'regime_-1': {...}, # DOWN 모델
+            'regime_0': {...}   # FLAT 모델
+        }
+        """
+        print("\n" + "="*60)
+        print("레짐별 모델 학습")
+        print("="*60)
+        
+        if regime_col not in X.columns:
+            print(f"⚠️ {regime_col} 컬럼 없음 → 전체 모델만 학습")
+            return self._train_single_model(X, y, name='overall')
+        
+        results = {}
+        
+        # 1. 전체 모델 (Overall)
+        print("\n[1] 전체 모델 학습")
+        results['overall'] = self._train_single_model(X, y, name='overall')
+        
+        # 2. 레짐별 모델
+        regimes = X[regime_col].unique()
+        regime_names = {1: 'UP', -1: 'DOWN', 0: 'FLAT'}
+        
+        for regime_val in sorted(regimes):
+            if pd.isna(regime_val):
+                continue
+            
+            regime_name = regime_names.get(regime_val, f'REGIME-{regime_val}')
+            print(f"\n[{int(regime_val)+2}] {regime_name} 레짐 모델 학습")
+            
+            # 해당 레짐 데이터만 필터링
+            mask = X[regime_col] == regime_val
+            X_regime = X[mask].copy()
+            y_regime = y[mask].copy()
+            
+            if len(X_regime) < 100:
+                print(f"  ⚠️ 데이터 부족 ({len(X_regime)}개) → 스킵")
+                continue
+            
+            results[f'regime_{int(regime_val)}'] = self._train_single_model(
+                X_regime, y_regime, name=regime_name
+            )
+        
+        self.models = results
+        
+        return results
+    
+    def _train_single_model(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        name: str = 'model'
+    ) -> Dict:
+        """
+        단일 모델 학습 (내부 헬퍼)
+        
+        Returns:
+        --------
+        Dict: {
+            'models': List,
+            'calibrators': List,
+            'features': List[str],
+            'metrics': Dict
+        }
+        """
+        print(f"  데이터: {len(X):,}개 (클래스 분포: {y.value_counts().to_dict()})")
+        
+        # 데이터 분할
+        train_ratio = self.config.TRAIN_RATIO
+        val_ratio = self.config.VAL_RATIO
+        
+        n = len(X)
+        n_train = int(n * train_ratio)
+        n_val = int(n * val_ratio)
+        
+        X_train = X.iloc[:n_train].copy()
+        y_train = y.iloc[:n_train].copy()
+        
+        X_val = X.iloc[n_train:n_train + n_val].copy()
+        y_val = y.iloc[n_train:n_train + n_val].copy()
+        
+        X_test = X.iloc[n_train + n_val:].copy()
+        y_test = y.iloc[n_train + n_val:].copy()
+        
+        print(f"  분할: Train={len(X_train):,} | Val={len(X_val):,} | Test={len(X_test):,}")
+        
+        # 피처 선택
+        if self.selected_features is None:
+            features = self.select_features(X_train, y_train)
+        else:
+            features = self.selected_features
+        
+        # 앙상블 학습
+        models = self.train_ensemble(X_train, y_train, X_val, y_val, features)
+        
+        # 캘리브레이션
+        calibrated = self.calibrate_models(models, X_val, y_val, features)
+        
+        # 테스트 성능 평가
+        print(f"  테스트 성능 평가...")
+        metrics = self._evaluate_ensemble(
+            calibrated['models'],
+            calibrated['calibrators'],
+            X_test,
+            y_test,
+            features
+        )
+        
+        return {
+            'models': calibrated['models'],
+            'calibrators': calibrated['calibrators'],
+            'features': features,
+            'metrics': metrics,
+            'name': name
+        }
+    
+    def _evaluate_ensemble(
+        self,
+        models: List,
+        calibrators: List,
+        X_test: pd.DataFrame,
+        y_test: pd.Series,
+        features: List[str]
+    ) -> Dict:
+        """앙상블 성능 평가"""
+        # 앙상블 예측 (평균)
+        preds = []
+        for model, calibrator in zip(models, calibrators):
+            y_pred = model.predict(X_test[features].values).reshape(-1, 1)
+            y_cal = calibrator.predict_proba(y_pred)[:, 1]
+            preds.append(y_cal)
+        
+        y_ensemble = np.mean(preds, axis=0)
+        y_ensemble_binary = (y_ensemble > 0.5).astype(int)
+        
+        # 메트릭 계산
+        metrics = {
+            'accuracy': accuracy_score(y_test, y_ensemble_binary),
+            'precision': precision_score(y_test, y_ensemble_binary, zero_division=0),
+            'recall': recall_score(y_test, y_ensemble_binary, zero_division=0),
+            'f1': f1_score(y_test, y_ensemble_binary, zero_division=0),
+            'auc': roc_auc_score(y_test, y_ensemble),
+            'log_loss': log_loss(y_test, y_ensemble),
+            'n_test': len(y_test)
+        }
+        
+        print(f"    ✓ Acc: {metrics['accuracy']:.4f} | "
+              f"AUC: {metrics['auc']:.4f} | "
+              f"F1: {metrics['f1']:.4f}")
+        
+        return metrics
+    
+    # ==========================================
+    # 모델 저장/로드
+    # ==========================================
+    
+    def save_models(self, suffix: str = ''):
+        """
+        모델 저장
+        
+        Parameters:
+        -----------
+        suffix : str
+            파일명 접미사 (예: '_retrain')
+        """
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+        
+        for model_key, model_data in self.models.items():
+            # 파일명
+            filename = f"model_{model_key}_{timestamp}{suffix}.pkl"
+            filepath = self.config.MODEL_DIR / filename
+            
+            # 저장 데이터
+            save_data = {
+                'models': model_data['models'],
+                'calibrators': model_data['calibrators'],
+                'features': model_data['features'],
+                'metrics': model_data['metrics'],
+                'model_version': self.model_version,
+                'feature_version': self.feature_version,
+                'created_at': timestamp,
+                'config': {
+                    'LGBM_PARAMS': self.config.LGBM_PARAMS,
+                    'ENSEMBLE_MODELS': self.config.ENSEMBLE_MODELS,
+                    'TOP_K_FEATURES': self.config.TOP_K_FEATURES,
+                }
+            }
+            
+            # 저장
+            with open(filepath, 'wb') as f:
+                pickle.dump(save_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            
+            print(f"  ✓ {model_key}: {filepath.name}")
+        
+        # 메타데이터 저장
+        metadata_path = self.config.MODEL_DIR / f'model_metadata_{timestamp}.json'
+        metadata = {
+            'timestamp': timestamp,
+            'model_version': self.model_version,
+            'feature_version': self.feature_version,
+            'models': {k: v['metrics'] for k, v in self.models.items()},
             'selected_features': self.selected_features,
-            'feature_importance': self.feature_importance,
-            'calibration_method': self.calib_method,
-            'timestamp': datetime.now(timezone.utc).isoformat()
         }
-        if self.calibrator is not None:
-            data['calibrator'] = self.calibrator
-        joblib.dump(data, filepath)
-
-        if self.feature_importance is not None:
-            _ensure_dir(self.config.FEATURE_LOG_DIR)
-            fp = os.path.join(self.config.FEATURE_LOG_DIR,
-                              f'feature_importance_{datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")}.csv')
-            self.feature_importance.to_csv(fp, index=False)
-
-        sel = os.path.join(self.config.FEATURE_LOG_DIR, 'selected_features.json')
-        with open(sel, 'w') as f:
-            json.dump({
-                'features': self.selected_features,
-                'count': len(self.selected_features) if self.selected_features else 0,
-                'timestamp': datetime.now(timezone.utc).isoformat()
-            }, f, indent=2)
-
-    def load_model(self, filepath=None):
-        """레짐별 번들 로드"""
-        for rname in ['UP', 'DOWN', 'FLAT']:
-            bpath = os.path.join(self.config.MODEL_DIR, f"bundle_{rname}.pkl")
-            if os.path.exists(bpath):
-                self.bundles[rname] = joblib.load(bpath)
-                print(f"레짐 {rname} 번들 로드: {bpath}")
-            else:
-                self.bundles[rname] = None
-
-        if filepath is None:
-            filepath = os.path.join(self.config.MODEL_DIR, 'current_model.pkl')
-        if not os.path.exists(filepath):
-            if any(b is not None for b in self.bundles.values()):
-                for rname in ['FLAT', 'UP', 'DOWN']:
-                    if self.bundles[rname] is not None:
-                        self.models = self.bundles[rname]['models']
-                        self.scaler = self.bundles[rname]['scaler']
-                        self.calibrator = self.bundles[rname]['calibrator']
-                        self.calib_method = self.bundles[rname]['calib_method']
-                        self.selected_features = self.bundles[rname]['selected_features']
-                        break
-                return True
+        
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        print(f"\n✓ 모델 저장 완료: {timestamp}")
+    
+    def load_models(self, timestamp: Optional[str] = None):
+        """
+        모델 로드
+        
+        Parameters:
+        -----------
+        timestamp : str
+            모델 타임스탬프 (None이면 최신)
+        """
+        if timestamp is None:
+            # 최신 모델 찾기
+            model_files = list(self.config.MODEL_DIR.glob('model_overall_*.pkl'))
+            if not model_files:
+                print("⚠️ 저장된 모델 없음")
+                return False
+            
+            latest = max(model_files, key=lambda x: x.stem)
+            timestamp = latest.stem.split('_')[2]
+        
+        print(f"모델 로드 중: {timestamp}")
+        
+        # 모델 파일 찾기
+        pattern = f"model_*_{timestamp}*.pkl"
+        model_files = list(self.config.MODEL_DIR.glob(pattern))
+        
+        if not model_files:
+            print(f"⚠️ 모델 파일 없음: {pattern}")
             return False
-
-        data = joblib.load(filepath)
-        self.models = data['models']
-        self.scaler = data['scaler']
-        self.selected_features = data['selected_features']
-        self.feature_importance = data.get('feature_importance')
-        self.calib_method = data.get('calibration_method', 'isotonic')
-        self.calibrator = data.get('calibrator', None)
+        
+        self.models = {}
+        
+        for filepath in model_files:
+            # 모델 키 추출
+            parts = filepath.stem.split('_')
+            if len(parts) >= 3:
+                model_key = '_'.join(parts[1:-1])  # model_overall_timestamp → overall
+            else:
+                model_key = 'overall'
+            
+            # 로드
+            with open(filepath, 'rb') as f:
+                model_data = pickle.load(f)
+            
+            self.models[model_key] = model_data
+            
+            metrics = model_data.get('metrics', {})
+            print(f"  ✓ {model_key}: Acc={metrics.get('accuracy', 0):.4f}")
+        
+        # 메타데이터 로드
+        metadata_path = self.config.MODEL_DIR / f'model_metadata_{timestamp}.json'
+        if metadata_path.exists():
+            with open(metadata_path, 'r') as f:
+                self.metadata = json.load(f)
+            
+            self.model_version = self.metadata.get('model_version', 'unknown')
+            self.feature_version = self.metadata.get('feature_version', 'unknown')
+            self.selected_features = self.metadata.get('selected_features')
+        
+        print(f"✓ 모델 로드 완료: {len(self.models)}개")
         return True
+    
+    # ==========================================
+    # 예측
+    # ==========================================
+    
+    def predict(
+        self,
+        X: pd.DataFrame,
+        regime: Optional[int] = None,
+        use_regime_model: bool = True
+    ) -> np.ndarray:
+        """
+        예측
+        
+        Parameters:
+        -----------
+        X : DataFrame
+            피처
+        regime : int
+            레짐 값 (1, -1, 0)
+        use_regime_model : bool
+            레짐별 모델 사용 여부
+        
+        Returns:
+        --------
+        np.ndarray: 예측 확률
+        """
+        # 모델 선택
+        if use_regime_model and regime is not None:
+            model_key = f'regime_{int(regime)}'
+            if model_key in self.models:
+                model_data = self.models[model_key]
+            else:
+                # 레짐 모델 없으면 전체 모델 사용
+                model_data = self.models.get('overall')
+        else:
+            model_data = self.models.get('overall')
+        
+        if model_data is None:
+            raise ValueError("모델이 로드되지 않았습니다")
+        
+        models = model_data['models']
+        calibrators = model_data['calibrators']
+        features = model_data['features']
+        
+        # 앙상블 예측
+        preds = []
+        for model, calibrator in zip(models, calibrators):
+            y_pred = model.predict(X[features].values).reshape(-1, 1)
+            y_cal = calibrator.predict_proba(y_pred)[:, 1]
+            preds.append(y_cal)
+        
+        return np.mean(preds, axis=0)
+    
 
-
-# ===============================
-# Model Optimizer
-# ===============================
 class ModelOptimizer:
+    """
+    호환용 얇은 래퍼.
+    - main_pipe.py가 기대하는 인터페이스(initial_training / retrain_model / analyze_failures)를 제공
+    - 내부적으로 현재 ModelTrainer + FeatureEngineer를 사용
+    """
     def __init__(self, config):
         self.config = config
         self.trainer = ModelTrainer(config)
-        self.progress_file = os.path.join(config.BASE_DIR, '.retrain_progress.json')
-
-    def update_progress(self, step_num, total_steps, current_step, regime=''):
-        """재학습 진행 상황 업데이트"""
-        try:
-            progress = {
-                'status': 'training',
-                'step_num': step_num,
-                'total_steps': total_steps,
-                'current_step': current_step,
-                'regime': regime,
-                'timestamp': datetime.now(timezone.utc).isoformat()
-            }
-            with open(self.progress_file, 'w', encoding='utf-8') as f:
-                json.dump(progress, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
 
     def initial_training(self, df):
-        print("="*60)
-        print("초기 학습 시작 (레짐별 스위칭 모델)")
-        print("="*60)
-
-        total_steps = 5  # 전체 단계 수
-        
-        # Step 1: 데이터 준비
-        self.update_progress(1, total_steps, "데이터 준비 중")
-        
+        """초기 학습: 피처 생성 → 레짐별 피처선택 → 레짐별 학습(+캘리브레이션) → 저장"""
+        # 1) 피처/타겟
+        fe = FeatureEngineer()
+        df = df.copy()
         if 'timestamp' in df.columns:
             df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
-            print(f"기간: {df['timestamp'].min()} ~ {df['timestamp'].max()}")
 
-        fe = FeatureEngineer()
         X = fe.create_feature_pool(df, lookback_window=200)
         y = fe.create_target(df, window=self.config.PREDICTION_WINDOW)
 
         valid = y.notna() & (y.index >= 200)
         X, y = X[valid], y[valid]
-        print(f"유효 샘플: {len(X)}")
+        if len(X) < 500:
+            print("⚠️ 학습 표본이 적습니다. (500 미만)")
 
-        # Step 2: 미래 누출 점검
-        self.update_progress(2, total_steps, "미래 누출 점검 중")
-        
-        print("\n미래 누출 점검...")
-        if not fe.validate_no_future_leak(X, y):
-            print("⚠️ 누출 의심 존재")
-        else:
-            print("✓ 누출 없음")
-
-        # Step 3: 피처 선택
-        self.update_progress(3, total_steps, "레짐별 피처 선택 중")
-        
-        print("\n레짐별 피처 선택...")
+        # 2) 레짐별 피처 선택
         topk = int(getattr(self.config, 'TOP_K_FEATURES', 30))
         self.trainer.feature_selection_regime(X, y, regime_col='regime', top_k=topk)
 
-        # Step 4: 학습 + 캘리브레이션
-        self.update_progress(4, total_steps, "레짐별 모델 학습 중")
-        
-        print("\n레짐별 학습 + 캘리브레이션...")
-        
-        # 학습 중 진행 상황 업데이트를 위해 trainer에 progress callback 전달
-        self.trainer._progress_callback = lambda regime: self.update_progress(
-            4, total_steps, f"레짐별 모델 학습 중", regime
-        )
-        
+        # 3) 레짐별 학습
         metrics = self.trainer.train_ensemble_regime(X, y, regime_col='regime', test_size=0.2)
 
-        # Step 5: 저장
-        self.update_progress(5, total_steps, "모델 저장 중")
-        
-        print("\n전체 결과:")
-        for regime_name, regime_metrics in metrics.items():
-            print(f"\n[{regime_name}]")
-            for split, m in regime_metrics.items():
-                print(f"  {split}: acc={m['accuracy']:.4f}, prec={m['precision']:.4f}, "
-                      f"rec={m['recall']:.4f}, f1={m['f1']:.4f}, win={m['win_rate']:.4f}")
-
+        # 4) 저장
         self.trainer.save_model()
-        print("\n모델 저장 완료")
-
-        _ensure_dir(self.config.MODEL_DIR)
-        all_rows = []
-        for regime_name, regime_metrics in metrics.items():
-            for split, m in regime_metrics.items():
-                row = {'regime': regime_name, 'split': split}
-                row.update(m)
-                all_rows.append(row)
-        
-        results_df = pd.DataFrame(all_rows)
-        results_df.to_csv(
-            os.path.join(self.config.MODEL_DIR, 
-                        f'training_results_{datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")}.csv'),
-            index=False
-        )
-        
-        # 완료 플래그 생성
-        flag_path = os.path.join(self.config.BASE_DIR, '.retrain_complete')
-        with open(flag_path, 'w', encoding='utf-8') as f:
-            f.write(datetime.now(timezone.utc).isoformat())
-        
         return metrics
 
     def retrain_model(self, new_df):
-        """재학습 - 랜덤 시드 동적 생성"""
-        print("\n" + "="*60)
-        print("재학습 시작 (홀드아웃 테스트셋 비교)")
-        print("="*60)
-
-        try:
-            print("\n최신 데이터 수집 중...")
-            from real_trade import BinanceAPIClient
-            from data_merge import DataMerger
-            
-            api = BinanceAPIClient()
-            merger = DataMerger(self.config)
-            
-            # ✅ 기존 가격 데이터의 마지막 시간 확인
-            existing_price = merger.load_price_data()
-            
-            if not existing_price.empty and 'timestamp' in existing_price.columns:
-                last_time = pd.to_datetime(existing_price['timestamp']).max()
-                print(f"  기존 데이터 마지막 시간: {last_time}")
-                
-                # 마지막 시간부터 현재까지의 분 수 계산
-                now = datetime.now(timezone.utc)
-                time_diff = now - last_time.replace(tzinfo=timezone.utc)
-                minutes_gap = int(time_diff.total_seconds() / 60)
-                
-                print(f"  시간 차이: {minutes_gap}분")
-                
-                if minutes_gap > 0:
-                    # API는 최대 1000개까지만 가져올 수 있으므로
-                    fetch_limit = min(minutes_gap + 10, 1000)  # 여유분 10개 추가
-                    
-                    print(f"  수집할 캔들 수: {fetch_limit}개")
-                    
-                    # 최신 데이터 수집
-                    recent_candles = api.get_klines(
-                        symbol="BTCUSDT", 
-                        interval="1m", 
-                        limit=fetch_limit
-                    )
-                    
-                    if not recent_candles.empty:
-                        # ✅ 중복 제거: 기존 마지막 시간 이후 데이터만
-                        recent_candles['timestamp'] = pd.to_datetime(recent_candles['timestamp'], utc=True)
-                        new_candles = recent_candles[recent_candles['timestamp'] > last_time]
-                        
-                        if not new_candles.empty:
-                            merger.add_new_price_data(new_candles)
-                            latest_time = new_candles['timestamp'].max()
-                            print(f"  ✓ 신규 데이터 {len(new_candles)}건 추가")
-                            print(f"  ✓ 최신 시간: {latest_time}")
-                        else:
-                            print(f"  → 이미 최신 상태 (신규 데이터 없음)")
-                    else:
-                        print("  ⚠️ API에서 데이터를 가져올 수 없음")
-                else:
-                    print(f"  → 이미 최신 상태")
-            else:
-                # 기존 데이터 없음 - 처음 1000개 수집
-                print(f"  기존 데이터 없음 - 초기 수집")
-                recent_candles = api.get_klines(
-                    symbol="BTCUSDT", 
-                    interval="1m", 
-                    limit=1000
-                )
-                if not recent_candles.empty:
-                    merger.add_new_price_data(recent_candles)
-                    print(f"  ✓ 초기 데이터 {len(recent_candles)}건 수집")
-            
-            # ✅ 데이터 재병합
-            print("\n데이터 재병합 중...")
-            new_df = merger.merge_all_data()
-            
-            if new_df is None or new_df.empty:
-                print("❌ 재병합 실패 - 기존 데이터 사용")
-            else:
-                print(f"✓ 재병합 완료: {len(new_df):,}건")
-                
-        except Exception as e:
-            print(f"⚠️ 최신 데이터 수집 실패: {e}")
-            print("  → 기존 병합 데이터로 계속 진행")
-            import traceback
-            traceback.print_exc()
-
-        
-        # ✅ 1. 타임스탬프 기반 시드 생성
-        seed = int(time.time()) % 100000
-        np.random.seed(seed)
-        print(f"랜덤 시드: {seed}")
-        
-        total_steps = 6
-        
-        # Step 1: 데이터 준비
-        self.update_progress(1, total_steps, "데이터 준비 중")
-        
-        if 'timestamp' in new_df.columns:
-            new_df['timestamp'] = pd.to_datetime(new_df['timestamp'], utc=True)
-            print(f"기간: {new_df['timestamp'].min()} ~ {new_df['timestamp'].max()}")
-
-        fe = FeatureEngineer()
-        X = fe.create_feature_pool(new_df, lookback_window=200)
-        y = fe.create_target(new_df, window=self.config.PREDICTION_WINDOW)
-
-        valid = y.notna() & (y.index >= 200)
-        X, y = X[valid], y[valid]
-        print(f"유효 샘플: {len(X):,}건")
-        
-        # ✅ 2. 신규 데이터 검증
-        info_file = os.path.join(self.config.MODEL_DIR, 'last_training_info.json')
-        if os.path.exists(info_file):
-            with open(info_file, 'r', encoding='utf-8') as f:
-                last_info = json.load(f)
-                last_count = last_info.get('data_count', 0)
-                print(f"  - 이전 데이터: {last_count:,}건")
-                print(f"  - 신규 증가: {len(X) - last_count:,}건")
-                
-                if len(X) <= last_count + 10:
-                    print("❌ 신규 데이터 부족 (<10건) - 재학습 의미 없음")
-                    return None
-        
-        # 학습/테스트 분리
-        split_point = int(len(X) * 0.85)
-        
-        X_train_full = X.iloc[:split_point].reset_index(drop=True)
-        y_train_full = y.iloc[:split_point].reset_index(drop=True)
-        
-        X_test = X.iloc[split_point:].reset_index(drop=True)
-        y_test = y.iloc[split_point:].reset_index(drop=True)
-        
-        print(f"  - 학습: {len(X_train_full):,}건 (85%)")
-        print(f"  - 테스트: {len(X_test):,}건 (15%)")
-        
-        if len(X_test) < 100:
-            print("❌ 테스트셋 부족 - 재학습 중단")
-            return None
-
-        # Step 2: 기존 모델 로드
-        self.update_progress(2, total_steps, "기존 모델 로드 중")
-        
-        old = ModelTrainer(self.config)
-        has_old_model = old.load_model()
-        
-        if not has_old_model:
-            print("⚠️ 기존 모델 없음 → 초기 학습 모드")
-            self.trainer.feature_selection_regime(X_train_full, y_train_full, regime_col='regime', top_k=30)
-            self.trainer._progress_callback = lambda regime: self.update_progress(
-                3, total_steps, f"초기 학습 중", regime
-            )
-            metrics = self.trainer.train_ensemble_regime(X_train_full, y_train_full, regime_col='regime', test_size=0.15)
-            self.trainer.save_model()
-            
-            # ✅ 학습 정보 저장 (추가)
-            with open(info_file, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'data_count': len(X),
-                    'timestamp': datetime.now(timezone.utc).isoformat(),
-                    'seed': seed
-                }, f, indent=2)
-            
-            flag_path = os.path.join(self.config.BASE_DIR, '.retrain_complete')
-            with open(flag_path, 'w', encoding='utf-8') as f:
-                f.write(datetime.now(timezone.utc).isoformat())
-            
-            return metrics
-
-        # Step 3: 새 모델 학습
-        self.update_progress(3, total_steps, "새 모델 학습 중")
-        
-        print("\n새 모델 학습 중...")
-        new = ModelTrainer(self.config)
-        
-        if old.selected_features:
-            print(f"  기존 피처 재사용: {len(old.selected_features)}개")
-            new.selected_features = old.selected_features
-        else:
-            print("  새 피처 선택...")
-            new.feature_selection_regime(X_train_full, y_train_full, regime_col='regime', top_k=30)
-        
-        new._progress_callback = lambda regime: self.update_progress(
-            3, total_steps, f"새 모델 학습 중", regime
-        )
-        
-        # ✅ 랜덤 시드 적용한 학습 (매번 다른 모델 생성)
-        new_metrics = new.train_ensemble_regime(X_train_full, y_train_full, regime_col='regime', test_size=0.15)
-
-        # Step 4: 테스트셋으로 공정 비교
-        self.update_progress(4, total_steps, "모델 성능 비교 중")
-        
-        print("\n" + "="*60)
-        print("테스트셋 성능 비교")
-        print("="*60)
-        
-        regime_accs = {'old': {}, 'new': {}}
-
-        X_test_valid = X_test.copy()
-        y_test_valid = y_test.copy()
-        
-        if 'regime' in X_test.columns:
-            X_test_valid = X_test_valid.reset_index(drop=True)
-            y_test_valid = y_test_valid.reset_index(drop=True)
-
-            valid_regime = X_test_valid['regime'].notna()
-            valid_indices = valid_regime[valid_regime].index.tolist()
-
-            if len(valid_indices) > 0:
-                X_test_valid = X_test_valid.loc[valid_indices].reset_index(drop=True)
-                y_test_valid = y_test_valid.loc[valid_indices].reset_index(drop=True)
-        else:
-            X_test_valid = X_test_valid.reset_index(drop=True)
-            y_test_valid = y_test_valid.reset_index(drop=True)
-
-            min_len = min(len(X_test_valid), len(y_test_valid))
-            X_test_valid = X_test_valid.iloc[:min_len]
-            y_test_valid = y_test_valid.iloc[:min_len]
-
-        # 전체 성능
-        try:
-            old_pred_all = old.predict(X_test_valid)
-            new_pred_all = new.predict(X_test_valid)
-            
-            min_len = min(len(old_pred_all), len(new_pred_all), len(y_test_valid))
-            old_pred_all = old_pred_all[:min_len]
-            new_pred_all = new_pred_all[:min_len]
-            y_test_sub = y_test_valid.iloc[:min_len]
-            
-            old_acc_all = accuracy_score(y_test_sub, old_pred_all)
-            new_acc_all = accuracy_score(y_test_sub, new_pred_all)
-            
-            print(f"\n[전체 테스트셋]")
-            print(f"  기존 모델: {old_acc_all:.4f}")
-            print(f"  새 모델:   {new_acc_all:.4f}")
-            print(f"  개선:      {new_acc_all - old_acc_all:+.4f}")
-            
-            regime_accs['old']['ALL'] = old_acc_all
-            regime_accs['new']['ALL'] = new_acc_all
-            
-        except Exception as e:
-            print(f"⚠️ 전체 비교 실패: {e}")
-        
-        # 레짐별 성능
-        if 'regime' in X_test_valid.columns:
-            print(f"\n[레짐별 성능]")
-            
-            for rval in [1, -1, 0]:
-                rname = self.trainer._regime_to_name(rval)
-                
-                try:
-                    mask = (X_test_valid['regime'] == rval)
-                    mask_indices = mask[mask].index.tolist()
-                    
-                    if len(mask_indices) < 20:
-                        print(f"  [{rname}] 샘플 부족 ({len(mask_indices)}건) - 스킵")
-                        continue
-                    
-                    X_r = X_test_valid.loc[mask_indices].reset_index(drop=True)
-                    y_r = y_test_valid.loc[mask_indices].reset_index(drop=True)
-                    
-                    old_pred = old.predict(X_r, regime=rval)
-                    new_pred = new.predict(X_r, regime=rval)
-                    
-                    min_len = min(len(old_pred), len(new_pred), len(y_r))
-                    old_pred = old_pred[:min_len]
-                    new_pred = new_pred[:min_len]
-                    y_r = y_r.iloc[:min_len]
-                    
-                    old_acc = accuracy_score(y_r, old_pred)
-                    new_acc = accuracy_score(y_r, new_pred)
-                    
-                    regime_accs['old'][rname] = old_acc
-                    regime_accs['new'][rname] = new_acc
-                    
-                    print(f"  [{rname:5s}] 기존: {old_acc:.4f} | 새: {new_acc:.4f} | 차이: {new_acc - old_acc:+.4f}")
-                    
-                except Exception as e:
-                    print(f"  [{rname}] 비교 실패: {e}")
-                    continue
-        
-        # 의사결정
-        old_scores = [v for v in regime_accs['old'].values() if v > 0]
-        new_scores = [v for v in regime_accs['new'].values() if v > 0]
-        
-        old_avg = np.mean(old_scores) if old_scores else 0
-        new_avg = np.mean(new_scores) if new_scores else 0
-        
-        print(f"\n{'='*60}")
-        print(f"최종 평가:")
-        print(f"  기존 모델 평균: {old_avg:.4f}")
-        print(f"  새 모델 평균:   {new_avg:.4f}")
-        print(f"  개선폭:         {new_avg - old_avg:+.4f}")
-        
-        # Step 5: 백업 및 저장
-        self.update_progress(5, total_steps, "모델 저장 중")
-        
-        if new_avg > old_avg:
-            print(f"\n→ ✅ 새 모델 채택 (성능 향상)")
-            
-            # 백업
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            backup_dir = os.path.join(self.config.MODEL_DIR, 'backup', f'backup_{timestamp}')
-            _ensure_dir(backup_dir)
-            
-            import shutil
-            for rname in ['UP', 'DOWN', 'FLAT']:
-                src = os.path.join(self.config.MODEL_DIR, f"bundle_{rname}.pkl")
-                if os.path.exists(src):
-                    dst = os.path.join(backup_dir, f"bundle_{rname}.pkl")
-                    shutil.copy2(src, dst)
-            
-            src = os.path.join(self.config.MODEL_DIR, 'current_model.pkl')
-            if os.path.exists(src):
-                dst = os.path.join(backup_dir, 'current_model.pkl')
-                shutil.copy2(src, dst)
-            
-            comparison_path = os.path.join(backup_dir, 'comparison.json')
-            with open(comparison_path, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'timestamp': timestamp,
-                    'old_avg': float(old_avg),
-                    'new_avg': float(new_avg),
-                    'improvement': float(new_avg - old_avg),
-                    'regime_scores': {
-                        'old': {k: float(v) for k, v in regime_accs['old'].items()},
-                        'new': {k: float(v) for k, v in regime_accs['new'].items()}
-                    }
-                }, f, indent=2)
-            
-            print(f"  백업 완료: {backup_dir}")
-            
-            # 새 모델 저장
-            new.save_model()
-            self.trainer = new
-            print(f"  새 모델 저장 완료")
-            
-        else:
-            print(f"\n→ ⚠️ 기존 모델 유지 (성능 저하 or 동등)")
-            print(f"  새 모델은 저장하지 않습니다.")
-            self.trainer = old
-        
-        print("="*60)
-        
-        # ✅ 학습 정보 저장
-        with open(info_file, 'w', encoding='utf-8') as f:
-            json.dump({
-                'data_count': len(X),
-                'timestamp': datetime.now(timezone.utc).isoformat(),
-                'seed': seed,
-                'performance': {
-                    'old_avg': float(old_avg),
-                    'new_avg': float(new_avg),
-                    'improvement': float(new_avg - old_avg)
-                }
-            }, f, indent=2)
-        
-        # Step 6: 완료
-        self.update_progress(6, total_steps, "재학습 완료")
-        
-        flag_path = os.path.join(self.config.BASE_DIR, '.retrain_complete')
-        with open(flag_path, 'w', encoding='utf-8') as f:
-            f.write(datetime.now(timezone.utc).isoformat())
-        
-        return new_metrics
+        """
+        간단 재학습: 기존 모델 유무와 상관없이 initial_training을 호출.
+        (정교한 구버전 비교/채택 로직이 필요하면 여기서 확장 가능)
+        """
+        print("↻ 재학습(간단 모드): 새 데이터로 다시 학습합니다.")
+        return self.initial_training(new_df)
 
     def analyze_failures(self, trade_log_df):
-        """의사결정 트리로 실패 패턴 자동 발견"""
-        if 'result' not in trade_log_df.columns:
+        """
+        실패 패턴 분석(간이). trade_log_df에 필요한 피처가 없으면 빈 dict 반환.
+        main_pipe의 적응형 필터 생성 단계에서 사용.
+        """
+        if trade_log_df is None or trade_log_df.empty or 'result' not in trade_log_df.columns:
             return {}
-        
-        print("\n" + "="*60)
-        print(f"데이터 기반 패턴 분석 (전체 {len(trade_log_df)}건)")
-        print("="*60)
-        
-        from sklearn.tree import DecisionTreeClassifier, export_text
-        from sklearn.tree import _tree
-        
-        # ✅ 피처 선택 (가능한 모든 피처)
-        feature_cols = [
-            'atr_14', 'atr_ratio_14', 'atr_28', 'atr_ratio_28',
-            'volume_ratio', 'volume_trend', 'volume_sma_10', 'volume_sma_50',
-            'rsi_14', 'rsi_28',
-            'macd', 'macd_signal', 'macd_histogram',
-            'bb_position_20', 'bb_width_20', 'bb_position_50', 'bb_width_50',
-            'volatility_10', 'volatility_30', 'volatility_ratio_10', 'volatility_ratio_30',
-            'adx_14', 'di_plus_14', 'di_minus_14',
-            'stoch_14',
-            'hour', 'day_of_week',
-            'return_1', 'return_2', 'return_3', 'return_5', 'return_10', 'return_15', 'return_30',
-            'price_to_ma_5', 'price_to_ma_10', 'price_to_ma_20', 'price_to_ma_50',
-            'ma_5_slope', 'ma_10_slope', 'ma_20_slope',
-            'trend_strength_10', 'trend_strength_20', 'trend_strength_50',
-            'body_size', 'upper_shadow', 'lower_shadow', 'body_position'
-        ]
-        
-        # 사용 가능한 피처만 선택
-        available_features = [f for f in feature_cols if f in trade_log_df.columns]
-        
-        if len(available_features) < 3:
-            print("❌ 분석 가능한 피처 부족")
-            return {}
-        
-        # 데이터 준비
-        X = trade_log_df[available_features].copy()
-        y = trade_log_df['result'].copy()
-        
-        # 결측치 제거
-        valid_mask = X.notna().all(axis=1) & y.notna()
-        X = X[valid_mask]
-        y = y[valid_mask]
-        
-        if len(X) < 50:
-            print("❌ 유효 샘플 부족 (50건 미만)")
-            return {}
-        
-        fail_count = (y == 0).sum()
-        success_count = (y == 1).sum()
-        
-        print(f"✓ 분석 샘플: {len(X)}건 (성공: {success_count}, 실패: {fail_count})")
-        print(f"✓ 사용 피처: {len(available_features)}개")
-        
-        # ✅ 실패 거래만 분리하는 규칙 학습
-        # (실패=1, 성공=0으로 반전하여 실패 조건 학습)
-        y_fail = (y == 0).astype(int)
-        
-        # Decision Tree 학습 (간단한 규칙 생성)
-        tree = DecisionTreeClassifier(
-            max_depth=4,           # 깊이 제한으로 간단한 규칙
-            min_samples_split=50,  # 최소 50개 이상 샘플
-            min_samples_leaf=20,   # 리프 노드 최소 20개
-            max_features=0.7,      # 피처의 70%만 사용
-            class_weight='balanced',  # 클래스 불균형 해결
-            random_state=42
-        )
-        
-        tree.fit(X, y_fail)
-        
-        # ✅ 규칙 텍스트 출력
-        tree_rules = export_text(tree, feature_names=available_features, max_depth=4)
-        print("\n[학습된 의사결정 트리]")
-        print(tree_rules[:1000])  # 처음 1000자만 출력
-        if len(tree_rules) > 1000:
-            print("  ... (생략)")
-        
-        # ✅ 중요 피처 확인
-        importances = pd.DataFrame({
-            'feature': available_features,
-            'importance': tree.feature_importances_
-        }).sort_values('importance', ascending=False)
-        
-        print("\n[중요 피처 Top 10]")
-        for idx, row in importances.head(10).iterrows():
-            if row['importance'] > 0:
-                print(f"  {row['feature']:20s}: {row['importance']:.4f}")
-        
-        # ✅ 규칙을 필터로 변환
-        patterns = self._extract_rules_from_tree(tree, available_features, X, y_fail)
-        
-        # 기존 필터 로드
-        _ensure_dir(self.config.MODEL_DIR)
-        fpath = os.path.join(self.config.MODEL_DIR, 'adaptive_filters.json')
-        
-        existing_filters = []
-        filter_history = []
-        
-        if os.path.exists(fpath):
-            try:
-                with open(fpath, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    existing_filters = data.get('active_filters', [])
-                    filter_history = data.get('filter_history', [])
-            except Exception:
-                pass
-        
-        # 신규 필터 추가 (중복 제거)
-        new_filters = list(patterns.values())
-        existing_names = {f['name'] for f in existing_filters}
-        
-        added_count = 0
-        for new_filter in new_filters:
-            if new_filter['name'] not in existing_names:
-                existing_filters.append(new_filter)
-                added_count += 1
-                print(f"\n  ✓ 신규 필터 추가: {new_filter['name']}")
-                print(f"     조건: {new_filter['condition']}")
-                print(f"     이유: {new_filter['reason']}")
-        
-        # 저장
-        save_data = {
-            'active_filters': existing_filters,
-            'filter_history': filter_history + [patterns] if patterns else filter_history,
-            'last_updated': datetime.now(timezone.utc).isoformat(),
-            'tree_info': {
-                'n_samples': int(len(X)),
-                'n_features': len(available_features),
-                'max_depth': int(tree.get_depth()),
-                'n_leaves': int(tree.get_n_leaves()),
-                'top_features': importances.head(5).to_dict('records')
-            }
-        }
-        
-        with open(fpath, 'w', encoding='utf-8') as f:
-            json.dump(save_data, f, indent=2, ensure_ascii=False)
-        
-        if added_count > 0:
-            print(f"\n✓ {added_count}개 신규 필터 추가 (데이터 기반 자동 학습)")
-            print(f"✓ 총 활성 필터: {len(existing_filters)}개")
-        else:
-            print("\n  → 새로운 패턴 없음 (기존 규칙으로 충분)")
-        
-        print(f"필터 저장: {fpath}\n")
-        
-        return patterns
-    
-    
-    def _extract_rules_from_tree(self, tree, feature_names, X, y):
-        """의사결정 트리에서 규칙 추출"""
-        from sklearn.tree import _tree
-        
-        patterns = {}
-        tree_ = tree.tree_
-        feature_name = [
-            feature_names[i] if i != _tree.TREE_UNDEFINED else "undefined!"
-            for i in tree_.feature
-        ]
-        
-        def recurse(node, depth, conditions):
-            """재귀적으로 트리 탐색"""
-            if tree_.feature[node] != _tree.TREE_UNDEFINED:
-                name = feature_name[node]
-                threshold = tree_.threshold[node]
-                
-                # 왼쪽 가지 (<=)
-                left_conditions = conditions + [(name, '<=', threshold)]
-                recurse(tree_.children_left[node], depth + 1, left_conditions)
-                
-                # 오른쪽 가지 (>)
-                right_conditions = conditions + [(name, '>', threshold)]
-                recurse(tree_.children_right[node], depth + 1, right_conditions)
-            else:
-                # 리프 노드 - 규칙 완성
-                n_samples = tree_.n_node_samples[node]
-                n_fail = tree_.value[node][0][1]  # 실패 클래스 (y_fail=1)
-                
-                # 실패율 60% 이상이고 샘플 20개 이상인 규칙만 채택
-                if n_samples >= 20 and n_fail / n_samples > 0.6:
-                    rule_id = f"auto_rule_{len(patterns) + 1}"
-                    
-                    # 조건 문자열 생성
-                    condition_parts = []
-                    for feat, op, val in conditions:
-                        if op == '<=':
-                            condition_parts.append(f"{feat} <= {val:.4f}")
-                        else:
-                            condition_parts.append(f"{feat} > {val:.4f}")
-                    
-                    condition_str = " AND ".join(condition_parts)
-                    
-                    patterns[rule_id] = {
-                        'type': 'compound',
-                        'name': f'Auto Rule {len(patterns) + 1}',
-                        'conditions': [
-                            {
-                                'field': c[0],
-                                'operator': c[1],
-                                'threshold': float(c[2])
-                            } for c in conditions
-                        ],
-                        'condition': condition_str,
-                        'reason': f"데이터 기반 학습: 실패율 {n_fail/n_samples:.1%} (샘플 {int(n_samples)}건)",
-                        'improvement': 0.0,
-                        'samples': int(n_samples),
-                        'fail_rate': float(n_fail/n_samples)
+
+        out = {}
+
+        # 예: ATR 기반 고변동성 실패 패턴
+        if 'atr_14' in trade_log_df.columns:
+            q = trade_log_df['atr_14'].quantile(0.8)
+            sub = trade_log_df[trade_log_df['atr_14'] >= q]
+            if len(sub) >= 50:
+                fail_rate = (sub['result'] == 0).mean()
+                if fail_rate > 0.55:
+                    out['high_volatility'] = {
+                        'atr_14_threshold': float(q),
+                        'filter': f'atr_14 > {float(q):.6f}',
+                        'reason': f'고변동성(atr_14 상위 20%) 구간 실패율 {fail_rate:.1%}'
                     }
-        
-        recurse(0, 1, [])
-        return patterns
-    
 
-# ===============================
-# Quick sample run
-# ===============================
+        # 예: 거래량 기반 실패 패턴
+        if 'volume_ratio' in trade_log_df.columns:
+            qv = trade_log_df['volume_ratio'].quantile(0.8)
+            subv = trade_log_df[trade_log_df['volume_ratio'] >= qv]
+            if len(subv) >= 50:
+                fail_rate = (subv['result'] == 0).mean()
+                if fail_rate > 0.55:
+                    out['high_volume'] = {
+                        'volume_ratio_threshold': float(qv),
+                        'filter': f'volume_ratio > {float(qv):.6f}',
+                        'reason': f'고거래량(volume_ratio 상위 20%) 구간 실패율 {fail_rate:.1%}'
+                    }
+
+            ql = trade_log_df['volume_ratio'].quantile(0.2)
+            subl = trade_log_df[trade_log_df['volume_ratio'] <= ql]
+            if len(subl) >= 50:
+                fail_rate = (subl['result'] == 0).mean()
+                if fail_rate > 0.55:
+                    out['low_volume'] = {
+                        'volume_ratio_threshold': float(ql),
+                        'filter': f'volume_ratio < {float(ql):.6f}',
+                        'reason': f'저거래량(volume_ratio 하위 20%) 구간 실패율 {fail_rate:.1%}'
+                    }
+
+        # 예: 시간대 기반 실패 패턴
+        if 'hour' in trade_log_df.columns:
+            bad_hours = []
+            for h, g in trade_log_df.groupby('hour'):
+                if len(g) >= 30 and (g['result'] == 0).mean() > 0.6:
+                    bad_hours.append(int(h))
+            if bad_hours:
+                out['time_based'] = {
+                    'avoid_hours': bad_hours,
+                    'filter': f'hour in {bad_hours}',
+                    'reason': f'특정 시간대 실패율 높음(>60%)'
+                }
+
+        # 예: RSI 극단값 실패 패턴
+        if 'rsi_14' in trade_log_df.columns:
+            extremes = trade_log_df[(trade_log_df['rsi_14'] <= 30) | (trade_log_df['rsi_14'] >= 70)]
+            if len(extremes) >= 50 and (extremes['result'] == 0).mean() > 0.55:
+                out['rsi_extreme'] = {
+                    'condition': 'RSI < 30 or RSI > 70',
+                    'reason': 'RSI 극단값 근처에서 실패율 증가'
+                }
+
+        return out
+
+
+# ==========================================
+# 테스트
+# ==========================================
 if __name__ == "__main__":
-    from config import Config
+    from data_loader import DataLoader
+    
     Config.create_directories()
-
-    print("샘플 데이터 생성...")
-    periods = 1000
-    ts = pd.date_range(end=datetime.now(timezone.utc), periods=periods, freq='1min', tz='UTC')
+    
+    print("="*60)
+    print("ModelTrainer 테스트")
+    print("="*60)
+    
+    # 데이터 로드
+    loader = DataLoader()
+    
+    # 샘플 데이터 생성
+    print("\n샘플 데이터 생성...")
+    periods = 10000
+    ts = pd.date_range(
+        end=datetime.now(timezone.utc),
+        periods=periods,
+        freq='1min',
+        tz='UTC'
+    )
+    
     np.random.seed(42)
     base = 42000 + np.random.randn(periods).cumsum() * 20
-
+    
     rows = []
     for i, t in enumerate(ts):
         b = base[i]
@@ -1813,16 +778,53 @@ if __name__ == "__main__":
         h = max(o, c) + np.random.uniform(0, 30)
         l = min(o, c) - np.random.uniform(0, 30)
         v = np.random.uniform(100, 1000)
-        rows.append({'timestamp': t, 'open': o, 'high': h, 'low': l, 'close': c, 'volume': v})
-    df = pd.DataFrame(rows)
-    df.to_csv('sample_data.csv', index=False)
-
-    opt = ModelOptimizer(Config)
-    metrics = opt.initial_training(df)
-
-    print("\n학습 결과 요약:")
-    for regime_name, regime_metrics in metrics.items():
-        print(f"\n[{regime_name}]")
-        for split, m in regime_metrics.items():
-            print(f"  {split}: acc={m['accuracy']:.4f}, prec={m['precision']:.4f}, "
-                  f"rec={m['recall']:.4f}, f1={m['f1']:.4f}, win={m['win_rate']:.4f}")
+        rows.append({
+            'timestamp': t,
+            'open': o,
+            'high': h,
+            'low': l,
+            'close': c,
+            'volume': v
+        })
+    
+    df_1m = pd.DataFrame(rows)
+    
+    # 피처 + 타겟 생성
+    print("\n피처 생성...")
+    X, y = loader.prepare_train_data(df_1m, use_cache=False)
+    
+    print(f"  X: {X.shape}")
+    print(f"  y: {y.shape}, 분포={y.value_counts().to_dict()}")
+    
+    # 모델 학습
+    print("\n모델 학습...")
+    trainer = ModelTrainer()
+    
+    # 레짐별 모델 학습
+    results = trainer.train_regime_models(X, y)
+    
+    # 모델 저장
+    print("\n모델 저장...")
+    trainer.save_models()
+    
+    # 모델 로드 테스트
+    print("\n모델 로드 테스트...")
+    trainer2 = ModelTrainer()
+    trainer2.load_models()
+    
+    # 예측 테스트
+    print("\n예측 테스트...")
+    X_test = X.tail(10).copy()
+    
+    # 전체 모델로 예측
+    y_pred_overall = trainer2.predict(X_test, use_regime_model=False)
+    print(f"  전체 모델 예측: {y_pred_overall}")
+    
+    # 레짐별 모델로 예측 (regime=1)
+    if 'regime' in X_test.columns:
+        y_pred_regime = trainer2.predict(X_test, regime=1, use_regime_model=True)
+        print(f"  레짐(UP) 모델 예측: {y_pred_regime}")
+    
+    print("\n" + "="*60)
+    print("✓ 테스트 완료")
+    print("="*60)

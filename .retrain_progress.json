@@ -1,8 +1,0 @@
-{
-  "status": "training",
-  "step_num": 6,
-  "total_steps": 6,
-  "current_step": "재학습 완료",
-  "regime": "",
-  "timestamp": "2025-10-24T10:02:03.768467+00:00"
-}
