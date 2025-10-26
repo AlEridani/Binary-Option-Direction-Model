@@ -1,643 +1,604 @@
-# main_pipe.py
-# 메인 자동화 파이프라인 (논블로킹 재학습/적응형 필터 호환)
+"""
+메인 파이프라인 - 전체 시스템 오케스트레이션
+버전: 1.3.0
+"""
 
-import os
 import time
-import json
-import logging
 import schedule
-import threading
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, Tuple
-
-import pandas as pd
+from typing import Optional, Dict
+import signal
+import sys
 import numpy as np
+import pandas as pd
 
-from config import Config
-from model_train import ModelTrainer, ModelOptimizer
-from feature_engineer import FeatureEngineer
-from data_merge import DataMerger, DataValidator
-from real_trade import RealTimeTrader, BinanceAPIClient
+import config
+from real_trade import RealTrader
+from model_train import ModelTrainer
+from data_merge import DataMerger
 from monitor import Monitor
+from log_manager import LogManager
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 로깅
-# ──────────────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(name)s | %(message)s',
-    handlers=[
-        logging.FileHandler('pipeline.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger("main_pipe")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 유틸
-# ──────────────────────────────────────────────────────────────────────────────
-def _coerce_to_utc(series: pd.Series) -> pd.Series:
-    """Naive/문자열/혼합을 모두 UTC-aware로 통일"""
-    s = pd.to_datetime(series, errors='coerce', utc=False)
-    try:
-        if getattr(s.dt, "tz", None) is None:
-            s = s.dt.tz_localize("UTC")
-        else:
-            s = s.dt.tz_convert("UTC")
-    except Exception:
-        def _one(x):
-            if pd.isna(x):
-                return pd.NaT
-            dt = pd.to_datetime(x, errors='coerce')
-            if pd.isna(dt):
-                return pd.NaT
-            if getattr(dt, "tzinfo", None) is None:
-                return dt.tz_localize("UTC")
-            return dt.tz_convert("UTC")
-        s = series.apply(_one).astype("datetime64[ns, UTC]")
-    return s
-
-
-def wilson_lower_bound(wins: int, n: int, z: float = 1.96) -> float:
-    if n <= 0:
-        return 0.0
-    p = wins / n
-    denom = 1 + (z * z) / n
-    center = p + (z * z) / (2 * n)
-    margin = z * ((p * (1 - p) + (z * z) / (4 * n)) / n) ** 0.5
-    return (center - margin) / denom
-
-
-def _build_adaptive_filters(failure_patterns: dict) -> dict:
-    """
-    ModelOptimizer.analyze_failures() 출력 → RealTimeTrader.load_adaptive_filters() 구조 변환
-    """
-    active = []
-    if not failure_patterns:
-        return {"active_filters": [], "filter_history": []}
-
-    # volatility
-    if "high_volatility" in failure_patterns:
-        fp = failure_patterns["high_volatility"]
-        th = float(fp.get("atr_14_threshold", 0.0))
-        active.append({
-            "name": "High Volatility Filter",
-            "type": "risk",
-            "field": "atr_14",
-            "operator": ">",
-            "threshold": th,
-            "condition": fp.get("filter", f"atr_14 > {th}"),
-            "reason": fp.get("reason", "고변동성 구간 실패율↑"),
-            "improvement": 0.0
-        })
-    # volume
-    if "high_volume" in failure_patterns:
-        fp = failure_patterns["high_volume"]
-        th = float(fp.get("volume_ratio_threshold", 1.5))
-        active.append({
-            "name": "High Volume Filter",
-            "type": "volume",
-            "field": "volume_ratio",
-            "operator": ">",
-            "threshold": th,
-            "condition": fp.get("filter", f"volume_ratio > {th}"),
-            "reason": fp.get("reason", "고거래량 구간 실패율↑"),
-            "improvement": 0.0
-        })
-    if "low_volume" in failure_patterns:
-        fp = failure_patterns["low_volume"]
-        th = float(fp.get("volume_ratio_threshold", 0.5))
-        active.append({
-            "name": "Low Volume Filter",
-            "type": "volume",
-            "field": "volume_ratio",
-            "operator": "<",
-            "threshold": th,
-            "condition": fp.get("filter", f"volume_ratio < {th}"),
-            "reason": fp.get("reason", "저유동성 구간 실패율↑"),
-            "improvement": 0.0
-        })
-    # time
-    if "time_based" in failure_patterns:
-        fp = failure_patterns["time_based"]
-        bad_hours = list(map(int, fp.get("avoid_hours", [])))
-        active.append({
-            "name": "Bad Hours Filter",
-            "type": "time",
-            "field": "hour",
-            "operator": "in",
-            "bad_hours": bad_hours,
-            "condition": fp.get("filter", f"hour in {bad_hours}"),
-            "reason": fp.get("reason", "저승률 시간대"),
-            "improvement": 0.0
-        })
-    # rsi
-    if "rsi_extreme" in failure_patterns:
-        fp = failure_patterns["rsi_extreme"]
-        active.append({
-            "name": "RSI Extreme Filter",
-            "type": "rsi",
-            "field": "rsi_14",
-            "operator": "extreme",
-            "lower_threshold": 30.0,
-            "upper_threshold": 70.0,
-            "condition": fp.get("condition", "RSI < 30 or RSI > 70"),
-            "reason": fp.get("reason", "RSI 극단값 실패율↑"),
-            "improvement": 0.0
-        })
-
-    return {"active_filters": active, "filter_history": []}
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 메인 파이프라인
-# ──────────────────────────────────────────────────────────────────────────────
 class MainPipeline:
-    """메인 자동화 파이프라인"""
-
-    def __init__(self):
-        # 디렉토리 준비
-        Config.create_directories()
-        self.config = Config
-
-        # 컴포넌트
-        self.model_trainer = ModelTrainer(self.config)
-        self.model_optimizer = ModelOptimizer(self.config)
-        self.data_merger = DataMerger(self.config)
-        self.api_client = BinanceAPIClient()
-        self.real_trader: Optional[RealTimeTrader] = None
-        self.monitor = Monitor(self.config)  # 최근 성과 분석/리포트 담당
-
-        # 상태
+    """
+    메인 파이프라인
+    - 실시간 거래 루프
+    - 스케줄러 기반 백그라운드 태스크
+    - 자동 재학습 (윌슨 하한 기반)
+    - 일일 유지보수
+    - 예외 처리 및 복구
+    """
+    
+    def __init__(self, symbol: str = 'BTCUSDT'):
+        """
+        초기화
+        
+        Args:
+            symbol: 거래 심볼
+        """
+        self.symbol = symbol
         self.is_running = False
-        self.last_retrain_time: Optional[datetime] = None
-        self.trading_thread: Optional[threading.Thread] = None
-
-        logger.info("MainPipeline 초기화 완료")
-
-    # ── 초기화 ────────────────────────────────────────────────────────────────
+        
+        # 컴포넌트 초기화
+        self.trader = RealTrader(symbol=symbol)
+        self.model_trainer = ModelTrainer()
+        self.data_merger = DataMerger()
+        self.log_manager = LogManager()
+        self.monitor = Monitor(self.log_manager)
+        
+        # 시그널 핸들러 등록
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        
+        print("=" * 60)
+        print(f"메인 파이프라인 초기화 완료: {symbol}")
+        print(f"시스템 버전: {config.SYSTEM_VERSION}")
+        print("=" * 60)
+    
     def initialize_system(self) -> bool:
-        logger.info("시스템 초기화 시작…")
-
-        # 1) 모델 준비
-        model_file = os.path.join(self.config.MODEL_DIR, 'current_model.pkl')
-        if not os.path.exists(model_file):
-            logger.info("학습된 모델 없음 → 초기 학습 시작")
-            initial_data = self.fetch_initial_training_data()
-            if initial_data is not None and not initial_data.empty:
-                metrics = self.model_optimizer.initial_training(initial_data)
-                try:
-                    logger.info(
-                        "초기 학습 완료 | "
-                        f"train={metrics.get('train')} | "
-                        f"val={metrics.get('validation')} | "
-                        f"test={metrics.get('test')}"
-                    )
-                except Exception:
-                    logger.info("초기 학습 완료")
-            else:
-                logger.error("초기 학습 데이터 부족")
-                return False
-        else:
-            if self.model_trainer.load_model():
-                logger.info("기존 모델 로드 완료")
-            else:
-                logger.error("모델 로드 실패")
-                return False
-
-        # 2) 실시간 트레이더
-        self.real_trader = RealTimeTrader(
-            config=self.config,
-            model_trainer=self.model_trainer,
-            api_client=self.api_client
-        )
-        # 적응형 필터 프리로드(있으면)
-        if hasattr(self.real_trader, "load_adaptive_filters"):
-            try:
-                self.real_trader.adaptive_filters = self.real_trader.load_adaptive_filters()
-            except Exception:
-                pass
-
-        return True
-
-    # ── 데이터 소스 ───────────────────────────────────────────────────────────
-    def fetch_initial_training_data(self) -> Optional[pd.DataFrame]:
-        logger.info("초기 학습 데이터 수집…")
-        try:
-            dfs = []
-            # 실제에선 여러 구간/요청으로 확장
-            df = self.api_client.get_klines(symbol="BTCUSDT", interval="1m", limit=1000)
-            if df is not None and not df.empty:
-                dfs.append(df)
-            if dfs:
-                out = pd.concat(dfs, ignore_index=True)
-                out = out.drop_duplicates(subset=['timestamp']).sort_values('timestamp')
-                self.save_price_data(out)
-                logger.info(f"초기 데이터 수집 완료: {len(out):,} rows")
-                return out
-        except Exception as e:
-            logger.error(f"초기 데이터 수집 오류: {e}")
-
-        # 실패 시 시뮬레이션
-        logger.info("시뮬레이션 데이터 생성으로 대체")
-        return self.generate_simulation_data(days=180)
-
-    def generate_simulation_data(self, days=180) -> pd.DataFrame:
-        periods = days * 24 * 60
-        idx = pd.date_range(end=datetime.now(timezone.utc), periods=periods, freq='1min')
-
-        rng = np.random.default_rng(42)
-        rets = rng.normal(0.00006, 0.004, periods)
-        price = 42000 * np.exp(np.cumsum(rets))
-
-        rows = []
-        for i, ts in enumerate(idx):
-            base = price[i]
-            o = base * (1 + rng.uniform(-0.001, 0.001))
-            c = base * (1 + rng.uniform(-0.001, 0.001))
-            h = max(o, c) * (1 + rng.uniform(0, 0.002))
-            l = min(o, c) * (1 - rng.uniform(0, 0.002))
-            v = rng.uniform(100, 1200) * (1 + 0.3 * np.sin(i/1440 * 2*np.pi))
-            rows.append({'timestamp': ts, 'open': o, 'high': h, 'low': l, 'close': c, 'volume': v})
-
-        df = pd.DataFrame(rows)
-        self.save_price_data(df)
-        return df
-
-    def save_price_data(self, df: pd.DataFrame):
-        os.makedirs(self.config.PRICE_DATA_DIR, exist_ok=True)
-        path = os.path.join(self.config.PRICE_DATA_DIR, 'prices.csv')
-
-        if 'timestamp' not in df.columns:
-            raise ValueError("가격 DF에 'timestamp' 없음")
-        df = df.copy()
-        df['timestamp'] = _coerce_to_utc(df['timestamp'])
-        df['ts_min'] = df['timestamp'].dt.floor('T')
-
-        if os.path.exists(path):
-            old = pd.read_csv(path)
-            if 'timestamp' in old.columns:
-                old['timestamp'] = _coerce_to_utc(old['timestamp'])
-                if 'ts_min' not in old.columns:
-                    old['ts_min'] = old['timestamp'].dt.floor('T')
-            combined = pd.concat([old, df], ignore_index=True)
-        else:
-            combined = df
-
-        combined = (
-            combined.sort_values('timestamp')
-                    .drop_duplicates(subset=['ts_min'], keep='last')
-        )
-        combined.to_csv(path, index=False, encoding='utf-8-sig')
-        logger.info(f"가격 데이터 저장: {path} ({len(combined):,} rows)")
-
-    def fetch_live_data(self) -> Optional[pd.DataFrame]:
-        try:
-            df = self.api_client.get_klines(symbol="BTCUSDT", interval="1m", limit=500)
-            if df is not None and not df.empty:
-                self.data_merger.add_new_price_data(df.tail(10))
-                return df
-        except Exception as e:
-            logger.error(f"실시간 데이터 수집 오류: {e}")
-        return None
-
-    # ── 재학습 ────────────────────────────────────────────────────────────────
-    def check_retrain_flag(self) -> bool:
-        flag_path = os.path.join(self.config.BASE_DIR, '.retrain_required')
-        if os.path.exists(flag_path):
-            try:
-                with open(flag_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    _ = f.read()
-            except Exception:
-                pass
-            os.remove(flag_path)
-            logger.info("재학습 플래그 감지")
-            return True
-        return False
-
-    def retrain_pipeline(self) -> bool:
-        logger.info("=" * 60)
-        logger.info("재학습 파이프라인 시작")
-        logger.info("=" * 60)
-        try:
-            # 1) 병합
-            logger.info("1. 데이터 병합")
-            merged = self.data_merger.merge_all_data()
-            if merged is None or merged.empty:
-                logger.error("병합 데이터 없음")
-                return False
-
-            # 2) 가격 검증
-            logger.info("2. 가격 데이터 검증")
-            ok, issues = DataValidator.validate_price_data(merged)
-            if not ok:
-                logger.warning(f"가격 데이터 이슈: {issues}")
-
-            # 3) 모델 재학습
-            logger.info("3. 모델 재학습")
-            metrics = self.model_optimizer.retrain_model(merged)
-            logger.info(f"재학습 결과: {metrics}")
-
-            # 4) 실패 패턴 분석 → 적응형 필터 저장
-            logger.info("4. 실패 패턴 분석/필터 저장")
-            trade_logs = self.data_merger.load_trade_logs(days=30)
-            if not trade_logs.empty:
-                patterns = self.model_optimizer.analyze_failures(trade_logs)
-                filters_doc = _build_adaptive_filters(patterns)
-                apath = os.path.join(self.config.MODEL_DIR, 'adaptive_filters.json')
-                with open(apath, 'w', encoding='utf-8') as f:
-                    json.dump(filters_doc, f, ensure_ascii=False, indent=2)
-                logger.info(f"적응형 필터 저장 완료: {apath} (활성 {len(filters_doc.get('active_filters', []))}개)")
-            else:
-                logger.info("거래 로그 부족 → 필터 업데이트 생략")
-
-            # 5) 실시간 모듈 새 모델 로드
-            if self.real_trader:
-                if self.model_trainer.load_model():
-                    logger.info("실시간 모듈: 새 모델 적용")
-                if hasattr(self.real_trader, "load_adaptive_filters"):
-                    self.real_trader.adaptive_filters = self.real_trader.load_adaptive_filters()
-
-            self.last_retrain_time = datetime.now(timezone.utc)
-            with open(os.path.join(self.config.BASE_DIR, '.retrain_complete'), 'w', encoding='utf-8') as f:
-                f.write(self.last_retrain_time.isoformat())
-            logger.info("재학습 완료 플래그 기록")
-
-            logger.info("재학습 파이프라인 완료")
-            return True
-
-        except Exception as e:
-            logger.exception(f"재학습 파이프라인 오류: {e}")
+        """
+        시스템 초기화
+        
+        Returns:
+            초기화 성공 여부
+        """
+        print("\n🔧 시스템 초기화 중...")
+        
+        # 1. Config 검증
+        valid, errors = config.validate_config()
+        if not valid:
+            print("❌ Config 검증 실패:")
+            for error in errors:
+                print(f"  - {error}")
             return False
-
-    # ── 라이브 루프/스케줄러 ─────────────────────────────────────────────────
-    def trading_loop(self):
-        logger.info("거래 루프 시작")
-        while self.is_running:
-            try:
-                # 내부에서 주기적 실행/폴링 (논블로킹 재학습)
-                self.real_trader.run_live_trading(
-                    duration_hours=999999,
-                    trade_interval_minutes=self.config.TRADE_INTERVAL_MINUTES
+        
+        print("  ✅ Config 검증 통과")
+        
+        # 2. 모델 로드
+        if not self.trader.model_loaded:
+            print("  ⚠️  모델 미로드, 학습된 모델 필요")
+            
+            # 초기 학습 필요 시 수행
+            # success = self.retrain_pipeline()
+            # if not success:
+            #     return False
+        else:
+            print("  ✅ 모델 로드 완료")
+        
+        # 3. 로그 디렉토리 확인
+        for dir_path in config.DIRS_TO_CREATE:
+            if not dir_path.exists():
+                print(f"  ❌ 디렉토리 없음: {dir_path}")
+                return False
+        
+        print("  ✅ 디렉토리 구조 확인")
+        
+        # 4. 초기 모니터링
+        self.monitor.print_summary()
+        
+        print("\n✅ 시스템 초기화 완료")
+        return True
+    
+    def trading_loop(self) -> None:
+        """거래 루프 (1분마다 실행)"""
+        try:
+            self.trader.run()
+        except Exception as e:
+            print(f"❌ 거래 루프 오류: {e}")
+            # 복구 시도
+            time.sleep(5)
+    
+    def scheduled_tasks(self) -> None:
+        """스케줄러 기반 백그라운드 태스크"""
+        # 모니터링 업데이트 (5분마다)
+        schedule.every(config.MONITOR_UPDATE_INTERVAL).seconds.do(
+            self._safe_execute, self.monitor.update
+        )
+        
+        # 리포트 생성 (4시간마다)
+        schedule.every(config.REPORT_INTERVAL).seconds.do(
+            self._safe_execute, self.generate_report
+        )
+        
+        # 재학습 체크 (1시간마다)
+        schedule.every(3600).seconds.do(
+            self._safe_execute, self.auto_retrain_check
+        )
+        
+        # 일일 유지보수 (자정)
+        schedule.every().day.at("00:00").do(
+            self._safe_execute, self.daily_maintenance
+        )
+    
+    def _safe_execute(self, func, *args, **kwargs) -> None:
+        """안전 실행 래퍼 (예외 처리)"""
+        try:
+            func(*args, **kwargs)
+        except Exception as e:
+            print(f"❌ 스케줄 태스크 실행 오류 ({func.__name__}): {e}")
+    
+    def retrain_pipeline(self, start_date: Optional[str] = None, 
+                        end_date: Optional[str] = None) -> bool:
+        """
+        재학습 파이프라인
+        
+        Args:
+            start_date: 시작일 (None이면 최근 30일)
+            end_date: 종료일 (None이면 오늘)
+        
+        Returns:
+            재학습 성공 여부
+        """
+        print("\n" + "=" * 60)
+        print("🔄 재학습 파이프라인 시작")
+        print("=" * 60)
+        
+        # 날짜 설정
+        if end_date is None:
+            end_date = datetime.now().strftime("%Y-%m-%d")
+        
+        if start_date is None:
+            start_dt = datetime.now() - timedelta(days=30)
+            start_date = start_dt.strftime("%Y-%m-%d")
+        
+        print(f"\n📅 학습 기간: {start_date} ~ {end_date}")
+        
+        try:
+            # 1. 데이터 병합 및 정제
+            print("\n1️⃣  데이터 준비")
+            X, y = self.data_merger.create_retrain_dataset(start_date, end_date)
+            
+            if X.empty or y.empty:
+                print("❌ 데이터 준비 실패")
+                return False
+            
+            print(f"  ✅ 데이터 준비 완료: X={X.shape}, y={y.shape}")
+            
+            # 2. 데이터 검증
+            print("\n2️⃣  데이터 검증")
+            valid, errors = self.data_merger.data_loader.validate_data_quality(X, y)
+            
+            if not valid:
+                print("  ⚠️  데이터 품질 이슈:")
+                for error in errors:
+                    print(f"    - {error}")
+                
+                # 치명적 오류가 아니면 계속 진행
+                if any('불일치' in e or '타입' in e for e in errors):
+                    print("  ❌ 치명적 오류, 중단")
+                    return False
+            
+            print("  ✅ 데이터 검증 통과")
+            
+            # 3. 모델 학습
+            print("\n3️⃣  모델 학습")
+            
+            # 레짐별 모델 학습
+            if 'regime' in X.columns:
+                results = self.model_trainer.train_ensemble_regime(
+                    X, y, regime_col='regime', test_size=0.2
                 )
-
-                # (보통 여기 도달하지 않음: 예외/중지시만)
-                self.monitor.generate_report()
-
-                if self.check_retrain_flag():
-                    self.retrain_pipeline()
-
-            except Exception as e:
-                logger.exception(f"거래 루프 오류: {e}")
-                time.sleep(60)
-
-    def scheduled_tasks(self):
-        # 자정: 청소
-        schedule.every().day.at("00:00").do(self.daily_maintenance)
-        # 4시간마다: 리포트
-        schedule.every(4).hours.do(self.monitor.generate_report)
-        # 3시간마다: 자동 재학습 체크
-        schedule.every(3).hours.do(self.auto_retrain_check)
-
-        while self.is_running:
-            schedule.run_pending()
-            time.sleep(60)
-
-    def daily_maintenance(self):
-        logger.info("일일 유지보수 시작")
-        try:
-            self.data_merger.cleanup_old_data(days_to_keep=90)
-
-            # 로그 로테이션
-            lf = 'pipeline.log'
-            if os.path.exists(lf):
-                size_mb = os.path.getsize(lf) / (1024 * 1024)
-                if size_mb > 100:
-                    archive = f"pipeline_{datetime.now().strftime('%Y%m%d')}.log"
-                    try:
-                        os.rename(lf, archive)
-                        logger.info(f"로그 아카이브: {archive}")
-                    except Exception:
-                        pass
-
-            # 성과 저장
-            stats = self.monitor.analyze_recent_trades(30)
-            if stats:
-                path = os.path.join(self.config.BASE_DIR, f"stats_{datetime.now().strftime('%Y%m%d')}.json")
-                with open(path, 'w', encoding='utf-8') as f:
-                    json.dump(stats, f, indent=2, default=str, ensure_ascii=False)
-        except Exception:
-            logger.exception("일일 유지보수 오류")
-        logger.info("일일 유지보수 완료")
-
-    def auto_retrain_check(self):
-        logger.info("자동 재학습 검토(윌슨 하한)…")
-        try:
-            day = self.monitor.analyze_recent_trades(1)
-            n = int(day.get('total_trades', 0)) if day else 0
-            min_n = self.config.EVALUATION_WINDOW
-
-            if n < min_n:
-                logger.info(f"표본 부족 → 보류 (n={n} < {min_n})")
-                return
-
-            wins = int(day.get('wins', 0)) if day else 0
-            L = wilson_lower_bound(wins, n, z=1.96)
-            wr = wins / n if n > 0 else 0.0
-            logger.info(f"최근 n={n}, wr={wr:.2%}, 윌슨 하한={L:.2%}, 임계={self.config.RETRAIN_THRESHOLD:.2%}")
-
-            min_gap_hours = 6
-            gap_ok = (self.last_retrain_time is None) or (
-                datetime.now(timezone.utc) - self.last_retrain_time >= timedelta(hours=min_gap_hours)
-            )
-
-            if (L < self.config.RETRAIN_THRESHOLD) and gap_ok:
-                logger.info("조건 충족 → 재학습 수행")
-                self.retrain_pipeline()
             else:
-                if not gap_ok:
-                    remain = timedelta(hours=min_gap_hours) - (datetime.now(timezone.utc) - self.last_retrain_time)
-                    logger.info(f"재학습 최소 간격 미충족. 남은 시간: {remain}")
-                else:
-                    logger.info("승률 하한이 임계 이상 → 재학습 스킵")
-        except Exception:
-            logger.exception("자동 재학습 검토 오류")
-
-    # ── 라이프사이클 ──────────────────────────────────────────────────────────
-    def start(self):
-        logger.info("=" * 60)
-        logger.info("바이너리 옵션 예측 시스템 시작")
-        logger.info("=" * 60)
-
-        if not self.initialize_system():
-            logger.error("시스템 초기화 실패")
+                results = self.model_trainer.train_single_model(X, y, test_size=0.2)
+            
+            print("\n  📊 학습 결과:")
+            for model_name, result in results.items():
+                print(f"    {model_name}: Accuracy={result.get('accuracy', 0):.4f}")
+            
+            # 4. 모델 저장
+            print("\n4️⃣  모델 저장")
+            self.model_trainer.save_models()
+            
+            # 5. 모델 재로드 (Trader에 적용)
+            print("\n5️⃣  모델 재로드")
+            self.trader.model_trainer.load_models()
+            self.trader.model_loaded = True
+            
+            print("\n✅ 재학습 파이프라인 완료")
+            print("=" * 60)
+            
+            return True
+            
+        except Exception as e:
+            print(f"\n❌ 재학습 파이프라인 실패: {e}")
+            print("=" * 60)
+            return False
+    
+    def auto_retrain_check(self) -> None:
+        """자동 재학습 체크 (윌슨 하한 기반)"""
+        print("\n🔍 자동 재학습 체크")
+        
+        # 최근 거래 로드
+        df_recent = self.log_manager.load_recent_trades(n=config.MIN_TRADES_FOR_RETRAIN)
+        
+        if len(df_recent) < config.MIN_TRADES_FOR_RETRAIN:
+            print(f"  ⏳ 거래 수 부족 ({len(df_recent)} < {config.MIN_TRADES_FOR_RETRAIN})")
             return
-
+        
+        df_closed = df_recent[df_recent['status'] == 'CLOSED']
+        
+        if len(df_closed) < config.MIN_TRADES_FOR_RETRAIN:
+            print(f"  ⏳ 완료 거래 부족 ({len(df_closed)} < {config.MIN_TRADES_FOR_RETRAIN})")
+            return
+        
+        # 윌슨 하한 계산
+        import numpy as np
+        
+        n = len(df_closed)
+        wins = (df_closed['result'] == 'WIN').sum()
+        p_hat = wins / n
+        
+        z = 1.96  # 95% 신뢰수준
+        denominator = 1 + z**2 / n
+        center = (p_hat + z**2 / (2*n)) / denominator
+        margin = z * np.sqrt(p_hat * (1 - p_hat) / n + z**2 / (4*n**2)) / denominator
+        lower_bound = center - margin
+        
+        print(f"  승률: {p_hat:.2%}")
+        print(f"  윌슨 하한: {lower_bound:.2%}")
+        print(f"  임계값: {config.RETRAIN_WIN_RATE_THRESHOLD:.0%}")
+        
+        if lower_bound < config.RETRAIN_WIN_RATE_THRESHOLD:
+            print("\n  ⚠️  재학습 필요!")
+            
+            # 재학습 실행
+            success = self.retrain_pipeline()
+            
+            if success:
+                print("  ✅ 재학습 완료")
+                
+                # 동적 필터 초기화
+                self.trader.filter_state = self.trader._load_filter_state()
+            else:
+                print("  ❌ 재학습 실패")
+        else:
+            print("  ✅ 승률 양호, 재학습 불필요")
+    
+    def daily_maintenance(self) -> None:
+        """일일 유지보수"""
+        print("\n" + "=" * 60)
+        print("🛠️  일일 유지보수 시작")
+        print("=" * 60)
+        
+        # 1. 로그 로테이션
+        print("\n1️⃣  로그 정리")
+        # 구현: 오래된 로그 압축 또는 삭제
+        
+        # 2. 캐시 정리
+        print("\n2️⃣  캐시 정리")
+        self.data_merger.data_loader.clean_cache(older_than_days=7)
+        
+        # 3. 성능 리포트
+        print("\n3️⃣  일일 성능 리포트")
+        self.generate_report()
+        
+        # 4. 데이터 백업
+        print("\n4️⃣  데이터 백업")
+        # 구현: 중요 데이터 백업
+        
+        print("\n✅ 일일 유지보수 완료")
+        print("=" * 60)
+    
+    def generate_report(self) -> None:
+        """리포트 생성"""
+        print("\n" + "=" * 60)
+        print("📊 성능 리포트 생성")
+        print("=" * 60)
+        
+        # 모니터링 요약 출력
+        self.monitor.print_summary()
+        
+        # 트렌드 분석
+        trend = self.monitor.get_performance_trend(hours=24)
+        
+        if trend['win_rate_trend']:
+            import numpy as np
+            print("\n📈 24시간 트렌드:")
+            print(f"  평균 승률: {np.mean(trend['win_rate_trend']):.2%}")
+            print(f"  평균 PnL: {np.mean(trend['pnl_trend']):.2f}")
+            print(f"  평균 진입률: {np.mean(trend['entry_rate_trend']):.1f}회/시간")
+        
+        # 거래 상태
+        status = self.trader.get_status()
+        print("\n💼 거래 상태:")
+        print(f"  활성 포지션: {status['active_positions']} / {status['max_positions']}")
+        print(f"  동적 컷오프: {status['dynamic_cutoff']:.3f}")
+        print(f"  필터 패턴: {status['filter_patterns']}개")
+        
+        print("\n" + "=" * 60)
+    
+    def start(self) -> None:
+        """시스템 시작"""
+        # 초기화
+        if not self.initialize_system():
+            print("❌ 시스템 초기화 실패")
+            return
+        
+        # 스케줄 설정
+        self.scheduled_tasks()
+        
         self.is_running = True
-
-        # 거래 스레드
-        self.trading_thread = threading.Thread(target=self.trading_loop, daemon=True)
-        self.trading_thread.start()
-
-        # 스케줄 스레드
-        schedule_thread = threading.Thread(target=self.scheduled_tasks, daemon=True)
-        schedule_thread.start()
-
-        logger.info("서비스 시작 완료")
-
+        
+        print("\n🚀 시스템 시작")
+        print("  - Ctrl+C로 안전 종료")
+        print("  - 거래 루프: 1분마다")
+        print("  - 모니터링: 5분마다")
+        print("  - 리포트: 4시간마다")
+        print("=" * 60 + "\n")
+        
+        # 메인 루프
         try:
             while self.is_running:
-                time.sleep(10)
-                self.monitor_system_health()
+                # 거래 루프 실행
+                self.trading_loop()
+                
+                # 스케줄 태스크 실행
+                schedule.run_pending()
+                
+                # 1분 대기
+                time.sleep(60)
+                
         except KeyboardInterrupt:
-            logger.info("종료 신호 수신")
+            print("\n⚠️  사용자 중단")
+        except Exception as e:
+            print(f"\n❌ 시스템 오류: {e}")
+        finally:
             self.stop()
-
-    def monitor_system_health(self):
-        if self.trading_thread and not self.trading_thread.is_alive():
-            logger.warning("거래 스레드 중지 감지 → 재시작")
-            self.trading_thread = threading.Thread(target=self.trading_loop, daemon=True)
-            self.trading_thread.start()
-
-    def stop(self):
-        logger.info("시스템 종료 중…")
+    
+    def stop(self) -> None:
+        """시스템 안전 종료"""
+        print("\n" + "=" * 60)
+        print("🛑 시스템 종료 중...")
+        print("=" * 60)
+        
         self.is_running = False
-        try:
-            if self.real_trader:
-                self.real_trader.is_running = False
-                if hasattr(self.real_trader, "print_performance_summary"):
-                    self.real_trader.print_performance_summary()
-            self.monitor.generate_report()
-            if self.data_merger.merged_data is not None:
-                self.data_merger.save_merged_data(self.data_merger.merged_data)
-        except Exception:
-            logger.exception("종료 루틴 오류")
-        logger.info("시스템 종료 완료")
-
-    # ── 기타: 백테스트/옵티마이즈 ─────────────────────────────────────────────
-    def run_backtest(self, start_date: Optional[str] = None, end_date: Optional[str] = None):
-        logger.info("백테스팅 모드 시작")
-        if not self.initialize_system():
-            logger.error("시스템 초기화 실패")
-            return
-
-        hist = self.data_merger.load_price_data(
-            start_date=pd.to_datetime(start_date, utc=True) if start_date else None,
-            end_date=pd.to_datetime(end_date, utc=True) if end_date else None,
-        )
-        if hist.empty:
-            logger.error("백테스트용 가격 데이터 없음")
-            return
-
-        results = self.real_trader.backtest(hist, start_date, end_date)
-        if results is not None:
-            results.to_csv('backtest_results.csv', index=False)
-            logger.info("백테스트 결과 저장: backtest_results.csv")
-
-    def optimize_hyperparameters(self):
-        logger.info("하이퍼파라미터 최적화 시작")
-
-        X, y = self.data_merger.get_training_data(lookback_days=90)
-        if X is None or y is None:
-            logger.error("학습 데이터 준비 실패")
-            return
-
+        
+        # 1. 활성 포지션 정리
+        print("\n1️⃣  활성 포지션 정리")
+        if self.trader.active_positions:
+            print(f"  활성 포지션 {len(self.trader.active_positions)}개 발견")
+            # 실제 환경에서는 포지션 청산 필요
+            print("  ⚠️  포지션 수동 정리 필요")
+        else:
+            print("  ✅ 활성 포지션 없음")
+        
+        # 2. 상태 저장
+        print("\n2️⃣  상태 저장")
+        self.trader._save_filter_state()
+        print("  ✅ 필터 상태 저장 완료")
+        
+        # 3. 최종 리포트
+        print("\n3️⃣  최종 리포트")
+        self.generate_report()
+        
+        print("\n✅ 시스템 종료 완료")
+        print("=" * 60)
+    
+    def optimize_hyperparameters(self, lookback_days: int = 90) -> Dict:
+        """
+        하이퍼파라미터 최적화 (Grid Search)
+        
+        Args:
+            lookback_days: 학습 데이터 일수
+        
+        Returns:
+            최적 파라미터 딕셔너리
+        """
+        print("\n" + "=" * 60)
+        print("🔍 하이퍼파라미터 최적화 시작")
+        print("=" * 60)
+        
+        # 데이터 준비
+        print("\n📊 학습 데이터 준비")
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        
+        X, y = self.data_merger.create_retrain_dataset(start_date, end_date)
+        
+        if X.empty or y.empty:
+            print("❌ 데이터 준비 실패")
+            return {}
+        
+        print(f"  ✅ 데이터: X={X.shape}, y={y.shape}")
+        
+        # 파라미터 그리드
         param_grid = {
             'num_leaves': [31, 50, 70],
             'learning_rate': [0.01, 0.05, 0.1],
             'feature_fraction': [0.7, 0.8, 0.9],
             'bagging_fraction': [0.7, 0.8, 0.9],
+            'max_depth': [5, 7, 9]
         }
-
+        
+        print(f"\n🔎 탐색 공간:")
+        total_combinations = 1
+        for key, values in param_grid.items():
+            print(f"  - {key}: {values}")
+            total_combinations *= len(values)
+        
+        print(f"\n  총 조합: {total_combinations}개")
+        
+        # Grid Search
         best_params = None
         best_score = -1e9
-
-        for nl in param_grid['num_leaves']:
-            for lr in param_grid['learning_rate']:
-                for ff in param_grid['feature_fraction']:
-                    for bf in param_grid['bagging_fraction']:
-                        params = self.config.LGBM_PARAMS.copy()
-                        params.update({
-                            'num_leaves': nl,
-                            'learning_rate': lr,
-                            'feature_fraction': ff,
-                            'bagging_fraction': bf
-                        })
-
-                        temp_trainer = ModelTrainer(self.config)
-                        temp_trainer.config.LGBM_PARAMS = params
-
-                        try:
-                            # 시계열 피처 선택 + 앙상블 학습
-                            sel = temp_trainer.feature_selection_temporal(X, y, top_k=50)
-                            temp_trainer.selected_features = sel
-                            metrics = temp_trainer.train_ensemble_temporal(X, y)
-                            val_acc = metrics['validation']['accuracy']
-                        except Exception as e:
-                            logger.warning(f"파라미터 조합 실패: {e}")
-                            continue
-
-                        if val_acc > best_score:
-                            best_score = val_acc
-                            best_params = params
-                            logger.info(f"새 최적 파라미터: acc={val_acc:.4f} / {best_params}")
-
+        best_metrics = None
+        
+        print(f"\n⚙️  최적화 진행 중...")
+        
+        tested = 0
+        
+        for num_leaves in param_grid['num_leaves']:
+            for learning_rate in param_grid['learning_rate']:
+                for feature_fraction in param_grid['feature_fraction']:
+                    for bagging_fraction in param_grid['bagging_fraction']:
+                        for max_depth in param_grid['max_depth']:
+                            tested += 1
+                            
+                            # 파라미터 설정
+                            params = config.LIGHTGBM_PARAMS.copy()
+                            params.update({
+                                'num_leaves': num_leaves,
+                                'learning_rate': learning_rate,
+                                'feature_fraction': feature_fraction,
+                                'bagging_fraction': bagging_fraction,
+                                'max_depth': max_depth
+                            })
+                            
+                            try:
+                                # 임시 트레이너 생성
+                                temp_trainer = ModelTrainer()
+                                
+                                # 임시로 파라미터 변경
+                                original_params = config.LIGHTGBM_PARAMS.copy()
+                                config.LIGHTGBM_PARAMS = params
+                                
+                                # 학습
+                                if 'regime' in X.columns:
+                                    results = temp_trainer.train_ensemble_regime(
+                                        X, y, regime_col='regime', test_size=0.2
+                                    )
+                                else:
+                                    results = temp_trainer.train_single_model(
+                                        X, y, test_size=0.2
+                                    )
+                                
+                                # 원래 파라미터 복원
+                                config.LIGHTGBM_PARAMS = original_params
+                                
+                                # 평균 정확도 계산
+                                scores = [r.get('accuracy', 0) for r in results.values()]
+                                avg_score = sum(scores) / len(scores) if scores else 0
+                                
+                                # 최고 점수 갱신
+                                if avg_score > best_score:
+                                    best_score = avg_score
+                                    best_params = params
+                                    best_metrics = results
+                                    
+                                    print(f"\n  [{tested}/{total_combinations}] ✨ 신기록!")
+                                    print(f"    Accuracy: {avg_score:.4f}")
+                                    print(f"    Params: leaves={num_leaves}, lr={learning_rate}, "
+                                          f"feat={feature_fraction}, bag={bagging_fraction}, depth={max_depth}")
+                                
+                                elif tested % 10 == 0:
+                                    print(f"  [{tested}/{total_combinations}] 진행 중... (최고: {best_score:.4f})")
+                                
+                            except Exception as e:
+                                print(f"  [{tested}/{total_combinations}] ⚠️  실패: {e}")
+                                continue
+        
+        # 결과 출력
+        print("\n" + "=" * 60)
+        print("최적화 완료!")
+        print("=" * 60)
+        
         if best_params:
-            self.config.LGBM_PARAMS = best_params
-            if hasattr(self.config, 'save_config'):
-                try:
-                    self.config.save_config()
-                except Exception:
-                    pass
-            logger.info(f"최적 파라미터: {best_params} | 최고 검증 정확도: {best_score:.4f}")
+            print(f"\n🏆 최적 파라미터:")
+            for key, value in best_params.items():
+                print(f"  - {key}: {value}")
+            
+            print(f"\n📊 최고 성능:")
+            print(f"  - 평균 Accuracy: {best_score:.4f}")
+            
+            if best_metrics:
+                print(f"\n  레짐별 성능:")
+                for regime_name, metrics in best_metrics.items():
+                    print(f"    {regime_name}: {metrics.get('accuracy', 0):.4f}")
+            
+            # 설정 파일에 저장 (선택)
+            print(f"\n💾 최적 파라미터를 적용하시겠습니까? (y/n): ", end="")
+            # 자동으로 적용하지 않고 반환만
+            
         else:
-            logger.info("더 나은 파라미터를 찾지 못함")
+            print("\n❌ 더 나은 파라미터를 찾지 못했습니다.")
+        
+        print("\n" + "=" * 60)
+        
+        return best_params or {}
+    
+    def generate_simulation_data(self, days: int = 90) -> pd.DataFrame:
+        """
+        시뮬레이션 데이터 생성
+        
+        Args:
+            days: 생성할 일수
+        
+        Returns:
+            시뮬레이션 1분봉 데이터
+        """
+        print(f"\n📊 시뮬레이션 데이터 생성 ({days}일)")
+        
+        n_minutes = days * 1440  # 하루 1440분
+        
+        start_time = datetime.now(timezone.utc) - timedelta(days=days)
+        timestamps = [start_time + timedelta(minutes=i) for i in range(n_minutes)]
+        
+        # 랜덤 워크
+        np.random.seed(42)
+        base_price = 50000.0
+        returns = np.random.normal(0, 0.002, n_minutes)
+        prices = base_price * (1 + returns).cumprod()
+        
+        data = []
+        for i, ts in enumerate(timestamps):
+            close = prices[i]
+            open_price = close + np.random.uniform(-50, 50)
+            high = max(open_price, close) + np.random.uniform(0, 100)
+            low = min(open_price, close) - np.random.uniform(0, 100)
+            volume = np.random.uniform(1000, 5000)
+            
+            data.append({
+                'timestamp': ts,
+                'open': open_price,
+                'high': high,
+                'low': low,
+                'close': close,
+                'volume': volume
+            })
+        
+        df = pd.DataFrame(data)
+        
+        print(f"  ✅ 생성 완료: {len(df):,}개 데이터")
+        
+        return df
+    
+    def _signal_handler(self, signum, frame):
+        """시그널 핸들러 (Ctrl+C 등)"""
+        print(f"\n⚠️  시그널 수신: {signum}")
+        self.is_running = False
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CLI
-# ──────────────────────────────────────────────────────────────────────────────
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(description='바이너리 옵션 예측 시스템')
-    parser.add_argument('--mode', choices=['live', 'backtest', 'train', 'optimize'], default='live')
-    parser.add_argument('--start-date', type=str, help='시작 날짜 (YYYY-MM-DD)')
-    parser.add_argument('--end-date', type=str, help='종료 날짜 (YYYY-MM-DD)')
-    parser.add_argument('--config', type=str, help='설정 파일 경로(JSON)')
-
-    args = parser.parse_args()
-
-    # 커스텀 설정 적용
-    if args.config and os.path.exists(args.config):
-        with open(args.config, 'r', encoding='utf-8') as f:
-            custom = json.load(f)
-        for k, v in custom.items():
-            if hasattr(Config, k):
-                setattr(Config, k, v)
-
-    pipe = MainPipeline()
-
-    if args.mode == 'live':
-        pipe.start()
-
-    elif args.mode == 'backtest':
-        pipe.run_backtest(args.start_date, args.end_date)
-
-    elif args.mode == 'train':
-        if not pipe.initialize_system():
-            logger.error("시스템 초기화 실패")
-            return
-        data = pipe.fetch_initial_training_data()
-        if data is not None and not data.empty:
-            metrics = pipe.model_optimizer.initial_training(data)
-            logger.info("학습 완료")
-            for split, metric in metrics.items():
-                logger.info(f"{split}: {metric}")
-
-    elif args.mode == 'optimize':
-        pipe.optimize_hyperparameters()
-
-
+# ============================================================
+# 메인 실행
+# ============================================================
 if __name__ == "__main__":
-    main()
+    print("=" * 60)
+    print("바이너리 옵션 트레이딩 시스템")
+    print(f"버전: {config.SYSTEM_VERSION}")
+    print("=" * 60)
+    
+    # 파이프라인 초기화
+    pipeline = MainPipeline(symbol='BTCUSDT')
+    
+    # 시스템 시작
+    pipeline.start()

@@ -1,759 +1,471 @@
 """
-feature_engineer.py
-30분봉 기반 피처 엔지니어링 (전체 재작성)
-- 1분봉 → 30분봉 집계
-- 30분봉 close 시점에 판단
-- 다음 봉 open 진입 → close 만기 예측
-- 멀티타임프레임 레짐 (4h, 1h, 30min, 15min) - 1분봉 기준 계산
+피처 엔지니어링 - 30분 바이너리 옵션 전용
+버전: 1.3.1 (미래 데이터 누수 완전 제거)
+
+30분 바이너리 옵션 구조:
+- 진입 시점: N번째 봉 종료 직후 (예: 10:00:04)
+- 진입 가격: N+1번째 봉 open (예: 10:00:04 시점 가격)
+- 만기 시점: 진입 후 정확히 30분 (예: 10:30:04)
+- 정산 가격: N+1번째 봉 close (예: 10:30:00 종가)
+- 타겟: 정산 가격 > 진입 가격
 """
 
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone
-from config import Config
+from typing import Optional
+import warnings
+warnings.filterwarnings('ignore')
+
+import config
 from timeframe_manager import TimeframeManager
 
 
 class FeatureEngineer:
-    """피처 엔지니어링 (30분봉 기준, 미래 누출 방지)"""
+    """
+    30분봉 기반 피처 엔지니어링
+    - 테크니컬 지표 계산
+    - 멀티타임프레임 레짐 (4h, 1h, 15m)
+    - ADX 가중 레짐 점수
+    - 30분 바이너리 옵션 타겟 생성
+    - 미래 누수 완전 방지
+    """
     
     def __init__(self):
-        self.regime_timeframes = Config.REGIME_TIMEFRAMES
-        self.regime_weights = Config.REGIME_WEIGHTS
-        self.adx_threshold = Config.REGIME_ADX_THR
-        self.adx_window = Config.REGIME_ADX_WINDOW
+        """인자 없이 초기화 (Config 참조)"""
         self.tf_manager = TimeframeManager()
+        self.regime_timeframes = config.REGIME_TIMEFRAMES
+        self.regime_weights = config.REGIME_WEIGHTS
+        self.adx_threshold = config.ADX_THRESHOLD
+        self.regime_lookback = config.REGIME_LOOKBACK
     
-    # ==========================================
-    # ADX 계산
-    # ==========================================
+    def create_feature_pool(self, df_1m: pd.DataFrame, lookback_30m_bars: int = 100) -> pd.DataFrame:
+        """
+        1분봉 → 30분봉 집계 및 전체 피처 생성
+        
+        Args:
+            df_1m: 1분봉 데이터
+            lookback_30m_bars: 계산에 사용할 과거 30분봉 수
+        
+        Returns:
+            피처가 포함된 30분봉 데이터 (타겟 포함)
+        """
+        # 1분봉 → 30분봉 집계 (백테스트 모드: 완성된 봉만)
+        df_30m = self.tf_manager.aggregate_1m_to_30m(df_1m, realtime_safe=False)
+        
+        if df_30m.empty:
+            print("❌ 30분봉 집계 결과 없음")
+            return pd.DataFrame()
+        
+        if len(df_30m) < lookback_30m_bars:
+            print(f"❌ 30분봉 부족: {len(df_30m)} < {lookback_30m_bars}")
+            return pd.DataFrame()
+        
+        df = df_30m.copy()
+        
+        print(f"📊 30분봉 집계 완료: {len(df)}개")
+        
+        # 기본 테크니컬 지표 (과거 데이터만 사용)
+        df = self._add_moving_averages(df)
+        df = self._add_rsi(df)
+        df = self._add_macd(df)
+        df = self._add_bollinger_bands(df)
+        df = self._add_stochastic(df)
+        df = self._add_adx(df)
+        
+        # 멀티타임프레임 레짐 (과거 데이터만 사용)
+        df = self._add_multi_regime(df)
+        
+        # 레짐 점수 (ADX 가중)
+        df = self._calculate_regime_score(df)
+        
+        # 30분 바이너리 옵션 타겟 생성 (핵심!)
+        df = self._create_target_30m_binary(df)
+        
+        # 결측치 제거 (마지막 봉은 타겟이 NaN이므로 자동 제거됨)
+        initial_len = len(df)
+        df = df.dropna().reset_index(drop=True)
+        
+        if df.empty:
+            print(f"❌ 결측치 제거 후 데이터 없음 (초기: {initial_len}개)")
+            return pd.DataFrame()
+        
+        print(f"✅ 피처 생성 완료: {len(df)}개 (초기 {initial_len}개 → 결측 제거)")
+        
+        # 버전 정보 추가
+        df['feature_ver'] = config.FEATURE_VERSION
+        df['data_ver'] = config.DATA_VERSION
+        
+        return df
     
-    @staticmethod
-    def _compute_adx_core(high, low, close, window=14):
-        """ADX, +DI, -DI 계산 (핵심 로직)"""
-        # True Range 계산
-        tr1 = high - low
-        tr2 = (high - close.shift()).abs()
-        tr3 = (low - close.shift()).abs()
+    def _add_moving_averages(self, df: pd.DataFrame) -> pd.DataFrame:
+        """이동평균 추가 (과거 데이터만 사용)"""
+        df['ema_9'] = df['close'].ewm(span=9, adjust=False).mean()
+        df['ema_21'] = df['close'].ewm(span=21, adjust=False).mean()
+        df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
+        
+        df['sma_20'] = df['close'].rolling(window=20).mean()
+        df['sma_50'] = df['close'].rolling(window=50).mean()
+        df['sma_200'] = df['close'].rolling(window=200).mean()
+        
+        return df
+    
+    def _add_rsi(self, df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+        """RSI 추가"""
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        
+        rs = gain / loss
+        df['rsi_14'] = 100 - (100 / (1 + rs))
+        
+        return df
+    
+    def _add_macd(self, df: pd.DataFrame) -> pd.DataFrame:
+        """MACD 추가"""
+        ema_12 = df['close'].ewm(span=12, adjust=False).mean()
+        ema_26 = df['close'].ewm(span=26, adjust=False).mean()
+        
+        df['macd'] = ema_12 - ema_26
+        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+        df['macd_hist'] = df['macd'] - df['macd_signal']
+        
+        return df
+    
+    def _add_bollinger_bands(self, df: pd.DataFrame, period: int = 20, num_std: int = 2) -> pd.DataFrame:
+        """볼린저 밴드 추가"""
+        df['bb_middle'] = df['close'].rolling(window=period).mean()
+        bb_std = df['close'].rolling(window=period).std()
+        
+        df['bb_upper'] = df['bb_middle'] + (bb_std * num_std)
+        df['bb_lower'] = df['bb_middle'] - (bb_std * num_std)
+        df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
+        
+        return df
+    
+    def _add_stochastic(self, df: pd.DataFrame, k_period: int = 14, d_period: int = 3) -> pd.DataFrame:
+        """Stochastic 추가"""
+        low_min = df['low'].rolling(window=k_period).min()
+        high_max = df['high'].rolling(window=k_period).max()
+        
+        df['stoch_k'] = 100 * (df['close'] - low_min) / (high_max - low_min)
+        df['stoch_d'] = df['stoch_k'].rolling(window=d_period).mean()
+        
+        return df
+    
+    def _add_adx(self, df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+        """ADX 및 DI+/DI- 추가"""
+        high_diff = df['high'].diff()
+        low_diff = -df['low'].diff()
+        
+        tr1 = df['high'] - df['low']
+        tr2 = abs(df['high'] - df['close'].shift(1))
+        tr3 = abs(df['low'] - df['close'].shift(1))
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         
-        # Directional Movement
-        up_move = high.diff()
-        down_move = -low.diff()
+        atr = tr.rolling(window=period).mean()
         
-        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+        # DM+ / DM-
+        dm_plus = high_diff.where((high_diff > low_diff) & (high_diff > 0), 0)
+        dm_minus = low_diff.where((low_diff > high_diff) & (low_diff > 0), 0)
         
-        # Smoothing
-        alpha = 1.0 / window
-        atr = tr.ewm(alpha=alpha, adjust=False, min_periods=window).mean()
-        plus_dm_smooth = pd.Series(plus_dm, index=high.index).ewm(
-            alpha=alpha, adjust=False, min_periods=window
-        ).mean()
-        minus_dm_smooth = pd.Series(minus_dm, index=high.index).ewm(
-            alpha=alpha, adjust=False, min_periods=window
-        ).mean()
+        # Smoothed DM
+        dm_plus_smooth = dm_plus.rolling(window=period).mean()
+        dm_minus_smooth = dm_minus.rolling(window=period).mean()
         
-        # Directional Indicators
-        plus_di = 100.0 * (plus_dm_smooth / (atr + 1e-9))
-        minus_di = 100.0 * (minus_dm_smooth / (atr + 1e-9))
+        # DI+ / DI-
+        df['di_plus'] = 100 * (dm_plus_smooth / atr)
+        df['di_minus'] = 100 * (dm_minus_smooth / atr)
+        
+        # DX
+        di_sum = df['di_plus'] + df['di_minus']
+        di_diff = abs(df['di_plus'] - df['di_minus'])
+        dx = 100 * (di_diff / di_sum)
         
         # ADX
-        dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9)
-        adx = dx.ewm(alpha=alpha, adjust=False, min_periods=window).mean()
+        df['adx'] = dx.rolling(window=period).mean()
         
-        return plus_di, minus_di, adx
+        return df
     
-    # ==========================================
-    # 멀티타임프레임 레짐 (1분봉 기준 계산)
-    # ==========================================
-    
-    def compute_regime_single_tf(self, df_1m, timeframe='15min'):
+    def calculate_regime(self, df: pd.DataFrame, timeframe: str) -> pd.Series:
         """
-        단일 타임프레임 레짐 계산 (1분봉 기준)
+        단일 타임프레임 레짐 계산 (타임스탬프 기반 정렬)
         
-        Parameters:
-        -----------
-        df_1m : DataFrame
-            1분봉 데이터 (timestamp, open, high, low, close, volume)
-        timeframe : str
-            리샘플 타임프레임 ('4h', '1h', '30min', '15min')
+        Args:
+            df: 30분봉 데이터 (bar30_start 컬럼 필수)
+            timeframe: '4h', '1h', '15m'
         
         Returns:
-        --------
-        Series: 레짐 (-1: DOWN, 0: FLAT, 1: UP)
+            레짐 시리즈 (1: UP, -1: DOWN, 0: FLAT)
         """
-        df = df_1m.copy()
-        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
-        df = df.set_index('timestamp').sort_index()
+        # 해당 타임프레임으로 리샘플
+        df_tf = self.tf_manager.resample_to_timeframe(df, timeframe)
         
-        # 타임프레임 리샘플
-        ohlc = pd.DataFrame({
-            'open': df['open'].resample(timeframe).first(),
-            'high': df['high'].resample(timeframe).max(),
-            'low': df['low'].resample(timeframe).min(),
-            'close': df['close'].resample(timeframe).last(),
-            'volume': df['volume'].resample(timeframe).sum(),
-        }).dropna()
+        if df_tf.empty or len(df_tf) < self.regime_lookback.get(timeframe, 8):
+            return pd.Series(0, index=df.index)
         
-        if len(ohlc) < self.adx_window:
-            # 데이터 부족 시 FLAT 반환
-            return pd.Series(0, index=df.index, name=f'regime_{timeframe}')
+        # EMA 기반 추세 판단
+        lookback = self.regime_lookback.get(timeframe, 8)
+        ema_fast = df_tf['close'].ewm(span=max(lookback//2, 2), adjust=False).mean()
+        ema_slow = df_tf['close'].ewm(span=lookback, adjust=False).mean()
         
-        # ADX 계산
-        pdi, mdi, adx = self._compute_adx_core(
-            ohlc['high'], ohlc['low'], ohlc['close'], 
-            window=self.adx_window
-        )
+        # 레짐 결정
+        df_tf['regime'] = 0
+        df_tf.loc[ema_fast > ema_slow, 'regime'] = 1   # UP
+        df_tf.loc[ema_fast < ema_slow, 'regime'] = -1  # DOWN
         
-        # 레짐 판단
-        strong_trend = adx > self.adx_threshold
-        up_trend = pdi > mdi
+        # 30분봉에 매핑 (타임스탬프 기반 merge)
+        # df_tf의 시작 시각 컬럼 추출
+        tf_start_col = f'bar_{timeframe}_start'
+        if tf_start_col not in df_tf.columns:
+            # 첫 번째 datetime 컬럼 사용
+            datetime_cols = df_tf.select_dtypes(include=['datetime64']).columns
+            if len(datetime_cols) > 0:
+                tf_start_col = datetime_cols[0]
+            else:
+                return pd.Series(0, index=df.index)
         
-        regime = np.select(
-            [strong_trend & up_trend, strong_trend & ~up_trend],
-            [1, -1],
-            default=0
-        )
+        # 30분봉 각 행에 대해 해당하는 레짐 찾기 (forward fill)
+        df_30m_aligned = df[['bar30_start']].copy()
+        df_30m_aligned['regime'] = 0
         
-        regime_series = pd.Series(regime, index=ohlc.index, name=f'regime_{timeframe}')
+        df_tf_sorted = df_tf.sort_values(tf_start_col).reset_index(drop=True)
         
-        # 1분봉 타임프레임으로 forward fill
-        regime_reindexed = regime_series.reindex(df.index, method='ffill')
+        for idx, row in df_30m_aligned.iterrows():
+            bar_start = row['bar30_start']
+            
+            # 해당 시점 이전의 가장 최근 레짐 값 찾기 (forward fill)
+            mask = df_tf_sorted[tf_start_col] <= bar_start
+            if mask.any():
+                regime_val = df_tf_sorted[mask]['regime'].iloc[-1]
+                df_30m_aligned.at[idx, 'regime'] = regime_val
         
-        return regime_reindexed
+        return df_30m_aligned['regime']
     
-    def compute_multi_timeframe_regime(self, df_1m, target_30m_index):
-        """
-        멀티타임프레임 레짐 계산 (1분봉 → 30분봉 인덱스)
-        ✅ 4h, 1h, 30min, 15min 모두 계산
-        
-        Parameters:
-        -----------
-        df_1m : DataFrame
-            1분봉 원본 데이터
-        target_30m_index : Index or Series
-            목표 30분봉 인덱스 (bar30_start)
-        
-        Returns:
-        --------
-        DataFrame: 30분봉 인덱스 기준 레짐 정보
-        """
-        # 1분봉 인덱스 설정
-        df_1m_indexed = df_1m.copy()
-        df_1m_indexed['timestamp'] = pd.to_datetime(df_1m_indexed['timestamp'], utc=True)
-        df_1m_indexed = df_1m_indexed.set_index('timestamp').sort_index()
-        
-        # 30분봉 타임스탬프 생성
-        if isinstance(target_30m_index, pd.Series):
-            bar30_timestamps = pd.to_datetime(target_30m_index.values, utc=True)
-        else:
-            bar30_timestamps = pd.to_datetime(target_30m_index, utc=True)
-        
-        result = pd.DataFrame(index=range(len(bar30_timestamps)))
-        
-        # 주말 체크
-        result['is_weekend'] = bar30_timestamps.dayofweek.isin([5, 6]).astype(int)
+    def _add_multi_regime(self, df: pd.DataFrame) -> pd.DataFrame:
+        """멀티타임프레임 레짐 추가"""
+        print(f"🔄 멀티타임프레임 레짐 계산 중... ({self.regime_timeframes})")
         
         # 각 타임프레임별 레짐 계산
-        regime_scores = []
-        regime_diagnostics = {}  # 진단용
+        df['regime_4h'] = self.calculate_regime(df, '4h')
+        df['regime_1h'] = self.calculate_regime(df, '1h')
+        df['regime_15m'] = self.calculate_regime(df, '15m')
         
-        print("  멀티타임프레임 레짐 계산:")
-        
-        for tf in self.regime_timeframes:
-            print(f"    - {tf} 레짐 계산 중...", end=' ')
-            
-            # 1분봉에서 직접 타임프레임별 레짐 계산
-            regime_1m = self.compute_regime_single_tf(df_1m, tf)
-            
-            # 30분봉 시작 시각으로 매핑
-            regime_30m = []
-            valid_count = 0
-
-            # 벡터화된 매핑 처리
-            regime_1m = self.compute_regime_single_tf(df_1m, tf)
-
-            # 30분봉 타임스탬프 기준으로 forward-fill 매핑
-            mapped = regime_1m.reindex(pd.to_datetime(bar30_timestamps, utc=True), method='ffill')
-
-            # NaN 방어
-            mapped = mapped.fillna(0)
-
-            # numpy 변환 후 결과 저장
-            regime_30m = mapped.to_numpy()
-            result[f'regime_{tf}'] = regime_30m
-
-            # 진단용 통계 (기존 valid_count 계산 대체)
-            valid_count = np.count_nonzero(~np.isnan(regime_30m))
-            total_count = len(regime_30m)
-            valid_pct = (valid_count / total_count) * 100 if total_count > 0 else 0
-            regime_diagnostics[tf] = (valid_count, total_count, valid_pct)
-            print(f"✓ ({valid_pct:.1f}% 유효)")
-            
-            # 가중치 적용
-            weight = self.regime_weights.get(tf, 0)
-            regime_scores.append(np.array(regime_30m) * weight)
-        
-        # 가중 평균 점수
-        result['regime_score'] = np.sum(regime_scores, axis=0)
-        
-        # 최종 레짐 결정
-        threshold = 0.3
-        result['regime_final'] = np.select(
-            [result['regime_score'] > threshold, result['regime_score'] < -threshold],
-            [1, -1],
-            default=0
+        # 가중 합산
+        df['regime_final'] = (
+            df['regime_4h'] * self.regime_weights['4h'] +
+            df['regime_1h'] * self.regime_weights['1h'] +
+            df['regime_15m'] * self.regime_weights['15m']
         )
         
-        # ✅ 진단 출력
-        self._print_regime_diagnostics(regime_diagnostics, result)
+        # 최종 레짐 (반올림)
+        df['regime'] = df['regime_final'].apply(lambda x: 1 if x > 0.3 else (-1 if x < -0.3 else 0))
         
-        return result
+        return df
     
-    @staticmethod
-    def _print_regime_diagnostics(diagnostics: dict, result: pd.DataFrame):
-        """
-        ✅ 레짐 진단 로그 출력
-        """
-        print("\n[레짐 진단]")
-        
-        # 타임프레임별 유효율
-        for tf, (valid, total, pct) in diagnostics.items():
-            print(f"  {tf:6s}: {valid:5d}/{total:5d}개 ({pct:5.1f}% 유효)")
-        
-        # 최종 레짐 분포
-        if 'regime_final' in result.columns:
-            regime_data = result['regime_final']
-            regime_dist = regime_data.value_counts().sort_index()
+    def _calculate_regime_score(self, df: pd.DataFrame) -> pd.DataFrame:
+        """ADX 가중 레짐 점수 계산"""
+        if 'regime_final' in df.columns and 'adx' in df.columns:
+            # ADX를 0-1 범위로 정규화
+            adx_norm = df['adx'] / 100.0
+            adx_norm = adx_norm.clip(0, 1)
             
-            print(f"\n  최종 레짐 분포:")
-            regime_labels = {1: "UP 🟢", -1: "DOWN 🔴", 0: "FLAT ⚪"}
-            total = len(regime_data)
-            
-            for val in [1, 0, -1]:
-                count = regime_dist.get(val, 0)
-                label = regime_labels.get(val, f"REGIME-{val}")
-                pct = (count / total) * 100 if total > 0 else 0
-                print(f"    {label:12s}: {count:5d}개 ({pct:5.1f}%)")
-        
-        # 레짐 스코어 통계
-        if 'regime_score' in result.columns:
-            score_mean = result['regime_score'].mean()
-            score_std = result['regime_score'].std()
-            score_min = result['regime_score'].min()
-            score_max = result['regime_score'].max()
-            print(f"\n  레짐 스코어:")
-            print(f"    평균={score_mean:+.3f}, 표준편차={score_std:.3f}")
-            print(f"    범위=[{score_min:+.3f}, {score_max:+.3f}]")
-        
-        print()
-    
-    # ==========================================
-    # 30분봉 피처 생성
-    # ==========================================
-    
-    def create_feature_pool(self, df_1m, lookback_bars=100):
-        """
-        30분봉 기반 피처 풀 생성
-        
-        Parameters:
-        -----------
-        df_1m : DataFrame
-            1분봉 원본 데이터
-        lookback_bars : int
-            초기 룩백 제거 (30분봉 기준)
-        
-        Returns:
-        --------
-        DataFrame: 30분봉 피처 데이터프레임
-        """
-        # ======================================
-        # 1. 1분봉 → 30분봉 집계
-        # ======================================
-        print("1분봉 → 30분봉 집계 중...")
-        df_30m = self.tf_manager.aggregate_1m_to_30m(df_1m)
-
-        # TimeframeManager 반환값 확인 및 보정
-        if 'bar30_start' not in df_30m.columns:
-            df_30m = df_30m.reset_index()
-        if 'index' in df_30m.columns:
-            df_30m = df_30m.rename(columns={'index': 'bar30_start'})
-
-        if 'bar30_end' not in df_30m.columns:
-            df_30m['bar30_end'] = pd.to_datetime(df_30m['bar30_start'], utc=True) + pd.Timedelta(minutes=30)
-            
-        print(f"✓ 30분봉 생성: {len(df_30m):,}개 바")
-        
-        # ======================================
-        # 2. 피처 DataFrame 초기화
-        # ======================================
-
-        features = pd.DataFrame()
-        features['bar30_start'] = df_30m['bar30_start'].values
-        features['bar30_end'] = df_30m['bar30_end'].values
-        features['timestamp'] = df_30m['bar30_start'].values
-        
-        # m1_index 계산
-        if 'm1_index_entry' in df_30m.columns:
-            features['m1_index_entry'] = df_30m['m1_index_entry'].values
+            # 레짐 점수 = 레짐 방향 × ADX 신뢰도
+            df['regime_score'] = df['regime_final'] * adx_norm
         else:
-            features['m1_index_entry'] = (
-                pd.to_datetime(df_30m['bar30_end'], utc=True).astype('int64') // 10**9 // 60
-            ).astype('int64').values
-
-        if 'm1_index_label' in df_30m.columns:
-            features['m1_index_label'] = df_30m['m1_index_label'].values
-        else:
-            features['m1_index_label'] = (
-                (pd.to_datetime(df_30m['bar30_end'], utc=True) + pd.Timedelta(minutes=30)).astype('int64') // 10**9 // 60
-            ).astype('int64').values
+            df['regime_score'] = 0.0
         
-        # ======================================
-        # 3. 과거 캔들 (shift로 미래 누수 방지)
-        # ======================================
-        features['prev_open'] = df_30m['open'].shift(1).values
-        features['prev_high'] = df_30m['high'].shift(1).values
-        features['prev_low'] = df_30m['low'].shift(1).values
-        features['prev_close'] = df_30m['close'].shift(1).values
-        features['prev_volume'] = df_30m['volume'].shift(1).values
-        
-        # ======================================
-        # 4. 수익률 (30분봉 기준)
-        # ======================================
-        sc = df_30m['close'].shift(1)
-        for period in [1, 2, 3, 5, 10, 20]:
-            features[f'return_{period}'] = (sc / df_30m['close'].shift(period + 1) - 1).values
-        
-        # ======================================
-        # 5. 거래량 변화 (30분봉 기준)
-        # ======================================
-        sv = df_30m['volume'].shift(1)
-        for period in [1, 2, 3, 5, 10]:
-            features[f'volume_change_{period}'] = (
-                sv / df_30m['volume'].shift(period + 1) - 1
-            ).values
-        
-        # ======================================
-        # 6. 이동평균 (30분봉 기준)
-        # ======================================
-        for period in [5, 10, 20, 50, 100]:
-            ma = sc.rolling(window=period, min_periods=period).mean()
-            features[f'ma_{period}'] = ma.values
-            features[f'price_to_ma_{period}'] = (sc / (ma + 1e-9) - 1).values
-            features[f'ma_{period}_slope'] = (ma.diff(3) / (ma.shift(3) + 1e-9)).values
-        
-        # ======================================
-        # 7. EMA (30분봉 기준)
-        # ======================================
-        for period in [12, 26, 50]:
-            ema = sc.ewm(span=period, adjust=False, min_periods=period).mean()
-            features[f'ema_{period}'] = ema.values
-            features[f'price_to_ema_{period}'] = (sc / (ema + 1e-9) - 1).values
-        
-        # ======================================
-        # 8. 볼린저 밴드 (30분봉 기준)
-        # ======================================
-        for period in [20, 50]:
-            ma = sc.rolling(window=period, min_periods=period).mean()
-            std = sc.rolling(window=period, min_periods=period).std()
-            upper = ma + 2 * std
-            lower = ma - 2 * std
-            features[f'bb_upper_{period}'] = upper.values
-            features[f'bb_lower_{period}'] = lower.values
-            features[f'bb_width_{period}'] = (4 * std / (ma + 1e-9)).values
-            features[f'bb_position_{period}'] = ((sc - lower) / ((upper - lower) + 1e-9)).values
-        
-        # ======================================
-        # 9. RSI (30분봉 기준)
-        # ======================================
-        for period in [14, 28]:
-            delta = sc.diff()
-            gain = delta.where(delta > 0, 0).rolling(window=period, min_periods=period).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=period, min_periods=period).mean()
-            rs = gain / (loss + 1e-9)
-            features[f'rsi_{period}'] = (100 - (100 / (1 + rs))).values
-        
-        # ======================================
-        # 10. MACD (30분봉 기준)
-        # ======================================
-        ema12 = sc.ewm(span=12, adjust=False, min_periods=12).mean()
-        ema26 = sc.ewm(span=26, adjust=False, min_periods=26).mean()
-        macd = ema12 - ema26
-        signal = macd.ewm(span=9, adjust=False, min_periods=9).mean()
-        features['macd'] = macd.values
-        features['macd_signal'] = signal.values
-        features['macd_histogram'] = (macd - signal).values
-        
-        # ======================================
-        # 11. Stochastic (30분봉 기준)
-        # ======================================
-        for period in [14]:
-            sh = df_30m['high'].shift(1)
-            sl = df_30m['low'].shift(1)
-            low_min = sl.rolling(window=period, min_periods=period).min()
-            high_max = sh.rolling(window=period, min_periods=period).max()
-            features[f'stoch_{period}'] = (
-                (sc - low_min) / ((high_max - low_min) + 1e-9) * 100
-            ).values
-        
-        # ======================================
-        # 12. ATR (30분봉 기준)
-        # ======================================
-        for period in [14, 28]:
-            sh = df_30m['high'].shift(1)
-            sl = df_30m['low'].shift(1)
-            sc_prev = df_30m['close'].shift(2)
-            tr = pd.concat([
-                sh - sl,
-                (sh - sc_prev).abs(),
-                (sl - sc_prev).abs()
-            ], axis=1).max(axis=1)
-            atr = tr.rolling(window=period, min_periods=period).mean()
-            features[f'atr_{period}'] = atr.values
-            features[f'atr_ratio_{period}'] = (atr / (sc + 1e-9)).values
-        
-        # ======================================
-        # 13. 거래량 피처 (30분봉 기준)
-        # ======================================
-        features['volume_sma_10'] = sv.rolling(window=10, min_periods=10).mean().values
-        features['volume_sma_50'] = sv.rolling(window=50, min_periods=50).mean().values
-        features['volume_ratio'] = (sv / (features['volume_sma_10'] + 1e-9)).values
-        features['volume_trend'] = (features['volume_sma_10'] / (features['volume_sma_50'] + 1e-9)).values
-        
-        # OBV
-        price_diff = df_30m['close'].diff().shift(1)
-        obv = (np.sign(price_diff) * sv).cumsum()
-        features['obv'] = obv.values
-        features['obv_ema'] = obv.ewm(span=20, adjust=False, min_periods=20).mean().values
-        features['obv_signal'] = (obv / (features['obv_ema'] + 1e-9) - 1).values
-
-        # ======================================
-        # 14. 캔들 패턴 (30분봉 기준)
-        # ======================================
-        po = df_30m['open'].shift(1)
-        pc = df_30m['close'].shift(1)
-        ph = df_30m['high'].shift(1)
-        pl = df_30m['low'].shift(1)
-        
-        features['body_size'] = ((pc - po).abs() / (po + 1e-9)).values
-        features['upper_shadow'] = ((ph - pd.concat([po, pc], axis=1).max(axis=1)) / (po + 1e-9)).values
-        features['lower_shadow'] = ((pd.concat([po, pc], axis=1).min(axis=1) - pl) / (po + 1e-9)).values
-        features['body_position'] = ((pc - po) / ((ph - pl) + 1e-9)).values
-        
-        for i in range(1, 4):
-            features[f'candle_direction_{i}'] = np.sign(
-                df_30m['close'].shift(i) - df_30m['open'].shift(i)
-            ).values
-            features[f'candle_size_{i}'] = (
-                (df_30m['high'].shift(i) - df_30m['low'].shift(i)) / 
-                (df_30m['close'].shift(i) + 1e-9)
-            ).values
-        
-        # ======================================
-        # 15. 시간 피처
-        # ======================================
-        dt = pd.to_datetime(df_30m['bar30_start'], utc=True)
-        features['hour'] = dt.dt.hour.values
-        features['minute'] = dt.dt.minute.values
-        features['day_of_week'] = dt.dt.dayofweek.values
-        features['day_of_month'] = dt.dt.day.values
-
-        # 순환 인코딩
-        features['hour_sin'] = np.sin(2 * np.pi * features['hour'] / 24.0)
-        features['hour_cos'] = np.cos(2 * np.pi * features['hour'] / 24.0)
-        features['dow_sin'] = np.sin(2 * np.pi * features['day_of_week'] / 7.0)
-        features['dow_cos'] = np.cos(2 * np.pi * features['day_of_week'] / 7.0)
-        
-        # ======================================
-        # 16. 마이크로구조 (30분봉 기준)
-        # ======================================
-        for period in [3, 5, 10]:
-            sh = df_30m['high'].shift(1)
-            sl = df_30m['low'].shift(1)
-            features[f'high_low_ratio_{period}'] = (
-                (sh / (sl + 1e-9) - 1).rolling(period, min_periods=period).mean()
-            ).values
-            features[f'close_position_{period}'] = (
-                ((sc - sl) / ((sh - sl) + 1e-9)).rolling(period, min_periods=period).mean()
-            ).values
-        
-        # ======================================
-        # 17. 추세 강도 (30분봉 기준)
-        # ======================================
-        for period in [10, 20, 50]:
-            ma = sc.rolling(window=period, min_periods=period).mean()
-            above = (sc > ma).astype(int)
-            features[f'trend_strength_{period}'] = above.rolling(
-                window=period, min_periods=period
-            ).mean().values
-        
-        # ======================================
-        # 18. 변동성 (30분봉 기준)
-        # ======================================
-        for period in [10, 30]:
-            returns = sc.pct_change()
-            vol_short = returns.rolling(window=period, min_periods=period).std()
-            vol_long = returns.rolling(window=period * 3, min_periods=period * 3).std()
-            
-            features[f'volatility_{period}'] = vol_short.values
-            features[f'volatility_ratio_{period}'] = (vol_short / (vol_long + 1e-9)).values
-        
-        # ======================================
-        # 19. DI / ADX (30분봉 기준)
-        # ======================================
-        pdi, mdi, adx = self._compute_adx_core(
-            df_30m['high'], df_30m['low'], df_30m['close'], 
-            window=self.adx_window
-        )
-        features['di_plus_14'] = pdi.shift(1).values
-        features['di_minus_14'] = mdi.shift(1).values
-        features['adx_14'] = adx.shift(1).values
-        
-        # ======================================
-        # 20. 멀티타임프레임 레짐 (1분봉 기준)
-        # ======================================
-        print("\n멀티타임프레임 레짐 계산 시작...")
-        
-        # 1분봉 전달, 30분봉 인덱스 기준으로 매핑
-        regime_df = self.compute_multi_timeframe_regime(df_1m, df_30m['bar30_start'])
-        
-        # ======================================
-        # 21. 통합 및 정리
-        # ======================================
-        # lookback 제거
-        features = features.iloc[lookback_bars:].copy().reset_index(drop=True)
-        regime_df = regime_df.iloc[lookback_bars:].copy().reset_index(drop=True)
-
-        # 길이 맞추기
-        min_len = min(len(features), len(regime_df))
-        if len(features) != len(regime_df):
-            print(f"⚠️ 길이 불일치: features={len(features)}, regime={len(regime_df)} → {min_len}으로 조정")
-            features = features.iloc[:min_len].copy()
-            regime_df = regime_df.iloc[:min_len].copy()
-
-        # 안전한 concat
-        features = pd.concat([features, regime_df], axis=1)
-        
-        # regime 컬럼 추가 (모델 학습용)
-        features['regime'] = features['regime_final'].astype('int16')
-
-        # ✅ NaN 처리 (pandas 2.0 호환)
-        nan_count = features.isna().sum().sum()
-        if nan_count > 0:
-            print(f"⚠️ NaN: {nan_count}개 → forward fill")
-            features = features.ffill().fillna(0)
-        
-        print(f"\n✓ 피처 생성 완료: {len(features):,}개 바, {len(features.columns)}개 피처")
-        
-        return features
+        return df
     
-    # ==========================================
-    # 라벨 생성
-    # ==========================================
-    
-    @staticmethod
-    def create_target_30m(df_30m):
+    def _create_target_30m_binary(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        라벨 생성 (30분봉 기준)
-        현재 봉 close 시점에서 다음 봉 예측
+        30분 바이너리 옵션 타겟 생성
         
-        Parameters:
-        -----------
-        df_30m : DataFrame
-            30분봉 데이터 (open, close 컬럼 필요)
+        타임라인:
+        [봉 N]           [봉 N+1]
+        09:30~10:00      10:00~10:30
+        |                |        |
+        피처 계산        진입     만기
+        (과거 데이터)    (open)   (close)
+        
+        - N번째 봉: 피처 계산에만 사용 (학습용)
+        - N+1번째 봉: 실제 진입/정산
+          - 진입 시점: 10:00:04초 (N+1 봉 시작 직후)
+          - 진입 가격: N+1 봉 open
+          - 만기 시점: 10:30:04초 (진입 후 정확히 30분)
+          - 정산 가격: N+1 봉 close
+        - 타겟: N+1 봉의 (close > open) 여부
         
         Returns:
-        --------
-        Series: 1 (다음 봉 양봉), 0 (다음 봉 음봉)
+            df with 'target' column
         """
-        # 다음 봉의 open (= 현재 봉 close 시점의 미래 가격)
-        next_open = df_30m['open'].shift(-1)
-        # 다음 봉의 close
-        next_close = df_30m['close'].shift(-1)
+        # 30분 바이너리: 같은 봉의 close가 open보다 높은가?
+        df['target_raw'] = (df['close'] > df['open']).astype(int)
         
-        # 다음 봉이 양봉이면 1, 음봉이면 0
-        return (next_close > next_open).astype(int)
+        # 미래 누수 방지: N번째 봉에서 N+1번째 결과를 예측
+        # N번째 피처 → N+1번째 타겟
+        df['target'] = df['target_raw'].shift(-1)
+        
+        # 임시 컬럼 제거
+        df = df.drop(['target_raw'], axis=1)
+        
+        return df
     
-    # ==========================================
-    # 미래 누수 검증
-    # ==========================================
-    
-    @staticmethod
-    def validate_no_future_leak(features, target):
-        """
-        미래 데이터 누출 검증
-        
-        Parameters:
-        -----------
-        features : DataFrame
-        target : Series
-        
-        Returns:
-        --------
-        bool: True (문제 없음), False (누출 의심)
-        """
-        issues = []
+    def get_feature_names(self, df: pd.DataFrame) -> list:
+        """학습에 사용할 피처 이름 반환"""
         exclude_cols = [
-            'bar30_start', 'bar30_end', 'm1_index_entry', 'm1_index_label',
-            'timestamp', 'regime', 'regime_final', 'is_weekend'
+            'bar30_start', 'bar30_end', 'target',
+            'feature_ver', 'data_ver', 'timestamp',
+            'open', 'high', 'low', 'close', 'volume'  # OHLCV는 제외 (피처에서 파생된 지표만 사용)
         ]
-        for col in features.columns:
-            if col in exclude_cols:
-                continue
-            
-            try:
-                corr = features[col].corr(target)
-                if pd.notna(corr) and abs(corr) > 0.95:
-                    issues.append(f"{col}: {corr:.3f}")
-            except:
-                continue
         
-        if issues:
-            print("⚠️ 미래 데이터 누출 의심:")
-            for it in issues:
-                print(f"  - {it}")
-            return False
+        feature_cols = [col for col in df.columns if col not in exclude_cols]
         
-        print("✓ 미래 누수 검증 통과")
-        return True
+        return feature_cols
+    
+    def validate_features(self, df: pd.DataFrame) -> tuple:
+        """피처 품질 검증"""
+        errors = []
+        warnings_list = []
+        
+        # 1. 타겟 존재 여부
+        if 'target' not in df.columns:
+            errors.append("타겟 컬럼 없음")
+        
+        # 2. 타겟 분포 체크
+        if 'target' in df.columns:
+            target_ratio = df['target'].mean()
+            if target_ratio < 0.40 or target_ratio > 0.60:
+                warnings_list.append(f"타겟 불균형: UP={target_ratio:.2%} (40~60% 권장)")
+        
+        # 3. 필수 피처 체크
+        required_features = ['regime', 'regime_score', 'adx', 'rsi_14', 'macd']
+        missing_features = [f for f in required_features if f not in df.columns]
+        if missing_features:
+            errors.append(f"필수 피처 누락: {missing_features}")
+        
+        # 4. NaN 체크
+        nan_counts = df.isnull().sum()
+        if nan_counts.sum() > 0:
+            warnings_list.append(f"결측치 존재: {nan_counts[nan_counts > 0].to_dict()}")
+        
+        # 5. Inf 체크
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        inf_counts = np.isinf(df[numeric_cols]).sum()
+        if inf_counts.sum() > 0:
+            errors.append(f"무한대 존재: {inf_counts[inf_counts > 0].to_dict()}")
+        
+        return (len(errors) == 0, errors, warnings_list)
 
 
-# ==========================================
-# 테스트
-# ==========================================
+# ============================================================
+# 테스트 및 검증
+# ============================================================
 if __name__ == "__main__":
-    from config import Config
+    print("=" * 60)
+    print("FeatureEngineer 테스트 (v1.3.1 - 30분 바이너리 옵션)")
+    print("=" * 60)
     
-    Config.create_directories()
+    # 테스트 데이터 생성 (3일치)
+    from datetime import datetime, timedelta
     
-    # 샘플 데이터 생성 (1분봉)
-    print("="*60)
-    print("FeatureEngineer 테스트 - 멀티타임프레임 (4h, 1h, 30min, 15min)")
-    print("="*60)
+    start_time = pd.Timestamp('2025-01-01 00:00:00', tz='UTC')
+    n_minutes = 4320  # 3일 = 4320분
     
-    print("\n샘플 1분봉 데이터 생성...")
-    periods = 10000  # 약 7일
-    ts = pd.date_range(
-        end=datetime.now(timezone.utc), 
-        periods=periods, 
-        freq='1min', 
-        tz='UTC'
-    )
+    timestamps = [start_time + pd.Timedelta(minutes=i) for i in range(n_minutes)]
     
+    # 랜덤 워크 시뮬레이션
     np.random.seed(42)
-    base = 42000 + np.random.randn(periods).cumsum() * 20
+    price = 50000
+    prices = [price]
     
-    rows = []
-    for i, t in enumerate(ts):
-        b = base[i]
-        o = b + np.random.uniform(-20, 20)
-        c = b + np.random.uniform(-20, 20)
-        h = max(o, c) + np.random.uniform(0, 30)
-        l = min(o, c) - np.random.uniform(0, 30)
-        v = np.random.uniform(100, 1000)
-        rows.append({
-            'timestamp': t, 
-            'open': o, 
-            'high': h, 
-            'low': l, 
-            'close': c, 
-            'volume': v
-        })
+    for _ in range(n_minutes - 1):
+        change = np.random.normal(0, 100)
+        price = max(price + change, 45000)  # 하한선
+        prices.append(price)
     
-    df_1m = pd.DataFrame(rows)
-    print(f"✓ 1분봉: {len(df_1m):,}개")
+    df_1m_test = pd.DataFrame({
+        'timestamp': timestamps,
+        'close': prices
+    })
     
-    # 피처 생성 (30분봉 기준)
-    print("\n[1] 피처 생성")
+    # OHLC 생성
+    df_1m_test['open'] = df_1m_test['close'].shift(1).fillna(df_1m_test['close'])
+    df_1m_test['high'] = df_1m_test[['open', 'close']].max(axis=1) * 1.002
+    df_1m_test['low'] = df_1m_test[['open', 'close']].min(axis=1) * 0.998
+    df_1m_test['volume'] = np.random.uniform(1000, 5000, n_minutes)
+    
+    # FeatureEngineer 초기화
     fe = FeatureEngineer()
-    features = fe.create_feature_pool(df_1m, lookback_bars=100)
     
-    print(f"\n[2] 30분봉 피처 샘플:")
-    display_cols = ['bar30_start', 'bar30_end', 'prev_close', 'ma_20', 'regime']
-    if all(c in features.columns for c in display_cols):
-        print(features[display_cols].head())
+    print("\n✅ FeatureEngineer 초기화 성공")
+    print(f"  - 레짐 타임프레임: {fe.regime_timeframes}")
+    print(f"  - 레짐 가중치: {fe.regime_weights}")
+    print(f"  - ADX 임계값: {fe.adx_threshold}")
+    print(f"  - 레짐 룩백: {fe.regime_lookback}")
     
-    print(f"\n[3] 레짐 분포:")
-    if 'regime' in features.columns:
-        regime_dist = features['regime'].value_counts().sort_index()
-        regime_labels = {1: "UP 🟢", -1: "DOWN 🔴", 0: "FLAT ⚪"}
-        for val, count in regime_dist.items():
-            label = regime_labels.get(val, f"REGIME-{val}")
-            pct = (count / len(features)) * 100
-            print(f"  {label:12s}: {count:5d}개 ({pct:5.1f}%)")
+    # 피처 생성
+    print("\n📊 피처 생성 테스트")
+    print(f"  입력: {len(df_1m_test):,}개 1분봉")
     
-    print(f"\n[4] 타임프레임별 레짐:")
-    regime_tf_cols = [c for c in features.columns if c.startswith('regime_') and c != 'regime_final']
-    for col in regime_tf_cols:
-        valid = features[col].notna().sum()
-        valid_pct = (valid / len(features)) * 100
-        print(f"  {col:15s}: {valid_pct:5.1f}% 유효")
+    df_features = fe.create_feature_pool(df_1m_test, lookback_30m_bars=100)
     
-    print(f"\n[5] 주말 비율:")
-    if 'is_weekend' in features.columns:
-        weekend_count = features['is_weekend'].sum()
-        weekend_pct = (weekend_count / len(features)) * 100
-        print(f"  주말: {weekend_count:5d}개 ({weekend_pct:5.1f}%)")
+    if not df_features.empty:
+        print(f"  출력: {len(df_features)}개 30분봉 + 피처")
+        print(f"  피처 수: {len(fe.get_feature_names(df_features))}개")
+        
+        # 피처 목록
+        print("\n📋 생성된 피처 목록:")
+        feature_names = fe.get_feature_names(df_features)
+        for i, name in enumerate(feature_names, 1):
+            print(f"  {i:2d}. {name}")
+        
+        # 샘플 데이터 (타겟 정합성 확인)
+        print("\n📈 샘플 데이터 (타겟 정합성 확인):")
+        sample_cols = ['bar30_start', 'open', 'close', 'regime', 'adx', 'rsi_14', 'target']
+        sample_df = df_features[sample_cols].tail(5)
+        
+        # 타겟 계산 검증
+        for idx, row in sample_df.iterrows():
+            manual_target = 1 if row['close'] > row['open'] else 0
+            print(f"  [{row['bar30_start']}]")
+            print(f"    open={row['open']:.2f}, close={row['close']:.2f}")
+            print(f"    실제 타겟={row['target']}, 검증={manual_target}")
+        
+        # 레짐 분포
+        print("\n🎯 레짐 분포:")
+        regime_counts = df_features['regime'].value_counts().sort_index()
+        for regime, count in regime_counts.items():
+            regime_name = {1: 'UP', 0: 'FLAT', -1: 'DOWN'}.get(regime, 'UNKNOWN')
+            pct = count / len(df_features) * 100
+            print(f"  {regime_name:5s} ({regime:2d}): {count:4d}개 ({pct:5.1f}%)")
+        
+        # 타겟 분포
+        print("\n🎲 타겟 분포 (30분 바이너리 옵션):")
+        target_counts = df_features['target'].value_counts().sort_index()
+        for target, count in target_counts.items():
+            target_name = {1: 'UP (close > open)', 0: 'DOWN (close <= open)'}.get(target, 'UNKNOWN')
+            pct = count / len(df_features) * 100
+            print(f"  {target_name}: {count:4d}개 ({pct:5.1f}%)")
+        
+        # 데이터 품질 검증
+        print("\n🔍 피처 품질 검증:")
+        valid, errors, warnings_list = fe.validate_features(df_features)
+        
+        if valid:
+            print("  ✅ 검증 통과")
+        else:
+            print("  ❌ 오류 발견:")
+            for error in errors:
+                print(f"    - {error}")
+        
+        if warnings_list:
+            print("  ⚠️  경고:")
+            for warning in warnings_list:
+                print(f"    - {warning}")
+        
+    else:
+        print("  ❌ 피처 생성 실패")
     
-    # 라벨 생성
-    print("\n[6] 타겟 생성")
-    tf_manager = TimeframeManager()
-    df_30m = tf_manager.aggregate_1m_to_30m(df_1m)
-    target = fe.create_target_30m(df_30m)
-
-    # lookback 맞추기
-    target_aligned = target.iloc[100:].reset_index(drop=True)
-
-    # 길이 맞추기
-    min_len = min(len(features), len(target_aligned))
-    features_valid = features.iloc[:min_len].copy()
-    target_valid = target_aligned.iloc[:min_len].copy()
-
-    # 유효 데이터만 (NaN 제거)
-    valid_mask = target_valid.notna()
-    features_final = features_valid[valid_mask].reset_index(drop=True)
-    target_final = target_valid[valid_mask].reset_index(drop=True)
-    
-    print(f"\n[7] 최종 데이터:")
-    print(f"  Features: {len(features_final):,}개 바 × {len(features_final.columns)}개 컬럼")
-    print(f"  Target:   {len(target_final):,}개")
-    if len(target_final) > 0:
-        target_dist = target_final.value_counts().to_dict()
-        print(f"  Target 분포: {target_dist}")
-        if 0 in target_dist and 1 in target_dist:
-            balance = min(target_dist[0], target_dist[1]) / max(target_dist[0], target_dist[1])
-            print(f"  클래스 균형: {balance:.2%}")
-
-    # 미래 누수 검증
-    print("\n[8] 미래 누수 검증:")
-    if len(features_final) > 0 and len(target_final) > 0:
-        fe.validate_no_future_leak(features_final, target_final)
-    
-    # 피처 요약
-    print("\n[9] 피처 카테고리:")
-    feature_categories = {
-        '타임스탬프': ['bar30_start', 'bar30_end', 'timestamp', 'm1_index_entry', 'm1_index_label'],
-        '과거 캔들': ['prev_open', 'prev_high', 'prev_low', 'prev_close', 'prev_volume'],
-        '수익률': [c for c in features_final.columns if c.startswith('return_')],
-        '거래량': [c for c in features_final.columns if 'volume' in c],
-        '이동평균': [c for c in features_final.columns if c.startswith('ma_') or c.startswith('ema_')],
-        '볼린저밴드': [c for c in features_final.columns if c.startswith('bb_')],
-        'RSI': [c for c in features_final.columns if c.startswith('rsi_')],
-        'MACD': [c for c in features_final.columns if 'macd' in c],
-        'ATR': [c for c in features_final.columns if c.startswith('atr_')],
-        '캔들패턴': [c for c in features_final.columns if 'candle' in c or 'body' in c or 'shadow' in c],
-        '시간피처': [c for c in features_final.columns if any(x in c for x in ['hour', 'minute', 'day', 'dow'])],
-        '추세/변동성': [c for c in features_final.columns if 'trend' in c or 'volatility' in c],
-        'ADX/DI': [c for c in features_final.columns if 'adx' in c or 'di_' in c],
-        '레짐': [c for c in features_final.columns if 'regime' in c or 'is_weekend' in c],
-    }
-    
-    for category, cols in feature_categories.items():
-        matching = [c for c in cols if c in features_final.columns]
-        if matching:
-            print(f"  {category:15s}: {len(matching):3d}개")
-    
-    print("\n" + "="*60)
-    print("✓ 테스트 완료")
-    print("="*60)
+    print("\n" + "=" * 60)
+    print("테스트 완료")
+    print("=" * 60)

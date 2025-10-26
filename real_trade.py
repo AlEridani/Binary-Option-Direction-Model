@@ -1,743 +1,656 @@
 """
-real_trade.py (패치 완전판)
-실시간 신호 생성 시스템 (30분봉 바이너리 옵션)
-- 30분봉 완성 시점에만 예측 (슬롯 중복 방지)
-- 패배 기반 유동성/연패/레짐/확률 필터 (동적)
-- 동적 컷오프 히스테리시스 + Δp 방어 + TTL + 포지션 제한
-- 켈리 추천 베팅금액 (5~250 제한) *로깅 전용
-- 재학습 트리거 (50번마다 승률 체크) + 패배 원인 분석
-- 모델 메타(버전/학습시각/해시) 로깅
-- 모니터 스냅샷 JSON 주기 출력
+실시간 거래 시스템 - Binance API + 백테스트 + 동적 필터
+버전: 1.3.0
 """
 
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, List, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Optional, Tuple, List
 import json
+from collections import defaultdict, deque
+import requests
+import uuid
 import time
-from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
 
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
-
-from config import Config
+import config
 from model_train import ModelTrainer
 from feature_engineer import FeatureEngineer
 from log_manager import LogManager
 from timeframe_manager import TimeframeManager
 
+# ================================
+# 바이낸스 API 클라이언트
+# ================================
+class BinanceAPIClient:
+    """바이낸스 API 클라이언트 (시뮬레이션 폴백)"""
+    
+    def __init__(self, api_key=None, api_secret=None):
+        self.api_key = api_key or config.BINANCE_API_KEY
+        self.api_secret = api_secret or config.BINANCE_API_SECRET
+        self.base_url = "https://api.binance.com"
+        self.simulation_mode = False
+        self._sim_price = 50000.0
 
-class RealTrader:
-    """실시간 신호 생성 시스템 (30분봉 기반)"""
-
-    def __init__(self, symbol: str = 'BTCUSDT'):
-        self.config = Config
-        self.symbol = symbol
-
-        # =============================
-        # Binance Client (시세 조회 전용)
-        # =============================
-        api_key = self.config.BINANCE_API_KEY
-        api_secret = self.config.BINANCE_API_SECRET
-        if not api_key or not api_secret:
-            raise ValueError(
-                "Binance API 키 없음!\n"
-                "환경변수 설정:\n"
-                "  export BINANCE_API_KEY='your_key'\n"
-                "  export BINANCE_API_SECRET='your_secret'"
-            )
-        self.client = Client(api_key, api_secret)
-        print("✓ Binance API 연결 (시세 조회 전용)")
-
-        # 모듈
-        self.model_trainer = ModelTrainer()
-        self.feature_engineer = FeatureEngineer()
-        self.log_manager = LogManager()
-        self.tf_manager = TimeframeManager()
-
-        # 모델 로드 + 메타정보
-        self.model_loaded = self.model_trainer.load_models()
-        if not self.model_loaded:
-            raise ValueError("모델 로드 실패! 학습된 모델이 필요합니다.")
+    def get_current_price(self, symbol="BTCUSDT"):
+        """현재 가격 조회"""
         try:
-            self.model_meta = self.model_trainer.get_model_meta()  # {version, trained_at, hash} 가정
+            url = f"{self.base_url}/api/v3/ticker/price"
+            params = {"symbol": symbol}
+            response = requests.get(url, params=params, timeout=3)
+            data = response.json()
+            return float(data['price'])
         except Exception:
-            self.model_meta = {}
-        print(f"✓ 모델 메타: {self.model_meta or 'N/A'}")
+            if not self.simulation_mode:
+                self.simulation_mode = True
+                print("⚙️  시뮬레이션 모드 활성화")
+            change = np.random.normal(0, 50)
+            self._sim_price = max(self._sim_price + change, 10000)
+            return float(self._sim_price)
 
-        # =============================
-        # 상태 관리
-        # =============================
-        self.active_positions: List[Dict] = []
-        self.last_trade_time: Dict[str, datetime] = {}
-
-        # 히스테리시스/TTL
-        self.p_prev: Optional[float] = None
-        self.direction_prev: Optional[int] = None
-        self.signal_start_time: Optional[datetime] = None
-        self.signal_direction: Optional[int] = None
-
-        # 통계/사이클
-        self.total_trades = 0
-        self.cycle_count = 0
-
-        # 1분봉 버퍼
-        self.price_buffer: List[Dict] = []
-        self.buffer_size = 500
-
-        # 동적 필터 상태
-        self.filter_state = self._load_filter_state()
-
-        # 재학습 트리거
-        self.retrain_check_interval = 50
-        self.retrain_threshold = 0.55
-        self.needs_retrain = False
-
-        # 슬롯 중복 방지
-        self.last_decision_slot: Optional[datetime] = None
-
-        # 자본(추천금액 계산용, 거래는 수동)
-        self.bankroll_path = self.config.RESULT_DIR / "bankroll.json"
-        self.bankroll = self._load_bankroll()
-
-        # 모니터 스냅샷 경로
-        self.monitor_snapshot_path = self.config.RESULT_DIR / "monitor_snapshot.json"
-
-    # =============================
-    # 공용 유틸
-    # =============================
-    def _load_filter_state(self) -> Dict:
-        p = self.config.RESULT_DIR / 'filter_state.json'
-        if p.exists():
-            try:
-                return json.load(open(p, 'r'))
-            except Exception:
-                pass
-        return {
-            'cutoff_dynamic': self.config.CUT_OFF,
-            'liquidity_threshold': self.config.LIQUIDITY_FILTER_THRESHOLD,
-            'max_consecutive_losses': self.config.MAX_CONSECUTIVE_LOSSES,
-            'last_updated': datetime.now(timezone.utc).isoformat(),
-            'loss_patterns': {}
-        }
-
-    def _save_filter_state(self):
-        p = self.config.RESULT_DIR / 'filter_state.json'
-        self.filter_state['last_updated'] = datetime.now(timezone.utc).isoformat()
-        json.dump(self.filter_state, open(p, 'w'), indent=2, default=str)
-
-    def _load_bankroll(self) -> float:
-        p = self.bankroll_path
-        if p.exists():
-            try:
-                data = json.load(open(p, 'r'))
-                return float(data.get("bankroll", 1000.0))
-            except Exception:
-                return 1000.0
-        return 1000.0
-
-    def _save_bankroll(self):
-        json.dump(
-            {"bankroll": float(self.bankroll), "updated": datetime.now(timezone.utc).isoformat()},
-            open(self.bankroll_path, "w"),
-            indent=2
-        )
-
-    @staticmethod
-    def _current_30m_slot(dt_utc: datetime) -> datetime:
-        dt_utc = dt_utc.replace(second=0, microsecond=0)
-        return dt_utc.replace(minute=(0 if dt_utc.minute < 30 else 30))
-
-    # =============================
-    # 켈리 추천 베팅금액 (로깅용)
-    # =============================
-    def _kelly_stake(self, p_up: float, rr: float = 0.8) -> float:
-        """
-        바이옵 페이오프 가정: 승 +0.8, 패 -1.0 → b = 0.8
-        f* = (b*p - (1-p))/b.  음수면 0으로.
-        결과는 bankroll*f 를 [5, 250]로 클립.
-        """
-        b = rr
-        p = float(p_up)
-        q = 1.0 - p
-        f_star = (b * p - q) / b
-        f_star = max(0.0, f_star)
-        raw = self.bankroll * f_star
-        return float(np.clip(raw, 5.0, 250.0))
-
-    # =============================
-    # 패배 원인 분석(필터 업데이트)
-    # =============================
-    def analyze_loss_patterns(self):
-        recent_trades = self.log_manager.load_recent_trades(n=100)
-        if len(recent_trades) < 20 or 'result' not in recent_trades.columns:
-            return
-        losses = recent_trades[recent_trades['result'] == 0].copy()
-        if len(losses) == 0:
-            return
-
-        print("\n[패배 원인 분석]")
-
-        # (1) 레짐별 손실률
-        if 'regime' in recent_trades.columns:
-            regime_total = recent_trades['regime'].value_counts()
-            regime_loss = losses['regime'].value_counts()
-            for regime_val in regime_total.index:
-                total_count = int(regime_total.get(regime_val, 0))
-                loss_count = int(regime_loss.get(regime_val, 0))
-                loss_rate = (loss_count / total_count) if total_count > 0 else 0
-                name = {1: "UP", -1: "DOWN", 0: "FLAT"}.get(regime_val, f"REGIME-{regime_val}")
-                print(f"  {name}: 손실률 {loss_rate:.1%} ({loss_count}/{total_count})")
-                if loss_rate > 0.7 and total_count >= 10:
-                    self.filter_state['loss_patterns'][f'regime_{regime_val}'] = {
-                        'loss_rate': loss_rate, 'count': total_count
-                    }
-                    print(f"    ⚠️ {name} 레짐 손실률 높음!")
-
-        # (2) 확률 구간별 손실률
-        if 'p_up' in recent_trades.columns:
-            bins = [0.5, 0.55, 0.6, 0.65, 0.7, 1.0]
-            labels = ['0.50-0.55', '0.55-0.60', '0.60-0.65', '0.65-0.70', '0.70+']
-            recent_trades['p_bin'] = pd.cut(recent_trades['p_up'].abs(), bins=bins, labels=labels, include_lowest=True)
-            for label in labels:
-                sub = recent_trades[recent_trades['p_bin'] == label]
-                if len(sub) > 0 and 'result' in sub.columns:
-                    loss_rate = (sub['result'] == 0).mean()
-                    print(f"  확률 {label}: 손실률 {loss_rate:.1%} ({int((sub['result']==0).sum())}/{len(sub)})")
-                    if loss_rate > 0.6 and len(sub) >= 10:
-                        self.filter_state['loss_patterns'][f'p_bin_{label}'] = {
-                            'loss_rate': float(loss_rate), 'count': int(len(sub))
-                        }
-
-        # (3) 동적 컷오프 보정
-        if 'result' in recent_trades.columns:
-            recent_win_rate = (recent_trades['result'] == 1).mean()
-            if recent_win_rate < 0.50:
-                new_cutoff = min(self.filter_state['cutoff_dynamic'] + 0.02, 0.65)
-                if new_cutoff != self.filter_state['cutoff_dynamic']:
-                    print(f"  ⚠️ Cutoff 조정: {self.filter_state['cutoff_dynamic']:.2f} → {new_cutoff:.2f}")
-                    self.filter_state['cutoff_dynamic'] = new_cutoff
-            elif recent_win_rate > 0.60:
-                new_cutoff = max(self.filter_state['cutoff_dynamic'] - 0.01, self.config.CUT_OFF)
-                if new_cutoff != self.filter_state['cutoff_dynamic']:
-                    print(f"  ✓ Cutoff 조정: {self.filter_state['cutoff_dynamic']:.2f} → {new_cutoff:.2f}")
-                    self.filter_state['cutoff_dynamic'] = new_cutoff
-
-        self._save_filter_state()
-
-    # =============================
-    # 재학습 체크
-    # =============================
-    def check_retrain_trigger(self):
-        if self.total_trades == 0:
-            return
-        if self.total_trades % self.retrain_check_interval != 0:
-            return
-        print(f"\n{'='*60}\n[재학습 체크] 거래 {self.total_trades}번\n{'='*60}")
-        recent = self.log_manager.load_recent_trades(n=self.retrain_check_interval)
-        if len(recent) < self.retrain_check_interval or 'result' not in recent.columns:
-            print("  데이터 부족/결과 없음")
-            return
-        wins = int((recent['result'] == 1).sum())
-        wr = wins / len(recent)
-        print(f"  최근 {self.retrain_check_interval}번 승률: {wr:.1%} ({wins}/{len(recent)})")
-        if wr < self.retrain_threshold:
-            print(f"  ⚠️ 승률 {wr:.1%} < {self.retrain_threshold:.1%} → 🔄 재학습 필요")
-            self.needs_retrain = True
-            self.analyze_loss_patterns()
-        else:
-            print("  ✓ 승률 양호")
-            self.needs_retrain = False
-
-    # =============================
-    # 데이터 수집
-    # =============================
-    def fetch_latest_klines(self, limit: int = 500) -> pd.DataFrame:
+    def get_klines(self, symbol="BTCUSDT", interval="1m", limit=500):
+        """캔들스틱 데이터 조회"""
         try:
-            klines = self.client.get_klines(
-                symbol=self.symbol,
-                interval=Client.KLINE_INTERVAL_1MINUTE,
-                limit=limit
-            )
-            df = pd.DataFrame(klines, columns=[
+            url = f"{self.base_url}/api/v3/klines"
+            params = {"symbol": symbol, "interval": interval, "limit": limit}
+            response = requests.get(url, params=params, timeout=5)
+            data = response.json()
+
+            df = pd.DataFrame(data, columns=[
                 'timestamp', 'open', 'high', 'low', 'close', 'volume',
                 'close_time', 'quote_volume', 'trades', 'taker_buy_base',
                 'taker_buy_quote', 'ignore'
             ])
-            df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].copy()
+
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
             for col in ['open', 'high', 'low', 'close', 'volume']:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            return df.dropna()
-        except BinanceAPIException as e:
-            print(f"⚠️ Binance API 에러: {e}")
-            return pd.DataFrame()
+                df[col] = df[col].astype(float)
 
-    def update_price_buffer(self, retries: int = 2, sleep_sec: float = 1.0) -> bool:
-        """1분봉 버퍼 업데이트(약한 재시도)"""
-        for attempt in range(retries + 1):
-            df_new = self.fetch_latest_klines(limit=10)
-            if not df_new.empty:
-                for _, row in df_new.iterrows():
-                    self.price_buffer.append(row.to_dict())
-                # 최신 타임스탬프 기준 중복 제거
-                seen = set(); unique = []
-                for item in reversed(self.price_buffer):
-                    ts = item['timestamp']
-                    if ts not in seen:
-                        seen.add(ts); unique.append(item)
-                self.price_buffer = list(reversed(unique))[-self.buffer_size:]
-                return True
-            if attempt < retries:
-                time.sleep(sleep_sec)
-        return False
+            return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+        except Exception:
+            if not self.simulation_mode:
+                self.simulation_mode = True
+                print("⚙️  시뮬레이션 데이터 생성")
+            return self._generate_simulation_data(limit)
 
-    def get_buffer_as_df(self) -> pd.DataFrame:
-        if not self.price_buffer:
-            return pd.DataFrame()
-        df = pd.DataFrame(self.price_buffer).sort_values('timestamp').reset_index(drop=True)
-        return df
+    def _generate_simulation_data(self, limit=500):
+        """시뮬레이션 데이터 생성"""
+        end_time = datetime.now(timezone.utc)
+        timestamps = [end_time - timedelta(minutes=i) for i in range(limit-1, -1, -1)]
+        
+        base_price = 50000.0
+        returns = np.random.normal(0, 0.002, limit)
+        prices = base_price * (1 + returns).cumprod()
 
-    # =============================
-    # 30분봉 체크/예측
-    # =============================
-    def is_30m_bar_complete(self) -> bool:
-        now = datetime.now(timezone.utc)
-        return (now.minute in [0, 30]) and (now.second < 10)
+        data = []
+        for i, ts in enumerate(timestamps):
+            close = prices[i]
+            open_price = close + np.random.uniform(-50, 50)
+            high = max(open_price, close) + np.random.uniform(0, 100)
+            low = min(open_price, close) - np.random.uniform(0, 100)
+            volume = np.random.uniform(100, 1000)
 
-    def predict_next_30m(self) -> Optional[Tuple[float, int]]:
-        df_1m = self.get_buffer_as_df()
-        if len(df_1m) < 100:
-            print(f"  ⚠️ 데이터 부족: {len(df_1m)}개")
-            return None
-        try:
-            features = self.feature_engineer.create_feature_pool(df_1m, lookback_bars=100)
-        except Exception as e:
-            print(f"  ⚠️ 피처 생성 실패: {e}")
-            return None
-        if features.empty:
-            print("  ⚠️ 피처 없음")
-            return None
-        X_latest = features.tail(1).copy()
-        regime = int(X_latest['regime'].iloc[0]) if 'regime' in X_latest.columns else None
-        try:
-            p_up = self.model_trainer.predict(
-                X_latest, regime=regime, use_regime_model=True
-            )[0]
-        except Exception as e:
-            print(f"  ⚠️ 예측 실패: {e}")
-            return None
-        return p_up, regime
+            data.append({
+                'timestamp': ts,
+                'open': open_price,
+                'high': high,
+                'low': low,
+                'close': close,
+                'volume': volume
+            })
 
-    # =============================
-    # 동적 필터
-    # =============================
-    def check_liquidity_filter(self) -> bool:
-        n = self.config.LIQUIDITY_FILTER_WINDOW
-        recent = self.log_manager.load_recent_trades(n=n)
-        if len(recent) < n or 'result' not in recent.columns:
-            return True
-        wr = (recent['result'] == 1).mean()
-        thr = self.filter_state['liquidity_threshold']
-        if wr < thr:
-            print(f"  ❌ 유동성 필터: 승률 {wr:.1%} < {thr:.1%}")
-            return False
-        return True
+        return pd.DataFrame(data)
 
-    def check_consecutive_losses(self) -> bool:
-        m = self.filter_state['max_consecutive_losses']
-        recent = self.log_manager.load_recent_trades(n=m)
-        if len(recent) < m or 'result' not in recent.columns:
-            return True
-        if (recent['result'] == 0).all():
-            print(f"  ❌ 연속 패배: {m}연속 손실")
-            return False
-        return True
 
-    def check_regime_filter(self, regime: Optional[int]) -> bool:
-        if regime is None:
-            return True
-        key = f'regime_{int(regime)}'
-        if key in self.filter_state['loss_patterns']:
-            loss_rate = self.filter_state['loss_patterns'][key]['loss_rate']
-            if loss_rate > 0.7:
-                name = {1: "UP", -1: "DOWN", 0: "FLAT"}.get(regime, f"REGIME-{regime}")
-                print(f"  ❌ 레짐 필터: {name} 손실률 {loss_rate:.1%}")
-                return False
-        return True
-
-    def check_probability_filter(self, p_up: float) -> bool:
-        p = abs(p_up)
-        if 0.5 <= p < 0.55: label = '0.50-0.55'
-        elif 0.55 <= p < 0.6: label = '0.55-0.60'
-        elif 0.6 <= p < 0.65: label = '0.60-0.65'
-        elif 0.65 <= p < 0.7: label = '0.65-0.70'
-        else: label = '0.70+'
-        key = f'p_bin_{label}'
-        if key in self.filter_state['loss_patterns']:
-            loss_rate = self.filter_state['loss_patterns'][key]['loss_rate']
-            if loss_rate > 0.6:
-                print(f"  ❌ 확률 필터: {label} 손실률 {loss_rate:.1%}")
-                return False
-        return True
-
-    # =============================
-    # 히스테리시스 / Δp / TTL / 포지션
-    # =============================
-    def check_hysteresis(self, p_now: float, direction_now: int) -> bool:
-        cut_on = self.config.CUT_ON
-        cut_off = self.filter_state['cutoff_dynamic']
-        if self.p_prev is None:
-            self.p_prev = p_now
-            if p_now >= cut_on:
-                self.direction_prev = 1; return True
-            if p_now <= (1 - cut_on):
-                self.direction_prev = 0; return True
-            self.direction_prev = None; return False
-
-        if self.direction_prev == 1:
-            self.p_prev = p_now
-            if p_now >= cut_off: return True
-            self.direction_prev = None; return False
-
-        if self.direction_prev == 0:
-            self.p_prev = p_now
-            if p_now <= (1 - cut_off): return True
-            self.direction_prev = None; return False
-
-        self.p_prev = p_now
-        if p_now >= cut_on:
-            self.direction_prev = 1; return True
-        if p_now <= (1 - cut_on):
-            self.direction_prev = 0; return True
-        return False
-
-    def check_ttl(self) -> bool:
-        if self.signal_start_time is None:
-            return False
-        ttl_minutes = self.config.SIGNAL_TTL_MINUTES
-        elapsed = (datetime.now(timezone.utc) - self.signal_start_time).total_seconds() / 60.0
-        if elapsed > ttl_minutes:
-            print(f"  ⏰ TTL 만료: {elapsed:.1f}분 경과")
-            self.signal_start_time = None
-            self.signal_direction = None
-            return False
-        return True
-
-    def start_signal(self, direction: int):
-        self.signal_start_time = datetime.now(timezone.utc)
-        self.signal_direction = direction
-
-    def check_delta_p(self, p_now: float) -> bool:
-        if self.p_prev is None:
-            return True
-        delta_p = abs(p_now - self.p_prev)
-        if delta_p > self.config.MAX_DELTA_P:
-            print(f"  ⚠️ Δp 초과: {delta_p:.3f} > {self.config.MAX_DELTA_P:.3f}")
-            return False
-        return True
-
-    def can_enter_new_position(self) -> bool:
-        if len(self.active_positions) >= self.config.MAX_POSITIONS:
-            print(f"  ❌ 최대 포지션: {len(self.active_positions)}/{self.config.MAX_POSITIONS}")
-            return False
-        last_time = self.last_trade_time.get(self.symbol)
-        if last_time:
-            elapsed = (datetime.now(timezone.utc) - last_time).total_seconds() / 60.0
-            if elapsed < self.config.REFRACTORY_WINDOW_MINUTES:
-                print(f"  ⏱️ 리프랙토리: {elapsed:.1f}분 < {self.config.REFRACTORY_WINDOW_MINUTES}분")
-                return False
-        return True
-
-    def add_position(self, position: Dict):
-        self.active_positions.append(position)
-        self.last_trade_time[self.symbol] = datetime.now(timezone.utc)
-
-    def remove_position(self, trade_id: str):
-        self.active_positions = [p for p in self.active_positions if p['trade_id'] != trade_id]
-
-    # =============================
-    # 시그널 로깅/청산
-    # =============================
-    def log_trade_signal(self, direction: int, p_up: float, regime: Optional[int] = None) -> bool:
-        now = datetime.now(timezone.utc)
-        df_1m = self.get_buffer_as_df()
-        if df_1m.empty:
-            print("  ⚠️ 가격 데이터 없음")
-            return False
-
-        entry_price = float(df_1m.iloc[-1]['close'])
-        trade_id = f"{self.symbol}_{now.strftime('%Y%m%d_%H%M%S')}"
-
-        bar30_start = self._current_30m_slot(now)
-        bar30_end = bar30_start + timedelta(minutes=30)
-        expiry_time = bar30_end + timedelta(minutes=30)
-
-        # 켈리 추천 베팅금액
-        stake = self._kelly_stake(p_up)
-
-        position = {
-            'trade_id': trade_id,
-            'symbol': self.symbol,
-            'direction': direction,
-            'entry_price': entry_price,
-            'entry_time': now,
-            'expiry_time': expiry_time,
-            'p_up': p_up,
-            'regime': regime,
-            'bar30_start': bar30_start,
-            'bar30_end': bar30_end,
-            'stake_recommended': stake,
-            'model_version': self.model_meta.get("version") if self.model_meta else None,
+# ===========================================
+# 실시간 트레이더 (통합 버전)
+# ===========================================
+class RealTrader:
+    """
+    실시간 거래 시스템 + 백테스트
+    - Binance API 연동
+    - 레짐 기반 진입
+    - 동적 필터
+    - 재학습 트리거
+    - 백테스트 엔진
+    """
+    
+    def __init__(self, symbol: str = 'BTCUSDT', api_client=None):
+        """초기화"""
+        self.symbol = symbol
+        
+        # 컴포넌트
+        self.model_trainer = ModelTrainer()
+        self.feature_engineer = FeatureEngineer()
+        self.log_manager = LogManager()
+        self.tf_manager = TimeframeManager()
+        self.api_client = api_client or BinanceAPIClient()
+        
+        # 모델 로드
+        self.model_loaded = self.model_trainer.load_models()
+        if not self.model_loaded:
+            print("⚠️  모델 미로드")
+        
+        # 거래 상태
+        self.is_running = False
+        self.active_positions = {}
+        self.max_positions = config.MAX_CONCURRENT_POSITIONS
+        self.trade_history = deque(maxlen=config.RETRAIN_CHECK_INTERVAL)
+        
+        # 재학습
+        self.pending_retrain = False
+        self.trades_since_last_check = 0
+        
+        # 성능 통계
+        self.performance_metrics = {
+            'total_trades': 0,
+            'wins': 0,
+            'losses': 0,
+            'long_trades': 0,
+            'long_wins': 0,
+            'short_trades': 0,
+            'short_wins': 0,
+            'current_streak': 0,
+            'max_streak': 0,
+            'total_profit': 0
         }
-        self.add_position(position)
-
-        # ✅ 피처에서 추가 정보 추출
-        features_dict = {}
+        
+        # 동적 필터
+        self.filter_state = self._load_filter_state()
+        
+        # 쿨다운
+        self.next_entry_after = None
+        self.last_attempt_time = None
+        
+    # ---------- 동적 필터 ----------
+    def _load_filter_state(self):
+        """동적 필터 로드"""
+        filter_path = config.FILTER_STATE_FILE
+        
+        if filter_path.exists():
+            try:
+                with open(filter_path, 'r') as f:
+                    filters = json.load(f)
+                    print(f"✅ 동적 필터 로드: {len(filters.get('active_filters', []))}개")
+                    return filters
+            except Exception as e:
+                print(f"⚠️  필터 로드 실패: {e}")
+        
+        return {'active_filters': [], 'filter_history': []}
+    
+    def _save_filter_state(self):
+        """동적 필터 저장"""
         try:
-            feats = self.feature_engineer.create_feature_pool(df_1m, lookback_bars=100)
-            if not feats.empty:
-                latest = feats.tail(1).iloc[0]
-                features_dict = {
-                    'regime_score': latest.get('regime_score', 0.0),
-                    'adx_14': latest.get('adx_14', 0.0),
-                    'di_plus_14': latest.get('di_plus_14', 0.0),
-                    'di_minus_14': latest.get('di_minus_14', 0.0),
-                }
-                
-                # 피처 로그도 저장
-                self.log_manager.log_feature(
-                    bar30_start=bar30_start,
-                    bar30_end=bar30_end,
-                    pred_ts=now,
-                    entry_ts=now,
-                    label_ts=expiry_time,
-                    m1_index_entry=self._minute_index(now),
-                    m1_index_label=self._minute_index(expiry_time),
-                    cut_on=self.config.CUT_ON,
-                    cut_off=self.filter_state['cutoff_dynamic'],
-                    p_prev=self.p_prev,
-                    p_now=p_up,
-                    p_cal=p_up,
-                    dp=abs(p_up - (self.p_prev or 0.5)),
-                    dmin=(now - bar30_end).total_seconds() / 60.0,
-                    regime=regime if regime is not None else 0,
-                    vol_ratio=latest.get('volume_ratio', 1.0),
-                    spread_bps=0.0,
-                    vwap_gap_bps=0.0,
-                    filters_passed="all",
-                    signal_id=trade_id
-                )
+            with open(config.FILTER_STATE_FILE, 'w') as f:
+                json.dump(self.filter_state, f, indent=2)
         except Exception as e:
-            print(f"  ⚠️ 피처 추출 실패: {e}")
-
-        # ✅ 간소화 로깅 호출
+            print(f"⚠️  필터 저장 실패: {e}")
+    
+    def apply_adaptive_filters(self, features_row):
+        """적응형 필터 적용"""
+        active_filters = self.filter_state.get('active_filters', [])
+        if not active_filters:
+            return True, []
+        
+        blocked_reasons = []
+        
+        for fc in active_filters:
+            filter_type = fc.get('type', 'num')
+            
+            # 복합 조건 필터
+            if filter_type == 'compound':
+                conditions = fc.get('conditions', [])
+                all_met = True
+                
+                for cond in conditions:
+                    field = cond.get('field')
+                    operator = cond.get('operator')
+                    threshold = cond.get('threshold')
+                    
+                    if field not in features_row or pd.isna(features_row[field]):
+                        all_met = False
+                        break
+                    
+                    value = features_row[field]
+                    
+                    if operator == '<=' and not (value <= threshold):
+                        all_met = False
+                        break
+                    elif operator == '>' and not (value > threshold):
+                        all_met = False
+                        break
+                
+                if all_met:
+                    blocked_reasons.append(f"{fc['name']}: {fc['reason']}")
+                    continue
+            
+            # 단일 조건 필터
+            field = fc.get('field')
+            if not field or field not in features_row or pd.isna(features_row[field]):
+                continue
+            
+            value = features_row[field]
+            op = fc.get('operator')
+            
+            if op == '>':
+                th = fc.get('threshold')
+                if value > th:
+                    blocked_reasons.append(f"{fc['name']}: {field}={value:.4f} > {th:.4f}")
+            elif op == '<':
+                th = fc.get('threshold')
+                if value < th:
+                    blocked_reasons.append(f"{fc['name']}: {field}={value:.4f} < {th:.4f}")
+        
+        return (len(blocked_reasons) == 0), blocked_reasons
+    
+    # ---------- 예측/진입 ----------
+    def predict_next_30m(self) -> Tuple[Optional[float], Optional[int]]:
+        """다음 30분봉 예측"""
+        if not self.model_loaded:
+            return None, None
+        
+        try:
+            # 최근 데이터 로드
+            df_1m = self.api_client.get_klines(limit=3000)
+            
+            # 피처 생성
+            df_features = self.feature_engineer.create_feature_pool(df_1m, lookback_bars=100)
+            
+            if df_features.empty:
+                return None, None
+            
+            # 최신 봉
+            latest = df_features.iloc[-1]
+            regime = int(latest['regime']) if 'regime' in latest else 0
+            
+            # 예측
+            X = df_features.iloc[[-1]]
+            feature_names = self.feature_engineer.get_feature_names(df_features)
+            X = X[feature_names]
+            
+            p_up = self.model_trainer.predict(X, regime=regime, use_regime_model=True)
+            
+            if isinstance(p_up, np.ndarray):
+                p_up = float(p_up[0]) if len(p_up) > 0 else 0.5
+            else:
+                p_up = float(p_up)
+            
+            return p_up, regime
+            
+        except Exception as e:
+            print(f"❌ 예측 실패: {e}")
+            return None, None
+    
+    def check_hysteresis(self, p_now: float, direction: str) -> bool:
+        """히스테리시스 체크"""
+        if direction == 'UP':
+            return p_now >= config.CUT_ON_DEFAULT
+        else:  # DOWN
+            return p_now <= (1 - config.CUT_ON_DEFAULT)
+    
+    def check_ttl(self, position: Dict, now: datetime) -> bool:
+        """TTL 체크"""
+        elapsed = (now - position['ttl_start']).total_seconds()
+        return elapsed < position['ttl_seconds']
+    
+    def check_delta_p(self, p_now: float, p_entry: float) -> bool:
+        """delta_p 체크"""
+        delta = abs(p_now - p_entry)
+        return delta >= config.DELTA_P_THRESHOLD
+    
+    def execute_trade(self, side, p_up, amount=100):
+        """거래 실행"""
+        if len(self.active_positions) >= self.max_positions:
+            return None
+        
+        trade_id = str(uuid.uuid4())[:8]
+        entry_time = datetime.now(timezone.utc)
+        expiry_time = entry_time + timedelta(minutes=config.BAR_MINUTES)
+        entry_price = self.api_client.get_current_price(self.symbol)
+        
+        # 레짐 정보
+        try:
+            df = self.api_client.get_klines(limit=500)
+            features = self.feature_engineer.create_feature_pool(df, 100)
+            current_regime = int(features['regime'].iloc[-1]) if 'regime' in features.columns else None
+        except:
+            current_regime = None
+        
+        info = {
+            'trade_id': trade_id,
+            'entry_time': entry_time.isoformat(),
+            'expiry_time': expiry_time.isoformat(),
+            'entry_price': entry_price,
+            'direction': int(side),
+            'p_up': float(p_up),
+            'regime': current_regime,
+            'amount': amount,
+            'status': 'open',
+            'ttl_start': entry_time,
+            'ttl_seconds': config.TTL_SECONDS,
+            'p_at_entry': float(p_up)
+        }
+        
+        self.active_positions[trade_id] = info
+        
+        # 로그 기록
         self.log_manager.log_trade_entry_simple(
             trade_id=trade_id,
-            direction=direction,
+            direction='UP' if side == 1 else 'DOWN',
             entry_price=entry_price,
-            entry_time=now,
-            expiry_time=expiry_time,
-            p_up=p_up,
-            regime=regime,
-            bar30_start=bar30_start,
-            bar30_end=bar30_end,
-            stake_recommended=stake,
-            model_version=position['model_version'],
-            features_dict=features_dict
+            entry_ts=entry_time,
+            p_at_entry=p_up,
+            regime=current_regime or 0
         )
-
-        direction_str = "UP 🟢" if direction == 1 else "DOWN 🔴"
-        print(f"\n✅ 신호 발생: {direction_str}")
-        print(f"  ID: {trade_id}")
-        print(f"  가격: ${entry_price:,.2f}")
-        print(f"  확률: {p_up:.3f}")
-        print(f"  추천 베팅금액: ${stake:,.2f}")
-        print(f"  모델버전: {position['model_version'] or 'N/A'}")
-        print(f"  만기: {expiry_time.strftime('%H:%M:%S')}")
-
-        self.total_trades += 1
-        self.check_retrain_trigger()
-        return True
+        
+        # 쿨다운
+        self.next_entry_after = entry_time + timedelta(seconds=config.REFRACTORY_WINDOW_SECONDS)
+        
+        direction_str = "롱🟢⬆️" if side == 1 else "숏🔴⬇️"
+        regime_labels = {1: "UP🟢", -1: "DOWN🔴", 0: "FLAT⚪", None: "N/A"}
+        regime_str = regime_labels.get(current_regime, "N/A")
+        
+        print("\n" + "="*70)
+        print("💰 거래 진입!")
+        print("="*70)
+        print(f"  🆔 ID: {trade_id}")
+        print(f"  📊 방향: {direction_str}")
+        print(f"  🎯 레짐: {regime_str}")
+        print(f"  📈 P(UP): {p_up:.2%}")
+        print(f"  💰 진입가: ${entry_price:,.2f}")
+        print(f"  💵 금액: ${amount}")
+        print(f"  📈 활성: {len(self.active_positions)}/{self.max_positions}")
+        print("="*70 + "\n")
+        
+        return trade_id
     
-    @staticmethod
-    def _minute_index(dt: datetime) -> int:
-        """1분 인덱스 계산"""
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp() // 60)
-
-    def check_and_close_positions(self):
+    def check_trade_result(self, trade_id):
+        """거래 결과 확인"""
+        pos = self.active_positions.get(trade_id)
+        if not pos:
+            return None
+        
+        entry_time = datetime.fromisoformat(pos['entry_time'].replace("Z",""))
+        expiry_time = datetime.fromisoformat(pos['expiry_time'].replace("Z",""))
         now = datetime.now(timezone.utc)
-        for position in self.active_positions.copy():
-            if now >= position['expiry_time']:
-                self.close_position(position)
-
-    def close_position(self, position: Dict):
-        df_1m = self.get_buffer_as_df()
-        if df_1m.empty:
-            print("  ⚠️ 청산 가격 없음")
-            return
-        exit_price = float(df_1m.iloc[-1]['close'])
-        entry_price = position['entry_price']
-        direction = position['direction']
-
-        if direction == 1:
-            result = 1 if exit_price > entry_price else 0
-        else:
-            result = 1 if exit_price < entry_price else 0
-
-        profit_loss = 0.80 if result == 1 else -1.00  # 페이오프 가정
-
-        # (선택) bankroll 시뮬레이션 업데이트를 원하면 주석 해제
-        # self.bankroll += position.get("stake_recommended", 0) * profit_loss
-        # self._save_bankroll()
-
+        
+        if now < expiry_time:
+            return None
+        
+        entry_price = pos['entry_price']
+        exit_price = self.api_client.get_current_price(self.symbol)
+        
+        direction = pos['direction']
+        is_win = (exit_price > entry_price) if direction == 1 else (exit_price < entry_price)
+        
+        amount = pos['amount']
+        profit = amount * config.PAYOUT_30M_PLUS if is_win else -amount
+        result = 1 if is_win else 0
+        
+        pos['exit_time'] = now.isoformat()
+        pos['exit_price'] = exit_price
+        pos['result'] = result
+        pos['profit_loss'] = profit
+        pos['status'] = 'closed'
+        
+        self.update_performance(is_win, profit, direction)
+        self.trade_history.append(result)
+        
+        # 로그 업데이트
         self.log_manager.update_trade_result(
-            trade_id=position['trade_id'],
-            exit_price=exit_price,
-            result=result,
-            profit_loss=profit_loss
+            trade_id=trade_id,
+            result='WIN' if is_win else 'LOSS',
+            label_price=exit_price,
+            payout=profit
         )
-        self.remove_position(position['trade_id'])
-
-        result_str = "승 ✅" if result == 1 else "패 ❌"
-        pl_str = f"+{profit_loss:.0%}" if profit_loss > 0 else f"{profit_loss:.0%}"
-        print(f"\n🏁 청산: {result_str} ({pl_str})  ID: {position['trade_id']}")
+        
+        result_emoji = "✅ 승리" if is_win else "❌ 패배"
+        print(f"\n{result_emoji}: {trade_id}")
         print(f"  진입: ${entry_price:,.2f} → 청산: ${exit_price:,.2f}")
+        print(f"  손익: ${profit:+,.2f}\n")
+        
+        del self.active_positions[trade_id]
+        
+        # 재학습 체크
+        self.trades_since_last_check += 1
+        if self.trades_since_last_check >= config.RETRAIN_CHECK_INTERVAL:
+            if self.check_retrain_trigger():
+                self.pending_retrain = True
+                print("⚠️  재학습 필요 - 신규 진입 중단")
+        
+        return result
+    
+    def update_performance(self, is_win, profit, direction):
+        """성능 통계 업데이트"""
+        self.performance_metrics['total_trades'] += 1
+        
+        if direction == 1:
+            self.performance_metrics['long_trades'] += 1
+            if is_win:
+                self.performance_metrics['long_wins'] += 1
+        else:
+            self.performance_metrics['short_trades'] += 1
+            if is_win:
+                self.performance_metrics['short_wins'] += 1
+        
+        if is_win:
+            self.performance_metrics['wins'] += 1
+            self.performance_metrics['current_streak'] += 1
+            self.performance_metrics['max_streak'] = max(
+                self.performance_metrics['max_streak'],
+                self.performance_metrics['current_streak']
+            )
+        else:
+            self.performance_metrics['losses'] += 1
+            self.performance_metrics['current_streak'] = 0
+        
+        self.performance_metrics['total_profit'] += profit
+    
+    def check_retrain_trigger(self) -> None:
+        """재학습 트리거 체크 (윌슨 하한)"""
+        n = len(self.trade_history)
+        if n < config.MIN_TRADES_FOR_RETRAIN:
+            return False
+        
+        wins = sum(self.trade_history)
+        p_hat = wins / n
+        
+        # 윌슨 하한
+        z = 1.96
+        denominator = 1 + z**2 / n
+        center = (p_hat + z**2 / (2*n)) / denominator
+        margin = z * np.sqrt(p_hat * (1 - p_hat) / n + z**2 / (4*n**2)) / denominator
+        lower_bound = center - margin
+        
+        print(f"\n재학습 체크: 승률={p_hat:.2%}, 하한={lower_bound:.2%}, 임계={config.RETRAIN_WIN_RATE_THRESHOLD:.0%}")
+        
+        return lower_bound < config.RETRAIN_WIN_RATE_THRESHOLD
+    
+    # ---------- 메인 루프 ----------
 
-    # =============================
-    # 모니터 스냅샷
-    # =============================
-    def _emit_monitor_snapshot(self):
-        recent = self.log_manager.load_recent_trades(n=200)
-        wr = float((recent['result'] == 1).mean()) if 'result' in recent.columns and len(recent) > 0 else None
-        # 연패 계산
-        cur_streak = 0; max_streak = 0
-        if 'result' in recent.columns:
-            for r in recent['result']:
-                cur_streak = (cur_streak + 1) if r == 0 else 0
-                max_streak = max(max_streak, cur_streak)
-        snap = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "recent_win_rate": wr,
-            "current_losses": cur_streak,
-            "max_consecutive_losses": max_streak,
-            "cutoff_dynamic": self.filter_state.get("cutoff_dynamic"),
-            "liquidity_threshold": self.filter_state.get("liquidity_threshold"),
-            "bankroll": self.bankroll,
-            "model_version": (self.model_meta.get("version") if self.model_meta else None),
-            "total_trades": self.total_trades,
-            "active_positions": len(self.active_positions),
-        }
-        json.dump(snap, open(self.monitor_snapshot_path, "w"), indent=2, default=str)
-
-    # =============================
-    # 메인 루프(1분마다)
-    # =============================
+    def should_generate_signal(self) -> bool:
+        """신호 생성 시점: 29분 40~50초"""
+        now = datetime.now(timezone.utc)
+        minute = now.minute
+        second = now.second
+        
+        # 29분 40~50초 또는 59분 40~50초
+        if minute in [29, 59] and 40 <= second <= 50:
+            return True
+        
+        return False
     def run(self):
-        print(f"\n{'='*60}")
-        print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] 사이클 #{self.cycle_count}")
-        print(f"{'='*60}")
-        self.cycle_count += 1
-
-        # 1) 가격 업데이트
-        if not self.update_price_buffer():
-            print("⚠️ 가격 업데이트 실패")
+        """메인 루프 (1분마다 호출)"""
+        
+        # 신호 생성 시점 체크
+        if not self.should_generate_signal():
+            # 기존 포지션만 체크
+            for trade_id in list(self.active_positions.keys()):
+                self.check_trade_result(trade_id)
             return
-        print(f"✓ 버퍼: {len(self.price_buffer)}개")
-
-        # 2) 만기 청산
-        self.check_and_close_positions()
-        print(f"✓ 활성 포지션: {len(self.active_positions)}개")
-
-        # 3) 재학습 상태
-        if self.needs_retrain:
-            print("🔄 재학습 필요! (main_pipe에서 처리)")
-
-        # 4) 30분봉 완성 + 슬롯 중복 방지
-        if not self.is_30m_bar_complete():
-            print("⏱️ 30분봉 대기 중...")
-            self._emit_monitor_snapshot()
+        
+        # 예측 수행
+        p_up, regime = self.predict_next_30m()
+        if p_up is None:
             return
-        slot = self._current_30m_slot(datetime.now(timezone.utc))
-        if self.last_decision_slot == slot:
-            print("⛔ 동일 슬롯 중복 방지")
-            self._emit_monitor_snapshot()
-            return
-        self.last_decision_slot = slot
-        print("🔔 30분봉 완성!")
+        
+        # 진입 판단
+        if len(self.active_positions) < self.max_positions:
+            side = None
+            
+            if regime == 1 and p_up >= config.CUT_ON_DEFAULT:
+                side = 1
+            elif regime == -1 and (1 - p_up) >= config.CUT_ON_DEFAULT:
+                side = 0
+            
+            if side is not None:
+                # 쿨다운 체크
+                if self.next_entry_after is None or now >= self.next_entry_after:
+                    # 필터 체크
+                    try:
+                        df = self.api_client.get_klines(limit=500)
+                        features = self.feature_engineer.create_feature_pool(df, 100)
+                        ok, reasons = self.apply_adaptive_filters(features.iloc[-1])
+                        
+                        if ok:
+                            self.execute_trade(side, p_up)
+                        else:
+                            print(f"  ❌ 필터 차단: {reasons}")
+                    except Exception as e:
+                        print(f"  ⚠️  필터 체크 실패: {e}")
+        
+        # 기존 포지션 관리
+        for trade_id in list(self.active_positions.keys()):
+            self.check_trade_result(trade_id)
+    
+    # ---------- 백테스트 ----------
+    def backtest(self, historical_data, start_date=None, end_date=None):
+        """백테스트 실행"""
+        print("\n" + "="*70)
+        print("백테스트 시작")
+        print("="*70)
+        
+        # 날짜 필터
+        if start_date:
+            historical_data = historical_data[historical_data['timestamp'] >= pd.to_datetime(start_date, utc=True)]
+        if end_date:
+            historical_data = historical_data[historical_data['timestamp'] <= pd.to_datetime(end_date, utc=True)]
+        
+        # 피처 생성
+        features = self.feature_engineer.create_feature_pool(historical_data, lookback_bars=100)
+        
+        if features.empty:
+            print("❌ 피처 생성 실패")
+            return pd.DataFrame()
+        
+        # 타겟 생성
+        features['next_open'] = features['open'].shift(-1)
+        features['next_close'] = features['close'].shift(-1)
+        features['target'] = (features['next_close'] > features['next_open']).astype(int)
+        features = features.dropna(subset=['target']).reset_index(drop=True)
+        
+        print(f"백테스트 데이터: {len(features):,}건")
+        
+        trades = []
+        
+        for i in range(len(features) - 1):
+            try:
+                X_current = features.iloc[[i]]
+                feature_names = self.feature_engineer.get_feature_names(features)
+                X = X_current[feature_names]
+                
+                regime = int(features['regime'].iloc[i]) if 'regime' in features.columns else 0
+                p_up = self.model_trainer.predict(X, regime=regime, use_regime_model=True)
+                
+                if isinstance(p_up, np.ndarray):
+                    p_up = float(p_up[0])
+                
+                # 진입 결정
+                side = None
+                if regime == 1 and p_up >= config.CUT_ON_DEFAULT:
+                    side = 1
+                elif regime == -1 and (1 - p_up) >= config.CUT_ON_DEFAULT:
+                    side = 0
+                
+                if side is None:
+                    continue
+                
+                actual = int(features['target'].iloc[i])
+                correct = int(side == actual)
+                
+                trades.append({
+                    'timestamp': features['bar30_start'].iloc[i] if 'bar30_start' in features.columns else i,
+                    'p_up': p_up,
+                    'regime': regime,
+                    'decision': side,
+                    'actual': actual,
+                    'correct': correct
+                })
+                
+            except Exception:
+                continue
+        
+        trades_df = pd.DataFrame(trades)
+        
+        if trades_df.empty:
+            print("❌ 거래 없음")
+            return pd.DataFrame()
+        
+        # 결과 출력
+        total = len(trades_df)
+        wins = trades_df['correct'].sum()
+        win_rate = wins / total
+        
+        profit = (wins * 100 * config.PAYOUT_30M_PLUS) - ((total - wins) * 100)
+        
+        print(f"\n백테스트 결과:")
+        print(f"  총 거래: {total}")
+        print(f"  승/패: {wins}/{total-wins}")
+        print(f"  승률: {win_rate:.2%}")
+        print(f"  손익: ${profit:+,.2f}")
+        print(f"  평균: ${profit/total:.2f}/거래")
+        
+        return trades_df
+    
+    def get_status(self) -> Dict:
+        """현재 상태 반환"""
+        return {
+            'symbol': self.symbol,
+            'model_loaded': self.model_loaded,
+            'active_positions': len(self.active_positions),
+            'max_positions': self.max_positions,
+            'trade_count': self.performance_metrics['total_trades'],
+            'win_rate': self.performance_metrics['wins'] / max(1, self.performance_metrics['total_trades']),
+            'filter_patterns': len(self.filter_state.get('active_filters', []))
+        }
 
-        # 5) 예측
-        pred = self.predict_next_30m()
-        if pred is None:
-            print("⚠️ 예측 실패")
-            self._emit_monitor_snapshot()
-            return
-        p_up, regime = pred
-        direction = 1 if p_up > 0.5 else 0
-        rname = {1: "UP", -1: "DOWN", 0: "FLAT"}.get(regime, "N/A")
-        print(f"📊 예측: p_up={p_up:.3f}, 레짐={rname}")
 
-        # 6) 필터(동적)
-        if not self.check_liquidity_filter(): self._emit_monitor_snapshot(); return
-        if not self.check_consecutive_losses(): self._emit_monitor_snapshot(); return
-        if not self.check_regime_filter(regime): self._emit_monitor_snapshot(); return
-        if not self.check_probability_filter(p_up): self._emit_monitor_snapshot(); return
-
-        # 7) Δp
-        if not self.check_delta_p(p_up):
-            self._emit_monitor_snapshot(); return
-
-        # 8) 히스테리시스(동적 컷오프)
-        if not self.check_hysteresis(p_up, direction):
-            print("⏸️ 히스테리시스: 신호 없음")
-            self._emit_monitor_snapshot(); return
-
-        # 9) 신호 발생 → TTL 시작
-        if self.signal_start_time is None:
-            self.start_signal(direction)
-            print(f"🔔 신호 발생: {'UP' if direction == 1 else 'DOWN'}")
-
-        # 10) TTL 체크
-        if not self.check_ttl():
-            self._emit_monitor_snapshot(); return
-
-        # 11) 포지션 제한
-        if not self.can_enter_new_position():
-            self._emit_monitor_snapshot(); return
-
-        # 12) 신호 로그 기록
-        self.log_trade_signal(direction, p_up, regime)
-
-        # 13) 모니터 스냅샷
-        self._emit_monitor_snapshot()
-
-
-# =============================
-# 테스트 실행
-# =============================
+# ============================================================
+# 테스트 및 검증
+# ============================================================
 if __name__ == "__main__":
-    print("="*60)
-    print("RealTrader 테스트 (패치 완전판)")
-    print("="*60)
-    try:
-        trader = RealTrader(symbol='BTCUSDT')
-        print("\n✓ 초기화 완료")
-        print(f"  심볼: {trader.symbol}")
-        print(f"  모델: 로드됨")
-        print(f"  필터 상태: {trader.filter_state}")
-        print(f"  초기 Bankroll: {trader.bankroll}")
-
-        # 단일 사이클
-        print("\n단일 사이클 테스트...")
-        trader.run()
-
-        # 패배 원인 분석
-        print("\n패배 원인 분석 테스트...")
-        trader.analyze_loss_patterns()
-
-    except Exception as e:
-        print(f"❌ 에러: {e}")
-        import traceback; traceback.print_exc()
+    print("=" * 60)
+    print("RealTrader 테스트 (API + 백테스트)")
+    print("=" * 60)
+    
+    # 초기화
+    trader = RealTrader(symbol='BTCUSDT')
+    
+    status = trader.get_status()
+    print(f"\n✅ 초기화 완료")
+    print(f"  Symbol: {status['symbol']}")
+    print(f"  Model Loaded: {status['model_loaded']}")
+    
+    # API 테스트
+    print("\n💰 API 테스트")
+    price = trader.api_client.get_current_price('BTCUSDT')
+    print(f"  현재가: ${price:,.2f}")
+    
+    df = trader.api_client.get_klines(limit=10)
+    print(f"  캔들 로드: {len(df)}개")
+    
+    print("\n" + "=" * 60)
+    print("테스트 완료")
+    print("=" * 60)

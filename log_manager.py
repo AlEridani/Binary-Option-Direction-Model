@@ -1,873 +1,389 @@
-# log_manager.py
-# 거래/피처 로그 관리 (30분봉 시스템)
-# - 날짜별 CSV 저장 (logs/trades/, logs/trades/entries/, logs/trades/closes/, logs/features/)
-# - 진입/청산 분리 기록 + 통합 파일 업데이트
-# - 원자적 쓰기, 스키마/타입 보정, 자동 무결성 검증
-# - real_trade 호환 어댑터 추가
+"""
+로그 관리자 - 거래/피처 로그 표준화 및 무결성 검증 (UTC ISO, 원자적 쓰기, trade_id 전역 업데이트)
+버전: 1.3.1
+"""
 
-import os
-import json
-import hashlib
-from pathlib import Path
-from typing import Dict, Optional, List
-from datetime import datetime, timezone
-
+from __future__ import annotations
 import pandas as pd
 import numpy as np
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+import json
+import shutil
 
-from config import Config
+import config
+
+
+def _to_utc(ts: datetime) -> pd.Timestamp:
+    return pd.Timestamp(ts, tz="UTC")
+
+
+def _iso(dt: datetime | pd.Timestamp | str | None) -> str:
+    if dt is None or (isinstance(dt, float) and np.isnan(dt)):
+        return ""
+    t = pd.to_datetime(dt, utc=True, errors="coerce")
+    return "" if pd.isna(t) else t.isoformat().replace("+00:00", "Z")
+
+
+def _atomic_write_csv(df: pd.DataFrame, fpath: Path):
+    fpath.parent.mkdir(parents=True, exist_ok=True)
+    tmp = fpath.parent / (".tmp_" + fpath.name)
+    df.to_csv(tmp, index=False)
+    shutil.move(str(tmp), str(fpath))
+
+
+def _read_csv_safe(fpath: Path) -> pd.DataFrame:
+    if not fpath.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(fpath)
+    except Exception as e:
+        print(f"⚠️  CSV 로드 실패: {fpath.name} ({e})")
+        return pd.DataFrame()
 
 
 class LogManager:
-    """로그 관리 (거래/피처) — 진입/청산 분리 + 통합 파일 업데이트"""
+    """
+    - 거래 로그(통합/엔트리/청산), 피처 로그
+    - 스키마 검증, UTC ISO 기록, 원자적 쓰기
+    - trade_id 기반 결과 업데이트(최근 N일 검색)
+    """
 
-    def __init__(self):
-        self.config = Config
-        self.trade_log_dir = self.config.TRADE_LOG_DIR
-        self.feature_log_dir = self.config.FEATURE_LOG_DIR
+    def __init__(self, search_days: int = 14):
+        self.trade_log_dir = config.TRADE_LOG_DIR
+        self.entry_dir = config.TRADE_ENTRY_DIR
+        self.close_dir = config.TRADE_CLOSE_DIR
+        self.meta_dir = config.TRADE_META_DIR
+        self.feature_log_dir = config.FEATURE_LOG_DIR
 
-        # 서브 디렉토리(진입/청산/메타)
-        self.trade_entries_dir = self.trade_log_dir / "entries"
-        self.trade_closes_dir = self.trade_log_dir / "closes"
-        self.trade_meta_dir = self.trade_log_dir / "meta"
+        self.trade_columns = config.TRADE_LOG_COLUMNS
+        self.feature_columns = config.FEATURE_LOG_COLUMNS
+        self.trade_dtypes = config.TRADE_LOG_DTYPES
+        self.search_days = int(search_days)
 
-        self._ensure_dirs()
-        self.current_versions = self._load_current_versions()
-
-    # ---------------------------
-    # 내부 유틸
-    # ---------------------------
-    def _ensure_dirs(self):
-        for d in [
-            self.trade_log_dir,
-            self.feature_log_dir,
-            self.trade_entries_dir,
-            self.trade_closes_dir,
-            self.trade_meta_dir,
-        ]:
-            d.mkdir(parents=True, exist_ok=True)
-
-    def _load_current_versions(self) -> Dict[str, str]:
-        version_file = self.config.MODEL_DIR / 'current_versions.json'
-        if version_file.exists():
-            with open(version_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        now_ver = self.config.get_version_string()
-        return {
-            'model_ver': now_ver,
-            'feature_ver': now_ver,
-            'filter_ver': now_ver,
-            'cutoff_ver': now_ver,
-            'data_ver': now_ver
-        }
-
-    def update_versions(self, **kwargs):
-        for key, value in kwargs.items():
-            if key in self.current_versions:
-                self.current_versions[key] = value
-        version_file = self.config.MODEL_DIR / 'current_versions.json'
-        with open(version_file, 'w', encoding='utf-8') as f:
-            json.dump(self.current_versions, f, indent=2, ensure_ascii=False)
-
-    @staticmethod
-    def _to_iso(dt: Optional[datetime]) -> Optional[str]:
-        if dt is None:
-            return None
-        if isinstance(dt, str):
-            return dt
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).isoformat()
-
-    @staticmethod
-    def _to_utc_datetime(x) -> Optional[datetime]:
-        if x is None or (isinstance(x, float) and np.isnan(x)):
-            return None
-        try:
-            dt = pd.to_datetime(x, utc=True, errors='coerce')
-            if pd.isna(dt):
-                return None
-            return dt.to_pydatetime()
-        except Exception:
-            return None
-
-    @staticmethod
-    def _minute_index(dt: datetime) -> int:
-        """1분 인덱스(정수): epoch_seconds // 60"""
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.timestamp() // 60)
-
-    def _atomic_write(self, df: pd.DataFrame, path: Path, mode: str, header: bool):
-        tmp = Path(str(path) + ".tmp")
-        if mode == 'a' and path.exists():
-            old = pd.read_csv(path)
-            merged = pd.concat([old, df], ignore_index=True)
-            merged.to_csv(tmp, index=False)
-        else:
-            df.to_csv(tmp, index=False)
-        os.replace(tmp, path)
-
-    def _atomic_overwrite(self, df: pd.DataFrame, path: Path):
-        tmp = Path(str(path) + ".tmp")
-        df.to_csv(tmp, index=False)
-        os.replace(tmp, path)
-
-    def _cast_trade_types(self, df: pd.DataFrame) -> pd.DataFrame:
-        """숫자/불리언/타임스탬프 기본 캐스팅"""
-        if df is None or df.empty:
-            return df
-
-        # timestamps
-        for col in ['bar30_start', 'bar30_end', 'entry_ts', 'label_ts', 'cross_time']:
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col], utc=True, errors='coerce')
-
-        num_cols = [
-            'm1_index_entry', 'm1_index_label',
-            'entry_price', 'label_price',
-            'payout', 'result',
-            'regime', 'is_weekend', 'regime_score',
-            'adx', 'di_plus', 'di_minus',
-            'p_at_entry', 'dp_at_entry',
-            'cut_on', 'cut_off',
-            'ttl_used_sec', 'refractory_window'
-        ]
-        for c in num_cols:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors='coerce')
-
-        if 'ttl_valid' in df.columns:
-            df['ttl_valid'] = df['ttl_valid'].astype('boolean')
-
-        return df
-
-    def _order_trade_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Config.TRADE_LOG_COLUMNS 순으로 정렬"""
-        if df is None or df.empty:
-            return df
-        base = list(getattr(self.config, 'TRADE_LOG_COLUMNS', []))
-        extras = [c for c in ['side', 'status'] if c in df.columns and c not in base]
-        ordered = [c for c in base if c in df.columns] + extras + [c for c in df.columns if c not in base + extras]
-        return df[ordered]
-
-    def _is_weekend(self, dt: datetime) -> int:
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return int(dt.weekday() >= 5)
-
-    # ---------------------------
-    # 경로
-    # ---------------------------
-    def _trade_path(self, date_str: str) -> Path:
-        return self.config.get_log_path('trade', date_str)
-
-    def _trade_entry_path(self, date_str: str) -> Path:
-        return self.trade_entries_dir / f"{date_str}_entries.csv"
-
-    def _trade_close_path(self, date_str: str) -> Path:
-        return self.trade_closes_dir / f"{date_str}_closes.csv"
-
-    def _feature_path(self, date_str: str) -> Path:
-        return self.config.get_log_path('feature', date_str)
-
-    # ---------------------------
-    # Trade: 진입 (ENTRY) - 상세 버전
-    # ---------------------------
-    def log_trade_entry(
-        self,
-        trade_id: str,
-        bar30_start: datetime,
-        bar30_end: datetime,
-        entry_ts: datetime,
-        m1_index_entry: Optional[int],
-        side: str,
-        entry_price: float,
-        regime: int,
-        regime_score: float,
-        adx: float,
-        di_plus: float,
-        di_minus: float,
-        p_at_entry: float,
-        dp_at_entry: float,
-        cut_on: float,
-        cut_off: float,
-        cross_time: Optional[datetime],
-        ttl_used_sec: float,
-        ttl_valid: bool,
-        refractory_window: int,
-        filters_applied: str,
-        reason_code: str,
-        mode: str = 'LIVE',
-        payout: float = None,
-        is_weekend: Optional[int] = None
-    ):
-        """진입(OPEN) 로그 기록 — 청산 정보 없이 기록"""
-        date_str = pd.to_datetime(bar30_start, utc=True).strftime("%Y%m%d")
-        trade_path = self._trade_path(date_str)
-        entry_path = self._trade_entry_path(date_str)
-
-        is_weekend_calc = self._is_weekend(pd.to_datetime(bar30_start, utc=True).to_pydatetime())
-        label_ts = pd.to_datetime(bar30_end, utc=True) + pd.Timedelta(minutes=self.config.BAR_MINUTES)
-
-        if m1_index_entry is None:
-            m1_index_entry = self._minute_index(pd.to_datetime(entry_ts, utc=True).to_pydatetime())
-
-        row = {
-            'trade_id': trade_id,
-            'bar30_start': self._to_iso(bar30_start),
-            'bar30_end': self._to_iso(bar30_end),
-            'entry_ts': self._to_iso(entry_ts),
-            'label_ts': self._to_iso(label_ts),
-            'm1_index_entry': m1_index_entry,
-            'm1_index_label': self._minute_index(label_ts.to_pydatetime()),
-            'entry_price': entry_price,
-            'label_price': np.nan,
-            'payout': payout if payout is not None else self.config.PAYOUT_RATIO,
-            'result': np.nan,
-            'side': str(side).upper(),
-            'regime': regime,
-            'is_weekend': is_weekend_calc,
-            'regime_score': regime_score,
-            'adx': adx,
-            'di_plus': di_plus,
-            'di_minus': di_minus,
-            'p_at_entry': p_at_entry,
-            'dp_at_entry': dp_at_entry,
-            'cut_on': cut_on,
-            'cut_off': cut_off,
-            'cross_time': self._to_iso(cross_time) if cross_time else None,
-            'ttl_used_sec': ttl_used_sec,
-            'ttl_valid': bool(ttl_valid),
-            'refractory_window': refractory_window,
-            'filters_applied': filters_applied,
-            'reason_code': reason_code,
-            'blocked_reason': None,
-            'model_ver': self.current_versions['model_ver'],
-            'feature_ver': self.current_versions['feature_ver'],
-            'filter_ver': self.current_versions['filter_ver'],
-            'cutoff_ver': self.current_versions['cutoff_ver'],
-            'data_ver': self.current_versions['data_ver'],
-            'mode': (mode or 'LIVE').upper(),
-            'status': 'OPEN'
-        }
-        df = pd.DataFrame([row])
-        df = self._cast_trade_types(df)
-        df = self._order_trade_columns(df)
-
-        self._atomic_write(df, trade_path, mode='a', header=not trade_path.exists())
-        self._atomic_write(df, entry_path, mode='a', header=not entry_path.exists())
-
-        print(f"✓ 진입 로그 저장: {trade_path.name} (trade_id={trade_id})")
-
-    # ---------------------------
-    # Trade: real_trade 호환 어댑터 (간소화)
-    # ---------------------------
+    # -------------------------------------------------
+    # 엔트리(간소/상세)
+    # -------------------------------------------------
     def log_trade_entry_simple(
-        self,
-        trade_id: str,
-        direction: int,
-        entry_price: float,
-        entry_time: datetime,
-        expiry_time: datetime,
-        p_up: float,
-        regime: Optional[int],
-        bar30_start: datetime,
-        bar30_end: datetime,
-        stake_recommended: Optional[float] = None,
-        model_version: Optional[str] = None,
-        features_dict: Optional[Dict] = None
-    ):
-        """
-        real_trade.py 호환용 간소화 인터페이스
-        
-        Parameters:
-        -----------
-        direction : int
-            0 (DOWN) or 1 (UP)
-        features_dict : Dict, optional
-            추가 피처 {'regime_score': float, 'adx_14': float, ...}
-        """
-        # direction → side 변환
-        side = 'LONG' if direction == 1 else 'SHORT'
-        
-        # features_dict에서 추출
-        if features_dict:
-            regime_score = float(features_dict.get('regime_score', 0.0))
-            adx = float(features_dict.get('adx_14', 0.0))
-            di_plus = float(features_dict.get('di_plus_14', 0.0))
-            di_minus = float(features_dict.get('di_minus_14', 0.0))
-            dp_at_entry = float(features_dict.get('dp', 0.0))
-        else:
-            regime_score = 0.0
-            adx = 0.0
-            di_plus = 0.0
-            di_minus = 0.0
-            dp_at_entry = 0.0
-        
-        # TTL 계산
-        if entry_time > bar30_end:
-            ttl_used_sec = (entry_time - bar30_end).total_seconds()
-        else:
-            ttl_used_sec = 0.0
-        
-        # 상세 로깅 호출
-        self.log_trade_entry(
-            trade_id=trade_id,
-            bar30_start=bar30_start,
-            bar30_end=bar30_end,
-            entry_ts=entry_time,
-            m1_index_entry=None,
-            side=side,
-            entry_price=entry_price,
-            regime=regime if regime is not None else 0,
-            regime_score=regime_score,
-            adx=adx,
-            di_plus=di_plus,
-            di_minus=di_minus,
-            p_at_entry=p_up,
-            dp_at_entry=dp_at_entry,
-            cut_on=self.config.CUT_ON,
-            cut_off=self.config.CUT_OFF,
-            cross_time=None,
-            ttl_used_sec=ttl_used_sec,
-            ttl_valid=True,
-            refractory_window=self.config.REFRACTORY_WINDOW_MINUTES,
-            filters_applied="auto",
-            reason_code="SIGNAL_ENTRY",
-            mode='LIVE',
-            payout=self.config.PAYOUT_RATIO
-        )
-        
-        # 추가 메타 저장
-        if stake_recommended is not None or model_version is not None:
-            self._save_trade_meta(trade_id, {
-                'stake_recommended': stake_recommended,
-                'model_version': model_version
-            })
+        self, trade_id: str, direction: str, entry_price: float, entry_ts: datetime,
+        p_raw_at_entry: float, regime: int, **kwargs
+    ) -> None:
+        date_str = _to_utc(entry_ts).strftime("%Y%m%d")
 
-    def _save_trade_meta(self, trade_id: str, meta: Dict):
-        """거래 메타 정보 별도 저장 (JSONL)"""
-        date_str = datetime.now(timezone.utc).strftime('%Y%m%d')
-        path = self.trade_meta_dir / f"{date_str}_meta.jsonl"
-        
-        record = {
-            'trade_id': trade_id,
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            **meta
+        base = {
+            "trade_id": trade_id,
+            "entry_ts": _iso(entry_ts),
+            "entry_price": entry_price,
+            "side": direction,
+            "p_raw_at_entry": p_raw_at_entry,
+            "p_cal_at_entry": kwargs.pop("p_cal_at_entry", p_raw_at_entry),
+            "cal_method": kwargs.pop("cal_method", "identity"),
+            "cal_ver": kwargs.pop("cal_ver", ""),
+            "regime": regime,
+            "status": "OPEN",
+            "mode": kwargs.pop("mode", "LIVE"),
+            "model_ver": config.MODEL_VERSION,
+            "feature_ver": config.FEATURE_VERSION,
+            "filter_ver": config.FILTER_VERSION,
+            "cutoff_ver": config.CUTOFF_VERSION,
+            "data_ver": config.DATA_VERSION,
         }
-        
-        with open(path, 'a', encoding='utf-8') as f:
-            json.dump(record, f, ensure_ascii=False, default=str)
-            f.write('\n')
+        # 선택적 시간 필드 ISO화
+        for k in ["bar30_start","bar30_end","cross_time","label_ts"]:
+            if k in kwargs: kwargs[k] = _iso(kwargs[k])
 
-    def load_trade_meta(self, date_str: Optional[str] = None) -> pd.DataFrame:
-        """거래 메타 정보 로드"""
-        if date_str is None:
-            date_str = datetime.now(timezone.utc).strftime('%Y%m%d')
-        
-        path = self.trade_meta_dir / f"{date_str}_meta.jsonl"
-        
-        if not path.exists():
-            return pd.DataFrame()
-        
-        records = []
-        with open(path, 'r', encoding='utf-8') as f:
-            for line in f:
-                try:
-                    records.append(json.loads(line.strip()))
-                except:
-                    continue
-        
-        if not records:
-            return pd.DataFrame()
-        
-        df = pd.DataFrame(records)
-        
-        if 'timestamp' in df.columns:
-            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True, errors='coerce')
-        
-        return df
+        row = {**{c: None for c in self.trade_columns}, **base, **kwargs}
+        df_row = pd.DataFrame([row])
 
-    # ---------------------------
-    # Trade: 청산/업데이트 (CLOSE)
-    # ---------------------------
+        self._append_union(self.trade_log_dir / f"{date_str}_trades.csv", df_row)
+        self._append_union(self.entry_dir / f"{date_str}_entries.csv", df_row)
+
+    def log_trade_entry(
+        self, trade_id: str, bar30_start: datetime, bar30_end: datetime, entry_ts: datetime,
+        m1_index_entry: Optional[int], entry_price: float, side: str,
+        regime: int, regime_score: float, adx: float, di_plus: float, di_minus: float,
+        p_raw_at_entry: float, p_cal_at_entry: float, cal_method: str, cal_ver: str,
+        cut_on: float, cut_off: float, filters_applied: str, **kwargs
+    ) -> None:
+        date_str = _to_utc(entry_ts).strftime("%Y%m%d")
+
+        row = {**{c: None for c in self.trade_columns}, **{
+            "trade_id": trade_id,
+            "bar30_start": _iso(bar30_start),
+            "bar30_end": _iso(bar30_end),
+            "entry_ts": _iso(entry_ts),
+            "m1_index_entry": m1_index_entry,
+            "entry_price": entry_price,
+            "side": side,
+            "regime": regime,
+            "regime_score": regime_score,
+            "adx": adx, "di_plus": di_plus, "di_minus": di_minus,
+            "p_raw_at_entry": p_raw_at_entry,
+            "p_cal_at_entry": p_cal_at_entry,
+            "cal_method": cal_method,
+            "cal_ver": cal_ver,
+            "cut_on": cut_on, "cut_off": cut_off,
+            "filters_applied": filters_applied,
+            "status": "OPEN",
+            "mode": kwargs.get("mode", "LIVE"),
+            "model_ver": config.MODEL_VERSION,
+            "feature_ver": config.FEATURE_VERSION,
+            "filter_ver": config.FILTER_VERSION,
+            "cutoff_ver": config.CUTOFF_VERSION,
+            "data_ver": config.DATA_VERSION,
+        }}
+
+        if "cross_time" in kwargs: row["cross_time"] = _iso(kwargs["cross_time"])
+        df_row = pd.DataFrame([row])
+
+        self._append_union(self.trade_log_dir / f"{date_str}_trades.csv", df_row)
+        self._append_union(self.entry_dir / f"{date_str}_entries.csv", df_row)
+
+    # -------------------------------------------------
+    # 결과 업데이트 (trade_id 전역 탐색)
+    # -------------------------------------------------
     def update_trade_result(
-        self,
-        trade_id: str,
-        result: int,
-        label_price: float,
-        label_ts: Optional[datetime] = None,
-        blocked_reason: Optional[str] = None,
-        date_hint: Optional[str] = None,
-        search_days: int = 3
+        self, trade_id: str, result: str, label_price: float, label_ts: Optional[datetime] = None, **kwargs
     ) -> bool:
-        """청산 결과 업데이트"""
-        candidate_dates: List[str] = []
-        if date_hint:
-            candidate_dates = [date_hint]
-        else:
-            now = datetime.now(timezone.utc)
-            for i in range(search_days):
-                d = (now - pd.Timedelta(days=i)).strftime("%Y%m%d")
-                candidate_dates.append(d)
+        """
+        trade_id를 최근 N일 통합 로그에서 탐색 → 해당 행 업데이트.
+        """
+        if label_ts is None:
+            label_ts = datetime.utcnow()
 
-        target_path = None
-        target_date = None
-        row_idx = None
-        df = None
+        # 검색 파일 목록(최근 N일)
+        files = self._recent_trade_files(self.search_days)
 
-        for d in candidate_dates:
-            p = self._trade_path(d)
-            if not p.exists():
+        updated = False
+        updated_row: Optional[pd.DataFrame] = None
+
+        for f in files:
+            df = _read_csv_safe(f)
+            if df.empty or "trade_id" not in df.columns:
                 continue
-            temp = pd.read_csv(p)
-            if 'trade_id' in temp.columns:
-                mask = temp['trade_id'] == trade_id
-                if mask.any():
-                    target_path = p
-                    target_date = d
-                    row_idx = temp.index[mask][0]
-                    df = temp
-                    break
 
-        if target_path is None or df is None:
-            print(f"⚠️ 업데이트 실패: 최근 {search_days}일 내 trade_id={trade_id}를 찾지 못했습니다.")
-            return False
+            mask = df["trade_id"].astype(str) == str(trade_id)
+            if mask.any():
+                # 업데이트
+                df.loc[mask, "result"] = result
+                df.loc[mask, "label_price"] = label_price
+                df.loc[mask, "label_ts"] = _iso(label_ts)
+                df.loc[mask, "status"] = "CLOSED"
+                for k, v in kwargs.items():
+                    if k in df.columns:
+                        df.loc[mask, k] = v
+                _atomic_write_csv(df, f)
 
-        df = self._cast_trade_types(df)
+                # 청산 로그에도 적재
+                updated_row = df.loc[mask].copy()
+                close_file = self.close_dir / f"{pd.Timestamp(label_ts, tz='UTC').strftime('%Y%m%d')}_closes.csv"
+                self._append_union(close_file, updated_row)
+                updated = True
+                break
 
-        df.loc[row_idx, 'result'] = int(result)
-        df.loc[row_idx, 'label_price'] = float(label_price)
-        if label_ts is not None:
-            df.loc[row_idx, 'label_ts'] = self._to_iso(label_ts)
-        if blocked_reason is not None:
-            df.loc[row_idx, 'blocked_reason'] = blocked_reason
-        
-        if 'status' not in df.columns:
-            df['status'] = np.where(df['result'].notna(), 'CLOSED', 'OPEN')
-        df.loc[row_idx, 'status'] = 'CLOSED'
+        if not updated:
+            print(f"⚠️  trade_id를 찾지 못함: {trade_id}")
+        return updated
 
-        df = self._order_trade_columns(df)
-        self._atomic_overwrite(df, target_path)
+    # -------------------------------------------------
+    # 피처 로그
+    # -------------------------------------------------
+    def log_feature(
+        self, bar30_start: datetime, bar30_end: datetime,
+        open_price: float, high: float, low: float, close: float, volume: float,
+        features: Dict, target: int
+    ) -> None:
+        date_str = _to_utc(bar30_start).strftime("%Y%m%d")
+        base = {
+            "bar30_start": _iso(bar30_start),
+            "bar30_end": _iso(bar30_end),
+            "open": open_price, "high": high, "low": low, "close": close, "volume": volume,
+            "target": target,
+            "feature_ver": config.FEATURE_VERSION, "data_ver": config.DATA_VERSION
+        }
+        row = {**{c: None for c in self.feature_columns}, **base, **features}
+        df_row = pd.DataFrame([row])
+        self._append_union(self.feature_log_dir / f"{date_str}_features.csv", df_row)
 
-        close_date = target_date or pd.to_datetime(df.loc[row_idx, 'bar30_start'], utc=True).strftime("%Y%m%d")
-        close_path = self._trade_close_path(close_date)
-        snapshot = df.loc[[row_idx]].copy()
-        self._atomic_write(snapshot, close_path, mode='a', header=not close_path.exists())
-
-        print(f"✓ 청산 업데이트 완료: {target_path.name} (trade_id={trade_id})")
-        return True
-
-    # ---------------------------
-    # Trade: 로딩
-    # ---------------------------
-    def load_trade_log(self, date_str: Optional[str] = None) -> pd.DataFrame:
-        if date_str is None:
-            date_str = datetime.now(self.config.LOG_TIMEZONE).strftime("%Y%m%d")
-        p = self._trade_path(date_str)
-        if not p.exists():
-            return pd.DataFrame()
-        df = pd.read_csv(p)
-        return self._cast_trade_types(df)
-
-    def load_all_trades(self, start_date: str, end_date: str) -> pd.DataFrame:
-        """기간 [start_date, end_date] (YYYYMMDD)"""
-        all_trades = []
-        start = datetime.strptime(start_date, "%Y%m%d")
-        end = datetime.strptime(end_date, "%Y%m%d")
-        current = start
-        while current <= end:
-            d = current.strftime("%Y%m%d")
-            df = self.load_trade_log(d)
-            if not df.empty:
-                all_trades.append(df)
-            current = current + pd.Timedelta(days=1)
-        if not all_trades:
-            return pd.DataFrame()
-        out = pd.concat(all_trades, ignore_index=True)
-        return self._cast_trade_types(out)
+    # -------------------------------------------------
+    # 로더/요약
+    # -------------------------------------------------
+    def load_trade_log(self, date_str: str) -> pd.DataFrame:
+        f = self.trade_log_dir / f"{date_str}_trades.csv"
+        df = _read_csv_safe(f)
+        return self._coerce_dtypes(df)
 
     def load_recent_trades(self, n: int = 50) -> pd.DataFrame:
-        """최근 N개 거래 로드"""
-        all_trades = []
-        now = datetime.now(timezone.utc)
-        
-        for i in range(7):  # 최근 7일
-            d = (now - pd.Timedelta(days=i)).strftime("%Y%m%d")
-            df = self.load_trade_log(d)
-            if not df.empty:
-                all_trades.append(df)
-        
-        if not all_trades:
-            return pd.DataFrame()
-        
-        combined = pd.concat(all_trades, ignore_index=True)
-        combined = self._cast_trade_types(combined)
-        
-        # 최신순 정렬
-        if 'entry_ts' in combined.columns:
-            combined = combined.sort_values('entry_ts', ascending=False)
-        
-        return combined.head(n).reset_index(drop=True)
+        files = sorted(self.trade_log_dir.glob("*_trades.csv"), reverse=True)
+        dfs: List[pd.DataFrame] = []
+        total = 0
+        for f in files:
+            df = _read_csv_safe(f)
+            if df.empty: continue
+            dfs.append(df)
+            total += len(df)
+            if total >= n: break
+        if not dfs:
+            return pd.DataFrame(columns=self.trade_columns)
+        out = pd.concat(dfs, ignore_index=True)
+        out = self._coerce_dtypes(out)
+        return out.tail(n).reset_index(drop=True)
 
-    # ---------------------------
-    # Feature: 기록/로딩
-    # ---------------------------
-    def log_feature(
-        self,
-        bar30_start: datetime,
-        bar30_end: datetime,
-        pred_ts: datetime,
-        entry_ts: datetime,
-        label_ts: datetime,
-        m1_index_entry: int,
-        m1_index_label: int,
-        cut_on: float,
-        cut_off: float,
-        p_prev: Optional[float],
-        p_now: float,
-        p_cal: float,
-        dp: float,
-        dmin: float,
-        regime: int,
-        vol_ratio: float,
-        spread_bps: float,
-        vwap_gap_bps: float,
-        filters_passed: str,
-        signal_id: str
-    ):
-        date_str = pd.to_datetime(bar30_start, utc=True).strftime("%Y%m%d")
-        path = self._feature_path(date_str)
-        row = {
-            'bar30_start': self._to_iso(bar30_start),
-            'bar30_end': self._to_iso(bar30_end),
-            'pred_ts': self._to_iso(pred_ts),
-            'entry_ts': self._to_iso(entry_ts),
-            'label_ts': self._to_iso(label_ts),
-            'm1_index_entry': int(m1_index_entry),
-            'm1_index_label': int(m1_index_label),
-            'cut_on': float(cut_on),
-            'cut_off': float(cut_off),
-            'p_prev': (None if p_prev is None else float(p_prev)),
-            'p_now': float(p_now),
-            'p_cal': float(p_cal),
-            'dp': float(dp),
-            'dmin': float(dmin),
-            'regime': int(regime),
-            'vol_ratio': float(vol_ratio),
-            'spread_bps': float(spread_bps),
-            'vwap_gap_bps': float(vwap_gap_bps),
-            'filters_passed': filters_passed,
-            'signal_id': signal_id,
-            'model_ver': self.current_versions['model_ver'],
-            'feature_ver': self.current_versions['feature_ver'],
-            'filter_ver': self.current_versions['filter_ver'],
-            'cutoff_ver': self.current_versions['cutoff_ver'],
-            'data_ver': self.current_versions['data_ver']
-        }
-        df = pd.DataFrame([row])
-        self._atomic_write(df, path, mode='a', header=not path.exists())
-
-    def load_feature_log(self, date_str: Optional[str] = None) -> pd.DataFrame:
-        if date_str is None:
-            date_str = datetime.now(self.config.LOG_TIMEZONE).strftime("%Y%m%d")
-        path = self._feature_path(date_str)
-        if not path.exists():
-            return pd.DataFrame()
-        df = pd.read_csv(path)
-        for col in ['bar30_start', 'bar30_end', 'pred_ts', 'entry_ts', 'label_ts']:
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col], utc=True, errors='coerce')
-        return df
-
-    # ---------------------------
-    # 무결성 검증
-    # ---------------------------
-    def validate_trade_log(self, df: pd.DataFrame) -> Dict:
-        errors = []
-        if df is None or df.empty:
-            return {'valid': True, 'errors': []}
-
-        required_cols = list(getattr(self.config, 'TRADE_LOG_COLUMNS', []))
-        if 'side' not in required_cols:
-            required_cols = required_cols + ['side']
-        missing_cols = [c for c in required_cols if c not in df.columns]
-        if missing_cols:
-            errors.append(f"필수 컬럼 누락: {missing_cols}")
-
-        df = self._cast_trade_types(df)
-
-        if 'entry_ts' in df.columns and 'bar30_end' in df.columns:
-            tol = pd.Timedelta(seconds=300)  # 5분
-            mismatch = ((df['entry_ts'] - df['bar30_end']).abs() > tol).sum()
-            if mismatch > 0:
-                errors.append(f"entry_ts != bar30_end (±{int(tol.total_seconds())}초 초과): {mismatch}건")
-
-        if 'label_ts' in df.columns and 'bar30_end' in df.columns:
-            expected_label = df['bar30_end'] + pd.Timedelta(minutes=self.config.BAR_MINUTES)
-            mask_closed = (df.get('status', 'CLOSED') == 'CLOSED') if 'status' in df.columns else df['result'].notna()
-            comp_mask = mask_closed & df['label_ts'].notna()
-            mismatch = (df.loc[comp_mask, 'label_ts'] != expected_label[comp_mask]).sum()
-            if mismatch > 0:
-                errors.append(f"label_ts != bar30_end + {self.config.BAR_MINUTES}분: {mismatch}건")
-
-        nan_cols = []
-        for c in df.columns:
-            if df[c].isna().any():
-                if c in ['result', 'label_price', 'blocked_reason', 'cross_time'] and \
-                   (('status' in df.columns and (df['status'] == 'OPEN').any())):
-                    continue
-                nan_cols.append(c)
-        if nan_cols:
-            errors.append(f"NaN 존재: {sorted(set(nan_cols))}")
-
-        if 'trade_id' in df.columns:
-            dup_count = df['trade_id'].duplicated().sum()
-            if dup_count > 0:
-                errors.append(f"중복 trade_id: {dup_count}건")
-
-        if 'ttl_valid' in df.columns and df['ttl_valid'].notna().any():
-            invalid_ttl = (~df['ttl_valid'].fillna(True)).sum()
-            if invalid_ttl > 0:
-                errors.append(f"ttl_valid=False: {invalid_ttl}건 (경고)")
-
-        return {'valid': len(errors) == 0, 'errors': errors}
-
-    def validate_feature_log(self, df: pd.DataFrame) -> Dict:
-        errors = []
-        if df is None or df.empty:
-            return {'valid': True, 'errors': []}
-
-        required_cols = list(getattr(self.config, 'FEATURE_LOG_COLUMNS', []))
-        missing_cols = [c for c in required_cols if c not in df.columns]
-        if missing_cols:
-            errors.append(f"필수 컬럼 누락: {missing_cols}")
-
-        if df.isna().any().any():
-            nan_cols = df.columns[df.isna().any()].tolist()
-            errors.append(f"NaN 존재: {nan_cols}")
-
-        if 'signal_id' in df.columns:
-            dup_count = df['signal_id'].duplicated().sum()
-            if dup_count > 0:
-                errors.append(f"중복 signal_id: {dup_count}건")
-
-        return {'valid': len(errors) == 0, 'errors': errors}
-
-    # ---------------------------
-    # 통계
-    # ---------------------------
-    def get_trade_summary(self, date_str: Optional[str] = None) -> Dict:
+    def get_trade_summary(self, date_str: str) -> Dict:
         df = self.load_trade_log(date_str)
         if df.empty:
-            return {'total_trades': 0}
+            return {'date': date_str, 'total_trades': 0, 'open_trades': 0, 'closed_trades': 0, 'win_rate': 0.0, 'total_pnl': 0.0}
 
         total = len(df)
-        win_rate = float(df['result'].mean()) if 'result' in df.columns else float('nan')
-        long_trades = int((df['side'] == 'LONG').sum()) if 'side' in df.columns else 0
-        short_trades = int((df['side'] == 'SHORT').sum()) if 'side' in df.columns else 0
-        avg_prob = float(df['p_at_entry'].mean()) if 'p_at_entry' in df.columns else float('nan')
-        regime_dist = df['regime'].value_counts().to_dict() if 'regime' in df.columns else {}
+        open_cnt = (df.get("status") == "OPEN").sum() if "status" in df else 0
+        closed = df[df.get("status") == "CLOSED"] if "status" in df else pd.DataFrame()
+        if len(closed) > 0:
+            wins = (closed.get("result") == "WIN").sum()
+            win_rate = wins / len(closed)
+        else:
+            win_rate = 0.0
 
-        blocked = {}
-        if 'blocked_reason' in df.columns:
-            bser = df['blocked_reason'].dropna()
-            blocked = bser.value_counts().to_dict()
+        pnl = 0.0
+        if "payout" in df.columns and len(closed) > 0:
+            wins = closed[closed["result"] == "WIN"]
+            losses = closed[closed["result"] == "LOSS"]
+            pnl = wins["payout"].sum() - len(losses)
 
-        return {
-            'total_trades': total,
-            'win_rate': win_rate,
-            'long_trades': long_trades,
-            
+        return {'date': date_str, 'total_trades': total, 'open_trades': int(open_cnt), 'closed_trades': int(len(closed)), 'win_rate': float(win_rate), 'total_pnl': float(pnl)}
 
-            'short_trades': short_trades,
-            'avg_probability': avg_prob,
-            'regime_distribution': regime_dist,
-            'blocked_reasons': blocked
-        }
+    # -------------------------------------------------
+    # 검증
+    # -------------------------------------------------
+    def validate_trade_log(self, df: pd.DataFrame) -> Dict:
+        res = {'valid': True, 'errors': [], 'warnings': []}
+        if df.empty:
+            res['warnings'].append("로그가 비어있음")
+            return res
 
-    def print_daily_summary(self, date_str: Optional[str] = None):
-        if date_str is None:
-            date_str = datetime.now(self.config.LOG_TIMEZONE).strftime("%Y%m%d")
-        s = self.get_trade_summary(date_str)
+        missing = [c for c in self.trade_columns if c not in df.columns]
+        if missing:
+            res['errors'].append(f"필수 컬럼 누락: {missing}")
+            res['valid'] = False
 
-        print(f"\n{'='*60}")
-        print(f"거래 요약: {date_str}")
-        print(f"{'='*60}")
+        if "trade_id" in df.columns:
+            dup = df["trade_id"].duplicated().sum()
+            if dup > 0:
+                res['warnings'].append(f"중복 trade_id: {int(dup)}개")
 
-        if s['total_trades'] == 0:
-            print("거래 없음")
-            return
+        # 핵심 결측
+        for c in ["trade_id","entry_ts","entry_price","side","status"]:
+            if c in df.columns and df[c].isnull().sum() > 0:
+                res['errors'].append(f"{c} 결측치 {int(df[c].isnull().sum())}개")
+                res['valid'] = False
 
-        print(f"총 거래: {s['total_trades']}건")
-        wr = s.get('win_rate', float('nan'))
-        print(f"승률: {wr:.2%}" if pd.notna(wr) else "승률: N/A")
-        print(f"LONG: {s.get('long_trades', 0)}건")
-        print(f"SHORT: {s.get('short_trades', 0)}건")
-        ap = s.get('avg_probability', float('nan'))
-        print(f"평균 확률: {ap:.4f}" if pd.notna(ap) else "평균 확률: N/A")
+        # 가격 유효성
+        if "entry_price" in df.columns:
+            badp = (pd.to_numeric(df["entry_price"], errors="coerce") <= 0).sum()
+            if badp > 0:
+                res['errors'].append(f"유효하지 않은 가격 {int(badp)}개")
+                res['valid'] = False
 
-        if s.get('regime_distribution'):
-            print(f"\n레짐 분포:")
-            for regime, count in s['regime_distribution'].items():
-                print(f"  {regime}: {count}건")
+        # side/result 값
+        if "side" in df.columns:
+            invalid_side = (~df["side"].isin(["UP","DOWN",None])).sum()
+            if invalid_side > 0:
+                res['errors'].append(f"유효하지 않은 side {int(invalid_side)}개")
+                res['valid'] = False
 
-        if s.get('blocked_reasons'):
-            print(f"\n차단 사유:")
-            for reason, count in s['blocked_reasons'].items():
-                if reason and str(reason) != 'nan':
-                    print(f"  {reason}: {count}건")
+        if "result" in df.columns and "status" in df.columns:
+            closed = df[df["status"] == "CLOSED"]
+            invalid_result = (~closed["result"].isin(["WIN","LOSS","CANCELLED"])).sum()
+            if invalid_result > 0:
+                res['warnings'].append(f"유효하지 않은 result {int(invalid_result)}개")
+
+        # 시간 무결성
+        if "entry_ts" in df.columns:
+            et = pd.to_datetime(df["entry_ts"], utc=True, errors="coerce")
+            if et.isna().any():
+                res['errors'].append("entry_ts 파싱 실패 레코드 존재")
+                res['valid'] = False
+            else:
+                if not et.sort_values().equals(et):
+                    res['warnings'].append("entry_ts가 정렬되지 않음")
+                dups = et.duplicated().sum()
+                if dups > 0:
+                    res['warnings'].append(f"entry_ts 중복 {int(dups)}건")
+
+        return res
+
+    # -------------------------------------------------
+    # 내부 유틸
+    # -------------------------------------------------
+    def _append_union(self, fpath: Path, df_new: pd.DataFrame):
+        """
+        기존 파일과 컬럼 유니온 후 append → 원자적 overwrite.
+        """
+        df_old = _read_csv_safe(fpath)
+        if df_old.empty:
+            out = df_new[self.trade_columns] if set(self.trade_columns).issuperset(df_new.columns) else df_new
+        else:
+            all_cols = list(dict.fromkeys(list(df_old.columns) + list(df_new.columns)))
+            out = pd.concat([df_old.reindex(columns=all_cols), df_new.reindex(columns=all_cols)], ignore_index=True)
+        _atomic_write_csv(out, fpath)
+
+    def _coerce_dtypes(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        # 시간 파싱
+        for c in ["bar30_start","bar30_end","entry_ts","label_ts","cross_time"]:
+            if c in df.columns:
+                df[c] = pd.to_datetime(df[c], utc=True, errors="coerce")
+        # 숫자 변환(가능한 범위)
+        for c in ["entry_price","label_price","payout","regime_score","adx","di_plus","di_minus",
+                  "p_raw_at_entry","p_cal_at_entry","cut_on","cut_off","ttl_used_sec","refractory_window"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        return df
+
+    def _recent_trade_files(self, days: int) -> List[Path]:
+        files = sorted(self.trade_log_dir.glob("*_trades.csv"), reverse=True)
+        if days <= 0:
+            return files
+        cutoff = pd.Timestamp.utcnow().tz_localize("UTC") - pd.Timedelta(days=days)
+        out = []
+        for f in files:
+            # 파일명에서 날짜 추출
+            try:
+                date_str = f.name.split("_")[0]
+                dt = pd.to_datetime(date_str, format="%Y%m%d", utc=True)
+                if dt >= cutoff.normalize():
+                    out.append(f)
+            except Exception:
+                out.append(f)  # 포맷 불명은 일단 포함
+        return out
 
 
-# =========================
-# 단독 테스트
-# =========================
 if __name__ == "__main__":
-    Config.create_directories()
+    print("="*60, "\nLogManager quick test\n", "="*60)
     lm = LogManager()
 
-    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    bar30_start = now.replace(minute=(now.minute // 30) * 30)
-    bar30_end = bar30_start + pd.Timedelta(minutes=30)
-
-    print("\n" + "="*60)
-    print("LogManager 테스트")
-    print("="*60)
-
-    # [테스트 1] 상세 로깅
-    print("\n[테스트 1] 상세 로깅 (기존 방식)")
+    now = pd.Timestamp("2025-01-15 10:30:00Z")
+    # 엔트리
+    lm.log_trade_entry_simple(
+        trade_id="T001", direction="UP", entry_price=50000.0, entry_ts=now.to_pydatetime(),
+        p_raw_at_entry=0.65, regime=1,
+        bar30_start=now, bar30_end=now + pd.Timedelta(minutes=30),
+        adx=30.0, regime_score=0.8, p_cal_at_entry=0.65, cal_method="identity", cal_ver="cal_a"
+    )
+    # 상세
     lm.log_trade_entry(
-        trade_id='TEST_001',
-        bar30_start=bar30_start,
-        bar30_end=bar30_end,
-        entry_ts=bar30_end,
-        m1_index_entry=None,
-        side='LONG',
-        entry_price=42000.0,
-        regime=1,
-        regime_score=0.7,
-        adx=25.0,
-        di_plus=30.0,
-        di_minus=20.0,
-        p_at_entry=0.65,
-        dp_at_entry=0.02,
-        cut_on=0.6,
-        cut_off=0.58,
-        cross_time=bar30_end,
-        ttl_used_sec=300.0,
-        ttl_valid=True,
-        refractory_window=30,
-        filters_applied='filter1,filter2',
-        reason_code='ENTRY_CONFIRMED',
-        mode='LIVE',
-        payout=0.85
+        trade_id="T002", bar30_start=now, bar30_end=now+pd.Timedelta(minutes=30),
+        entry_ts=now, m1_index_entry=1000, entry_price=50100.0, side="DOWN",
+        regime=-1, regime_score=-0.6, adx=35.0, di_plus=20.0, di_minus=30.0,
+        p_raw_at_entry=0.70, p_cal_at_entry=0.70, cal_method="identity", cal_ver="cal_a",
+        cut_on=0.60, cut_off=0.55, filters_applied='{"adx_filter": true}'
     )
+    # 업데이트
+    lm.update_trade_result("T001", "WIN", 50200.0, label_ts=now+pd.Timedelta(minutes=30), payout=0.85)
 
-    # [테스트 2] 간소화 로깅 (real_trade 호환)
-    print("\n[테스트 2] 간소화 로깅 (real_trade 호환)")
-    lm.log_trade_entry_simple(
-        trade_id='TEST_002',
-        direction=1,  # UP
-        entry_price=42100.0,
-        entry_time=bar30_end + pd.Timedelta(minutes=1),
-        expiry_time=bar30_end + pd.Timedelta(minutes=30),
-        p_up=0.67,
-        regime=1,
-        bar30_start=bar30_start,
-        bar30_end=bar30_end,
-        stake_recommended=25.0,
-        model_version='v1.2.3',
-        features_dict={
-            'regime_score': 0.8,
-            'adx_14': 28.0,
-            'di_plus_14': 32.0,
-            'di_minus_14': 18.0,
-            'dp': 0.03
-        }
-    )
-
-    print("\n[테스트 3] 간소화 로깅 - DOWN")
-    lm.log_trade_entry_simple(
-        trade_id='TEST_003',
-        direction=0,  # DOWN
-        entry_price=42050.0,
-        entry_time=bar30_end + pd.Timedelta(minutes=2),
-        expiry_time=bar30_end + pd.Timedelta(minutes=30),
-        p_up=0.35,  # DOWN이므로 0.5 미만
-        regime=-1,
-        bar30_start=bar30_start,
-        bar30_end=bar30_end,
-        stake_recommended=15.0,
-        model_version='v1.2.3',
-        features_dict={
-            'regime_score': -0.6,
-            'adx_14': 22.0,
-            'di_plus_14': 18.0,
-            'di_minus_14': 28.0,
-            'dp': 0.02
-        }
-    )
-
-    # [테스트 4] 청산 업데이트
-    print("\n[테스트 4] 청산 업데이트")
-    lm.update_trade_result(
-        trade_id='TEST_001',
-        result=1,
-        label_price=42100.0,
-        label_ts=bar30_end + pd.Timedelta(minutes=Config.BAR_MINUTES)
-    )
-
-    lm.update_trade_result(
-        trade_id='TEST_002',
-        result=1,
-        label_price=42150.0,
-        label_ts=bar30_end + pd.Timedelta(minutes=Config.BAR_MINUTES)
-    )
-
-    lm.update_trade_result(
-        trade_id='TEST_003',
-        result=0,
-        label_price=42080.0,
-        label_ts=bar30_end + pd.Timedelta(minutes=Config.BAR_MINUTES)
-    )
-
-    # [테스트 5] 로드 및 검증
-    print("\n[테스트 5] 로드 및 검증")
-    d = bar30_start.strftime("%Y%m%d")
-    df = lm.load_trade_log(d)
-    print(f"\n거래 로그 ({len(df)}건):")
-    if not df.empty:
-        display_cols = ['trade_id', 'side', 'entry_price', 'label_price', 'result', 'p_at_entry', 'status']
-        available_cols = [c for c in display_cols if c in df.columns]
-        print(df[available_cols])
-
-    val = lm.validate_trade_log(df)
-    print(f"\n검증: {'✓ OK' if val['valid'] else '✗ FAIL'}")
-    if not val['valid']:
-        for err in val['errors']:
-            print(f"  - {err}")
-
-    # [테스트 6] 메타 로드
-    print("\n[테스트 6] 메타 로드")
-    meta_df = lm.load_trade_meta(d)
-    if not meta_df.empty:
-        print("\n거래 메타 정보:")
-        print(meta_df[['trade_id', 'stake_recommended', 'model_version']])
-    else:
-        print("메타 없음")
-
-    # [테스트 7] 최근 거래 로드
-    print("\n[테스트 7] 최근 거래 로드")
-    recent = lm.load_recent_trades(n=10)
-    print(f"최근 {len(recent)}건 거래 로드됨")
-    if not recent.empty:
-        print(recent[['trade_id', 'side', 'result']].head())
-
-    # [테스트 8] 일일 요약
-    print("\n[테스트 8] 일일 요약")
-    lm.print_daily_summary(d)
-
-    print("\n" + "="*60)
-    print("✓ 테스트 완료")
-    print("="*60)
+    # 검증
+    date_str = now.strftime("%Y%m%d")
+    df = lm.load_trade_log(date_str)
+    print("loaded:", len(df))
+    print(lm.validate_trade_log(df))

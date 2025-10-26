@@ -1,630 +1,560 @@
-# data_merge.py - 데이터 병합 및 관리 모듈 (UTC & ts_min 안전, 30분봉 LogManager 호환)
-# - 가격: PRICE_DATA_DIR/raw/prices_YYYYMMDD.csv (또는 prices.csv) 모아서 사용
-# - 거래: logs/trades/YYYYMMDD.csv (LogManager가 쓰는 일자별 통합 파일)
-# - 피처: logs/features/features_YYYYMMDD.csv
-# - ts_min 통일 생성 (가격: timestamp, 거래: bar30_end, 피처: entry_ts 기본)
-# - 레거시 trades.csv도 자동 호환
+"""
+데이터 병합 - 가격/로그/거래 통합 + 품질 검증
+버전: 1.3.0
+"""
 
 import pandas as pd
 import numpy as np
-import os
-import glob
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Tuple, List, Dict, Optional
+
+import config
+from data_loader import DataLoader
+from log_manager import LogManager
+from timeframe_manager import TimeframeManager
 
 
 class DataMerger:
-    """실시간 데이터 병합 및 관리 (30분봉 로그 스키마 호환)"""
-
-    def __init__(self, config):
-        self.config = config
-        self.merged_data = None
-
-    # ========================
-    # 기본 유틸
-    # ========================
-    @staticmethod
-    def _to_utc_series(s: pd.Series) -> pd.Series:
-        """문자열/naive datetime을 UTC-aware Timestamp로 변환"""
-        if s is None:
-            return pd.Series([], dtype='datetime64[ns, UTC]')
-        return pd.to_datetime(s, errors='coerce', utc=True)
-
-    @staticmethod
-    def _dedup_columns(df: pd.DataFrame) -> pd.DataFrame:
-        if df is None or df.empty:
-            return df
-        return df.loc[:, ~df.columns.duplicated()].copy()
-
-    @classmethod
-    def _ensure_ts_min(cls, df: pd.DataFrame, time_col: str) -> pd.DataFrame:
+    """
+    데이터 병합 및 품질 관리
+    - 가격 + 로그 + 거래 병합
+    - 타임프레임 정렬
+    - 데이터 품질 검증
+    - 재학습용 클린 데이터셋 생성
+    """
+    
+    def __init__(self):
+        """인자 없이 초기화 (Config 참조)"""
+        self.data_loader = DataLoader()
+        self.log_manager = LogManager()
+        self.tf_manager = TimeframeManager()
+    
+    def merge_all_data(self, start_date: str, end_date: str, filename: str = None) -> pd.DataFrame:
         """
-        df[time_col]을 UTC로 변환하고 분단위로 내림한 'ts_min' 컬럼 생성(항상 재계산)
+        전체 데이터 병합
+        
+        Args:
+            start_date: 시작일 (YYYY-MM-DD)
+            end_date: 종료일 (YYYY-MM-DD)
+            filename: 파일명 (None이면 자동 탐색)
+        
+        Returns:
+            병합된 데이터프레임
         """
-        df = df.copy()
-        if 'ts_min' in df.columns:
-            df.drop(columns=['ts_min'], inplace=True)
-        if time_col not in df.columns:
-            df['ts_min'] = pd.NaT
-            return df
-        ts = cls._to_utc_series(df[time_col])
-        df[time_col] = ts
-        df['ts_min'] = ts.dt.floor('T')
-        return df
-
-    # ========================
-    # 가격 로딩
-    # ========================
-    def _price_files(self) -> List[str]:
-        raw_dir = os.path.join(self.config.PRICE_DATA_DIR, 'raw')
-        files = sorted(glob.glob(os.path.join(raw_dir, 'prices_*.csv')))
-        # 백업 플랜: 단일 prices.csv가 있을 수도 있음
-        alt = os.path.join(self.config.PRICE_DATA_DIR, 'prices.csv')
-        if os.path.exists(alt):
-            files.append(alt)
-        return files
-
-    def load_price_data(self,
-                        start_date: Optional[datetime] = None,
-                        end_date: Optional[datetime] = None) -> pd.DataFrame:
-        files = self._price_files()
-        if not files:
-            return pd.DataFrame()
-
-        dfs = []
-        for fp in files:
-            try:
-                df = pd.read_csv(fp)
-            except Exception:
-                continue
-            df = self._dedup_columns(df)
-            # 항상 ts_min 재계산
-            if 'ts_min' in df.columns:
-                df.drop(columns=['ts_min'], inplace=True, errors='ignore')
-            if 'timestamp' in df.columns:
-                df['timestamp'] = self._to_utc_series(df['timestamp'])
-                if start_date is not None:
-                    s = pd.to_datetime(start_date, utc=True)
-                    df = df[df['timestamp'] >= s]
-                if end_date is not None:
-                    e = pd.to_datetime(end_date, utc=True)
-                    df = df[df['timestamp'] <= e]
-            dfs.append(df)
-
-        if not dfs:
-            return pd.DataFrame()
-
-        price = pd.concat(dfs, ignore_index=True)
-        price = self._dedup_columns(price)
-        if 'timestamp' in price.columns:
-            price = price.sort_values('timestamp').drop_duplicates(subset=['timestamp'], keep='last')
-        return price
-
-    # ========================
-    # 거래 로딩 (LogManager 포맷 우선)
-    # ========================
-    def _trade_files_by_days(self, days: int = 7) -> List[str]:
-        """
-        logs/trades/YYYYMMDD.csv 최근 N일 파일
-        """
-        out = []
-        base = self.config.TRADE_LOG_DIR
-        now = datetime.now(timezone.utc)
-        for i in range(days):
-            d = (now - timedelta(days=i)).strftime("%Y%m%d")
-            fp = base / f"{d}.csv"
-            if fp.exists():
-                out.append(str(fp))
-        return sorted(out)
-
-    def load_trade_logs(self, days: int = 7, include_open: bool = False, join_meta: bool = True) -> pd.DataFrame:
-        """
-        LogManager가 생성한 날짜별 트레이드 로그를 로드해 표준 스키마로 어댑트.
-        (기존 load_trade_logs 대체용)
-        """
-        from datetime import datetime, timezone, timedelta
-        import glob
-        base_dir = self.config.TRADE_LOG_DIR
-        dfs = []
-
-        for i in range(days):
-            d = (datetime.now(timezone.utc) - timedelta(days=i)).strftime("%Y%m%d")
-            try:
-                daily_path = self.config.get_log_path('trade', d)
-            except Exception:
-                daily_path = Path(base_dir) / f"{d}.csv"
-
-            if os.path.exists(daily_path):
-                df = pd.read_csv(daily_path)
-                if df.empty:
+        print(f"\n📊 데이터 병합 시작: {start_date} ~ {end_date}")
+        
+        # 1. 가격 데이터 로드
+        if filename:
+            df_price = self.data_loader.load_price_data(start_date, end_date, filename)
+        else:
+            # 파일 자동 탐색
+            possible_files = ['btcusdt_1m.csv', 'test_merger.csv', 'test_data_loader.csv']
+            df_price = pd.DataFrame()
+            
+            for fname in possible_files:
+                try:
+                    df_price = self.data_loader.load_price_data(start_date, end_date, fname)
+                    if not df_price.empty:
+                        print(f"  ✅ 파일 로드: {fname}")
+                        break
+                except:
                     continue
-
-                # 시간/숫자 변환
-                for col in ['entry_ts', 'label_ts', 'bar30_start', 'bar30_end', 'cross_time']:
-                    if col in df.columns:
-                        df[col] = pd.to_datetime(df[col], utc=True, errors='coerce')
-
-                for col in ['result','entry_price','label_price','p_at_entry','dp_at_entry','regime']:
-                    if col in df.columns:
-                        df[col] = pd.to_numeric(df[col], errors='coerce')
-
-                df['entry_time'] = df.get('entry_ts', pd.NaT)
-                df['exit_time']  = df.get('label_ts', pd.NaT)
-                df['p_up']       = df.get('p_at_entry', np.nan)
-
-                if 'side' in df.columns:
-                    side = df['side'].astype(str).str.upper()
-                    df['direction'] = np.where(side == 'LONG', 1, np.where(side == 'SHORT', 0, np.nan))
-                elif 'direction' in df.columns:
-                    df['direction'] = pd.to_numeric(df['direction'], errors='coerce')
-                else:
-                    df['direction'] = np.nan
-
-                if not include_open:
-                    if 'status' in df.columns:
-                        df = df[df['status'] == 'CLOSED']
-                    else:
-                        df = df[df['result'].notna()]
-
-                df['regime'] = df.get('regime', 0).fillna(0)
-
-                keep = [
-                    'trade_id','entry_time','exit_time','direction','p_up','result',
-                    'entry_price','label_price','regime','side','p_at_entry','dp_at_entry',
-                    'bar30_start','bar30_end','status','model_ver','feature_ver','filter_ver','cutoff_ver'
-                ]
-                df = df[[c for c in keep if c in df.columns]]
-
-                # 메타 병합
-                if join_meta:
-                    meta_path = Path(base_dir) / 'meta' / f"{d}_meta.jsonl"
-                    if meta_path.exists():
-                        records = []
-                        with open(meta_path, 'r', encoding='utf-8') as f:
-                            for line in f:
-                                try:
-                                    records.append(json.loads(line.strip()))
-                                except:
-                                    pass
-                        if records:
-                            m = pd.DataFrame(records)
-                            if 'timestamp' in m.columns:
-                                m['timestamp'] = pd.to_datetime(m['timestamp'], utc=True, errors='coerce')
-                            if 'trade_id' in m.columns:
-                                meta_cols = [c for c in ['trade_id','stake_recommended','model_version'] if c in m.columns]
-                                m = m[meta_cols].drop_duplicates('trade_id', keep='last')
-                                df = df.merge(m, on='trade_id', how='left')
-
-                dfs.append(df)
-
-        if not dfs:
+        
+        if df_price.empty:
+            print("⚠️  가격 데이터 없음")
             return pd.DataFrame()
-
-        out = pd.concat(dfs, ignore_index=True)
-        for col in ['entry_time','exit_time','bar30_start','bar30_end']:
-            if col in out.columns:
-                out[col] = pd.to_datetime(out[col], utc=True, errors='coerce')
-        if 'entry_time' in out.columns:
-            out = out.sort_values('entry_time')
-        if 'p_up' not in out.columns and 'p_at_entry' in out.columns:
-            out['p_up'] = out['p_at_entry']
-
-        return out.reset_index(drop=True)
-
-
-    # ========================
-    # 피처 로딩 (LogManager 포맷)
-    # ========================
-    def _feature_files_by_days(self, days: int = 7) -> List[str]:
-        """
-        logs/features/features_YYYYMMDD.csv 최근 N일 파일
-        """
-        out = []
-        now = datetime.now(timezone.utc)
-        for i in range(days):
-            d = (now - timedelta(days=i)).strftime("%Y%m%d")
-            fp = self.config.get_log_path('feature', d)
-            if Path(fp).exists():
-                out.append(str(fp))
-        return sorted(out)
-
-    def load_feature_logs(self, days: int = 7) -> pd.DataFrame:
-        files = self._feature_files_by_days(days=days)
-        if not files:
+        
+        # 2. 1분봉 → 30분봉 집계
+        df_30m = self.tf_manager.aggregate_1m_to_30m(df_price)
+        
+        if df_30m.empty:
+            print("⚠️  30분봉 집계 실패")
             return pd.DataFrame()
-
+        
+        print(f"  ✅ 30분봉 집계: {len(df_30m)}개")
+        
+        # 3. 거래 로그 로드
+        df_trades = self._load_trade_logs_range(start_date, end_date)
+        
+        if not df_trades.empty:
+            print(f"  ✅ 거래 로그 로드: {len(df_trades)}개")
+            
+            # 4. 병합
+            df_merged = self._merge_price_and_trades(df_30m, df_trades)
+        else:
+            print("  ⚠️  거래 로그 없음, 가격 데이터만 사용")
+            df_merged = df_30m.copy()
+        
+        print(f"\n✅ 병합 완료: {len(df_merged)}개 레코드")
+        
+        return df_merged
+    
+    def _load_trade_logs_range(self, start_date: str, end_date: str) -> pd.DataFrame:
+        """날짜 범위의 거래 로그 로드"""
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+        
         dfs = []
-        for fp in files:
-            try:
-                df = pd.read_csv(fp)
-            except Exception:
-                continue
-            dfs.append(df)
+        current_dt = start_dt
+        
+        while current_dt <= end_dt:
+            date_str = current_dt.strftime("%Y%m%d")
+            df_day = self.log_manager.load_trade_log(date_str)
+            
+            if not df_day.empty:
+                dfs.append(df_day)
+            
+            current_dt += pd.Timedelta(days=1)
+        
         if not dfs:
             return pd.DataFrame()
-
-        feats = pd.concat(dfs, ignore_index=True)
-        feats = self._dedup_columns(feats)
-
-        # 타임스탬프 캐스팅
-        for c in ['bar30_start', 'bar30_end', 'pred_ts', 'entry_ts', 'label_ts']:
-            if c in feats.columns:
-                feats[c] = self._to_utc_series(feats[c])
-
-        # 피처 정렬/중복제거
-        # ts_min = entry_ts(있으면) → 없으면 bar30_end
-        if 'entry_ts' in feats.columns and feats['entry_ts'].notna().any():
-            feats = self._ensure_ts_min(feats, 'entry_ts')
-        elif 'bar30_end' in feats.columns:
-            feats = self._ensure_ts_min(feats, 'bar30_end')
+        
+        df_combined = pd.concat(dfs, ignore_index=True)
+        
+        return df_combined
+    
+    def _merge_price_and_trades(self, df_price: pd.DataFrame, 
+                                df_trades: pd.DataFrame) -> pd.DataFrame:
+        """가격과 거래 로그 병합"""
+        # bar30_start 기준으로 병합
+        if 'bar30_start' not in df_price.columns:
+            print("⚠️  bar30_start 컬럼 없음")
+            return df_price
+        
+        if 'bar30_start' not in df_trades.columns:
+            print("⚠️  거래 로그에 bar30_start 없음")
+            return df_price
+        
+        # 타임스탬프 정규화
+        df_price = df_price.copy()
+        df_trades = df_trades.copy()
+        
+        df_price['bar30_start'] = pd.to_datetime(df_price['bar30_start'])
+        df_trades['bar30_start'] = pd.to_datetime(df_trades['bar30_start'])
+        
+        # 거래 수 집계
+        trade_counts = df_trades.groupby('bar30_start').size().reset_index(name='n_trades')
+        
+        # 승률 집계
+        df_closed = df_trades[df_trades['status'] == 'CLOSED']
+        if not df_closed.empty:
+            win_rates = df_closed.groupby('bar30_start').apply(
+                lambda x: (x['result'] == 'WIN').mean()
+            ).reset_index(name='win_rate')
         else:
-            feats['ts_min'] = pd.NaT
-
-        feats = feats.sort_values('ts_min').drop_duplicates(subset=['ts_min'], keep='last')
-        return feats
-
-    # ========================
-    # 병합
-    # ========================
-    def merge_all_data(self, price_days: int = 7, trade_days: int = 7, feature_days: int = 7) -> pd.DataFrame:
+            win_rates = pd.DataFrame(columns=['bar30_start', 'win_rate'])
+        
+        # 병합
+        df_merged = df_price.merge(trade_counts, on='bar30_start', how='left')
+        df_merged = df_merged.merge(win_rates, on='bar30_start', how='left')
+        
+        # 결측치 처리
+        df_merged['n_trades'] = df_merged['n_trades'].fillna(0).astype(int)
+        df_merged['win_rate'] = df_merged['win_rate'].fillna(0.0)
+        
+        return df_merged
+    
+    def validate_merged_data(self, df: pd.DataFrame) -> Tuple[bool, List[str]]:
         """
-        가격/거래/피처를 ts_min 기준으로 병합
-        - 가격: 정확 매칭
-        - 거래: backward asof(최대 5분 허용)
-        - 피처: 정확 매칭
+        병합 데이터 검증
+        
+        Returns:
+            (검증 통과 여부, 오류 목록)
         """
-        print("데이터 병합 시작...")
-
-        price = self.load_price_data()  # 가격은 전체 파일에서 자동 필터
-        trades = self.load_trade_logs(days=trade_days)
-        feats = self.load_feature_logs(days=feature_days)
-
-        frames = []
-        if not price.empty and 'timestamp' in price.columns:
-            price = self._ensure_ts_min(price, 'timestamp')
-            frames.append(price[['ts_min']].dropna())
-        if not trades.empty:
-            frames.append(trades[['ts_min']].dropna())
-        if not feats.empty:
-            frames.append(feats[['ts_min']].dropna())
-
-        if not frames:
-            print("병합할 데이터가 없습니다.")
-            return pd.DataFrame()
-
-        base = pd.concat(frames, ignore_index=True).drop_duplicates().sort_values('ts_min')
-        merged = base.copy()
-
-        # 가격: 정확 조인
-        if not price.empty:
-            right_p = price.drop(columns=['timestamp'], errors='ignore').drop_duplicates('ts_min', keep='last')
-            merged = merged.merge(right_p, on='ts_min', how='left')
-
-        # 거래: 가장 가까운 이전 시점 asof (5분 허용)
-        if not trades.empty:
-            right_t = trades.drop_duplicates('ts_min', keep='last')
-            merged = pd.merge_asof(
-                merged.sort_values('ts_min'),
-                right_t.sort_values('ts_min'),
-                on='ts_min',
-                direction='backward',
-                tolerance=pd.Timedelta('5min'),
-                suffixes=('', '_trade')
-            )
-
-        # 피처: 정확 조인
-        if not feats.empty:
-            right_f = feats.drop_duplicates('ts_min', keep='last')
-            merged = merged.merge(right_f, on='ts_min', how='left', suffixes=('', '_feature'))
-
-        # 대표 timestamp
-        if 'timestamp' in merged.columns and pd.api.types.is_datetime64_any_dtype(merged['timestamp']):
-            ts = merged['timestamp']
-        else:
-            ts = merged['ts_min']
-        merged['timestamp'] = ts
-
-        merged = self._dedup_columns(merged).sort_values('ts_min').reset_index(drop=True)
-        self.merged_data = merged
-
-        # 리포트
-        print("\n" + "="*60)
-        print("병합 완료:")
-        print("="*60)
-        print(f"- 전체 레코드 수: {len(merged):,}")
-        print(f"- 시작 시간: {merged['timestamp'].min()}")
-        print(f"- 종료 시간: {merged['timestamp'].max()}")
-
-        if 'trade_id' in merged.columns:
-            tc = merged['trade_id'].notna().sum()
-            print(f"- 거래 기록 수: {tc:,}")
-            trades_with_price = merged[merged['trade_id'].notna() & merged.get('close').notna()]
-            print(f"- 가격 매칭된 거래: {len(trades_with_price):,}건")
-            missing = tc - len(trades_with_price)
-            if missing > 0:
-                print(f"  ⚠️ 가격 누락: {missing}건 (학습 제외됨)")
-
-            if 'result' in merged.columns:
-                wr = merged['result'].dropna()
-                if not wr.empty:
-                    wins = (wr == 1).sum()
-                    total = len(wr)
-                    print(f"- 승률: {wr.mean()*100:.2f}% ({wins}/{total})")
-
-            if 'regime' in merged.columns:
-                print("\n[레짐 분포]")
-                regime_data = merged[merged['trade_id'].notna()]['regime']
-                labels = {1: "UP 🟢", -1: "DOWN 🔴", 0: "FLAT ⚪"}
-                total_with_regime = regime_data.notna().sum()
-                if total_with_regime > 0:
-                    for rv, cnt in regime_data.value_counts().sort_index().items():
-                        name = labels.get(int(rv), f"REGIME-{int(rv)}")
-                        pct = (cnt / total_with_regime) * 100
-                        print(f"  {name:10s}: {cnt:4d}건 ({pct:5.1f}%)")
-        print("="*60 + "\n")
-
-        return merged
-
-    # ========================
-    # 학습 데이터 준비
-    # ========================
-    def build_balanced_training(self, df: pd.DataFrame, min_per_class: int = 2000, recent_days: int = 30) -> pd.DataFrame:
-        df = df.dropna(subset=['target', 'timestamp']).copy()
-        df['timestamp'] = self._to_utc_series(df['timestamp'])
-        if df['timestamp'].isna().all():
-            return df.sample(frac=1.0, random_state=42).reset_index(drop=True)
-
-        recent_cut = df['timestamp'].max() - pd.Timedelta(days=recent_days)
-        recent = df[df['timestamp'] >= recent_cut]
-        up = recent[recent['target'] == 1]
-        dn = recent[recent['target'] == 0]
-
-        if len(up) < min_per_class:
-            need = min_per_class - len(up)
-            pool = df[(df['target'] == 1) & (df['timestamp'] < recent_cut)]
-            take = min(need, len(pool))
-            if take > 0:
-                up = pd.concat([up, pool.sample(take, replace=(len(pool) < need), random_state=42)])
-
-        if len(dn) < min_per_class:
-            need = min_per_class - len(dn)
-            pool = df[(df['target'] == 0) & (df['timestamp'] < recent_cut)]
-            take = min(need, len(pool))
-            if take > 0:
-                dn = pd.concat([dn, pool.sample(take, replace=(len(pool) < need), random_state=42)])
-
-        balanced = pd.concat([up, dn]).sample(frac=1.0, random_state=42).reset_index(drop=True)
-        return balanced
-
-    @staticmethod
-    def dedupe_by_hash(df: pd.DataFrame, feature_cols: List[str], round_n: int = 4) -> pd.DataFrame:
+        errors = []
+        
+        if df.empty:
+            errors.append("데이터가 비어있음")
+            return False, errors
+        
+        # 1. 필수 컬럼 체크
+        required_cols = ['bar30_start', 'bar30_end', 'open', 'high', 'low', 'close', 'volume']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        
+        if missing_cols:
+            errors.append(f"필수 컬럼 누락: {missing_cols}")
+        
+        # 2. 타임스탬프 정렬 체크
+        if 'bar30_start' in df.columns:
+            df_check = df.copy()
+            df_check['bar30_start'] = pd.to_datetime(df_check['bar30_start'])
+            
+            if not df_check['bar30_start'].is_monotonic_increasing:
+                errors.append("타임스탬프가 정렬되지 않음")
+        
+        # 3. OHLC 정합성 체크
+        if all(col in df.columns for col in ['open', 'high', 'low', 'close']):
+            invalid_hl = (df['high'] < df['low']).sum()
+            if invalid_hl > 0:
+                errors.append(f"High < Low: {invalid_hl}건")
+            
+            invalid_ohlc = (
+                (df['high'] < df['open']) |
+                (df['high'] < df['close']) |
+                (df['low'] > df['open']) |
+                (df['low'] > df['close'])
+            ).sum()
+            
+            if invalid_ohlc > 0:
+                errors.append(f"OHLC 범위 위반: {invalid_ohlc}건")
+        
+        # 4. 중복 체크
+        if 'bar30_start' in df.columns:
+            duplicates = df['bar30_start'].duplicated().sum()
+            if duplicates > 0:
+                errors.append(f"중복 타임스탬프: {duplicates}건")
+        
+        # 5. NaN 체크
+        critical_cols = ['open', 'high', 'low', 'close', 'volume']
+        for col in critical_cols:
+            if col in df.columns:
+                nan_count = df[col].isnull().sum()
+                if nan_count > 0:
+                    errors.append(f"{col} 결측치: {nan_count}건")
+        
+        # 6. 이상치 체크 (가격이 0 이하)
+        if 'close' in df.columns:
+            invalid_price = (df['close'] <= 0).sum()
+            if invalid_price > 0:
+                errors.append(f"유효하지 않은 가격: {invalid_price}건")
+        
+        return len(errors) == 0, errors
+    
+    def clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        데이터 정제
+        
+        Args:
+            df: 원본 데이터
+        
+        Returns:
+            정제된 데이터
+        """
         if df.empty:
             return df
-        f = df[feature_cols].round(round_n)
-        keys = f.apply(lambda r: hash(tuple(r.values)), axis=1)
-        return df.loc[~keys.duplicated()].copy()
-
-    def save_merged_data(self, df: Optional[pd.DataFrame] = None) -> bool:
-        if df is None:
-            df = self.merged_data
-        if df is None or df.empty:
-            print("저장할 데이터가 없습니다.")
-            return False
-        os.makedirs(self.config.RESULT_DIR, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(self.config.RESULT_DIR, f'merged_data_{ts}.pkl')
-        df.to_pickle(path)
-        latest = os.path.join(self.config.RESULT_DIR, 'training_data.pkl')
-        df.to_pickle(latest)
-        print(f"병합 데이터 저장 완료: {path}")
-        return True
-
-    def get_training_data(self,
-                          lookback_days: int = 30,
-                          apply_balance: bool = True,
-                          apply_dedupe: bool = True,
-                          dedupe_round: int = 4,
-                          min_per_class: int = 2000) -> Tuple[Optional[pd.DataFrame], Optional[pd.Series]]:
+        
+        df_clean = df.copy()
+        
+        # 1. 중복 제거
+        if 'bar30_start' in df_clean.columns:
+            df_clean['bar30_start'] = pd.to_datetime(df_clean['bar30_start'])
+            df_clean = df_clean.drop_duplicates(subset=['bar30_start'], keep='first')
+        
+        # 2. 정렬
+        if 'bar30_start' in df_clean.columns:
+            df_clean = df_clean.sort_values('bar30_start').reset_index(drop=True)
+        
+        # 3. OHLC 정합성 수정
+        if all(col in df_clean.columns for col in ['open', 'high', 'low', 'close']):
+            # High는 max(open, close, high)
+            df_clean['high'] = df_clean[['open', 'high', 'close']].max(axis=1)
+            
+            # Low는 min(open, close, low)
+            df_clean['low'] = df_clean[['open', 'low', 'close']].min(axis=1)
+        
+        # 4. 결측치 제거 (중요 컬럼)
+        critical_cols = ['open', 'high', 'low', 'close', 'volume']
+        available_cols = [col for col in critical_cols if col in df_clean.columns]
+        
+        if available_cols:
+            df_clean = df_clean.dropna(subset=available_cols)
+        
+        # 5. 이상치 제거 (가격 <= 0)
+        if 'close' in df_clean.columns:
+            df_clean = df_clean[df_clean['close'] > 0]
+        
+        df_clean = df_clean.reset_index(drop=True)
+        
+        return df_clean
+    
+    def align_timeframes(self, df_price: pd.DataFrame, 
+                        df_trades: pd.DataFrame) -> pd.DataFrame:
+        """타임프레임 정렬 (30분봉 기준)"""
+        if df_price.empty:
+            return pd.DataFrame()
+        
+        if df_trades.empty:
+            return df_price
+        
+        # 양쪽 모두 정렬
+        df_price, df_trades = self.tf_manager.align_dataframes(df_price, df_trades)
+        
+        # 병합
+        df_aligned = self._merge_price_and_trades(df_price, df_trades)
+        
+        return df_aligned
+    
+    def create_retrain_dataset(self, start_date: str, end_date: str) -> Tuple[pd.DataFrame, pd.Series]:
         """
-        학습용 데이터 준비
-        - 최근 N일 필터
-        - FeatureEngineer로 feature/target 생성
-        - (옵션) 클래스 밸런싱 + 디듀프
-        - ★ regime 컬럼 보존/통계
+        재학습용 데이터셋 생성
+        
+        Args:
+            start_date: 시작일
+            end_date: 종료일
+        
+        Returns:
+            (X, y) 튜플
         """
-        latest_path = os.path.join(self.config.RESULT_DIR, 'training_data.pkl')
-        if os.path.exists(latest_path):
-            df = pd.read_pickle(latest_path)
+        print(f"\n🔄 재학습 데이터셋 생성: {start_date} ~ {end_date}")
+        
+        # 데이터 병합
+        df_merged = self.merge_all_data(start_date, end_date)
+        
+        if df_merged.empty:
+            print("❌ 데이터 병합 실패")
+            return pd.DataFrame(), pd.Series()
+        
+        # 데이터 정제
+        print("🧹 데이터 정제 중...")
+        df_clean = self.clean_data(df_merged)
+        
+        # 검증
+        valid, errors = self.validate_merged_data(df_clean)
+        
+        if not valid:
+            print("⚠️  데이터 검증 실패:")
+            for error in errors:
+                print(f"  - {error}")
+        
+        # 가격 데이터를 1분봉으로 변환 (피처 생성용)
+        # 실제로는 원본 1분봉 로드 필요
+        df_1m = self.data_loader.load_price_data(start_date, end_date)
+        
+        if df_1m.empty:
+            print("❌ 1분봉 데이터 없음")
+            return pd.DataFrame(), pd.Series()
+        
+        # 피처 생성 및 학습 데이터 준비
+        X, y = self.data_loader.prepare_training_data(df_1m, use_cache=False)
+        
+        print(f"✅ 재학습 데이터셋 생성 완료: X={X.shape}, y={y.shape}")
+        
+        return X, y
+    
+    def get_data_quality_report(self, df: pd.DataFrame) -> Dict:
+        """데이터 품질 리포트"""
+        if df.empty:
+            return {
+                'total_records': 0,
+                'missing_ratio': 0.0,
+                'duplicate_ratio': 0.0,
+                'outlier_ratio': 0.0,
+                'quality_score': 0.0
+            }
+        
+        total_records = len(df)
+        
+        # 결측치 비율
+        missing_count = df.isnull().sum().sum()
+        total_values = df.shape[0] * df.shape[1]
+        missing_ratio = missing_count / total_values if total_values > 0 else 0.0
+        
+        # 중복 비율
+        if 'bar30_start' in df.columns:
+            duplicate_count = df['bar30_start'].duplicated().sum()
+            duplicate_ratio = duplicate_count / total_records
         else:
-            df = self.merge_all_data()
-            if df is None or df.empty:
-                return None, None
-
-        if 'timestamp' in df.columns:
-            cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-            ts = self._to_utc_series(df['timestamp'])
-            df = df.assign(timestamp=ts)
-            df = df[df['timestamp'] >= cutoff].copy()
-
-        # FeatureEngineer 위치 별도 모듈이라면 아래 임포트 라인 확인
-        from feature_engineer import FeatureEngineer
-        fe = FeatureEngineer()
-
-        X = fe.create_feature_pool(df)
-        y = fe.create_target(df, window=self.config.PREDICTION_WINDOW)
-
-        valid = y.notna()
-        X = X[valid].copy()
-        y = y[valid].copy()
-        if X.empty or y.empty:
-            return None, None
-
-        if 'timestamp' in df.columns:
-            try:
-                ts_series = df.loc[X.index, 'timestamp']
-            except Exception:
-                ts_series = df['timestamp'].iloc[-len(X):].reset_index(drop=True)
-                X = X.reset_index(drop=True)
-                y = y.reset_index(drop=True)
+            duplicate_ratio = 0.0
+        
+        # 이상치 비율 (가격 <= 0)
+        if 'close' in df.columns:
+            outlier_count = (df['close'] <= 0).sum()
+            outlier_ratio = outlier_count / total_records
         else:
-            ts_series = pd.Series([pd.NaT]*len(X), dtype='datetime64[ns, UTC]')
-
-        tmp = X.copy()
-        tmp['target'] = y.values
-        tmp['timestamp'] = ts_series.values
-
-        feat_cols = list(X.columns)
-        if apply_balance:
-            tmp = self.build_balanced_training(tmp, min_per_class=min_per_class, recent_days=30)
-        if apply_dedupe and len(tmp) > 0:
-            tmp = self.dedupe_by_hash(tmp, feat_cols, round_n=dedupe_round)
-
-        X_final = tmp[feat_cols].copy()
-        y_final = tmp['target'].copy()
-
-        # 레짐 통계
-        if 'regime' in X_final.columns:
-            have = int(X_final['regime'].notna().sum())
-            none = int(X_final['regime'].isna().sum())
-            print("\n[학습 데이터 레짐 정보]")
-            print(f"  레짐 정보 있음: {have:,}건")
-            print(f"  레짐 정보 없음: {none:,}건")
-
-        return X_final, y_final
-
-    # ==============
-    # 레거시 지원 (선택)
-    # ==============
-    def add_new_price_data(self, new_data: pd.DataFrame) -> bool:
-        """실시간 가격 추가 (분단위 디듀프, 최신값 우선) — 기존 파이프와 호환용"""
-        today = datetime.now().strftime("%Y%m%d")
-        fp = os.path.join(self.config.PRICE_DATA_DIR, 'raw', f'prices_{today}.csv')
-
-        new = new_data.copy()
-        new['timestamp'] = pd.to_datetime(new['timestamp'], errors='coerce', utc=True)
-        new['ts_min'] = new['timestamp'].dt.floor('T')
-
-        if os.path.exists(fp):
-            existing = pd.read_csv(fp)
-            if 'timestamp' in existing.columns:
-                existing['timestamp'] = pd.to_datetime(existing['timestamp'], errors='coerce', utc=True)
-                existing['ts_min'] = existing['timestamp'].dt.floor('T')
-            merged = pd.concat([existing, new], ignore_index=True)
-        else:
-            merged = new
-
-        merged = merged.sort_values('timestamp').drop_duplicates(subset=['ts_min'], keep='last')
-        merged.drop(columns=['ts_min'], inplace=True, errors='ignore')
-        merged.to_csv(fp, index=False, encoding='utf-8-sig')
-        print(f"가격 데이터 추가 완료: {len(new_data)} 레코드")
-        return True
-
-    def cleanup_old_data(self, days_to_keep: int = 90):
-        """오래된 가격 raw 파일 정리 & 레거시 거래 로그 아카이브(옵션)"""
-        cutoff = datetime.now() - timedelta(days=days_to_keep)
-
-        price_files = glob.glob(os.path.join(self.config.PRICE_DATA_DIR, 'raw', '*.csv'))
-        for file in price_files:
-            filename = os.path.basename(file)
-            if filename.startswith('prices_'):
-                date_str = filename.replace('prices_', '').replace('.csv', '')
-                try:
-                    file_date = datetime.strptime(date_str, "%Y%m%d")
-                    if file_date < cutoff:
-                        os.remove(file)
-                        print(f"오래된 파일 삭제: {filename}")
-                except Exception:
-                    continue
+            outlier_ratio = 0.0
+        
+        # 품질 점수 (0~100)
+        quality_score = 100 * (1 - missing_ratio - duplicate_ratio - outlier_ratio)
+        quality_score = max(0, min(100, quality_score))
+        
+        return {
+            'total_records': total_records,
+            'missing_ratio': missing_ratio,
+            'duplicate_ratio': duplicate_ratio,
+            'outlier_ratio': outlier_ratio,
+            'quality_score': quality_score
+        }
 
 
-class DataValidator:
-    """데이터 검증"""
-
-    @staticmethod
-    def validate_price_data(df: pd.DataFrame):
-        issues = []
-        required = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            issues.append(f"누락된 컬럼: {missing}")
-
-        if all(c in df.columns for c in ['open','high','low','close']):
-            invalid_high = df[df['high'] < df[['open','close']].max(axis=1)]
-            if not invalid_high.empty:
-                issues.append(f"잘못된 고가: {len(invalid_high)} 레코드")
-            invalid_low = df[df['low'] > df[['open','close']].min(axis=1)]
-            if not invalid_low.empty:
-                issues.append(f"잘못된 저가: {len(invalid_low)} 레코드")
-
-        key = 'ts_min' if 'ts_min' in df.columns else 'timestamp'
-        if key in df.columns:
-            d0 = df.dropna(subset=[key])
-            dups = d0[d0.duplicated(subset=[key], keep=False)]
-            if not dups.empty:
-                issues.append(f"중복 {key}: {len(dups)} 레코드")
-
-        if set(required).issubset(df.columns):
-            nulls = df[required].isnull().sum()
-            if nulls.any():
-                issues.append(f"결측치: {nulls[nulls > 0].to_dict()}")
-
-        return len(issues) == 0, issues
-
-    @staticmethod
-    def validate_trade_logs(df: pd.DataFrame):
-        """
-        거래 로그 검증 (30분봉 LogManager 스키마)
-          - 필수: trade_id, bar30_end(or entry_ts), side, result(선택)
-          - regime ∈ {-1,0,1}
-        """
-        issues = []
-        required_any_time = [('bar30_end', 'entry_ts')]  # 둘 중 하나는 있어야 함
-        required = ['trade_id', 'side']
-
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            issues.append(f"누락된 컬럼: {missing}")
-
-        ok_time = ('bar30_end' in df.columns) or ('entry_ts' in df.columns)
-        if not ok_time:
-            issues.append("누락된 시간 컬럼: bar30_end 또는 entry_ts 필요")
-
-        if 'trade_id' in df.columns:
-            dups = df[df.duplicated(subset=['trade_id'], keep=False)]
-            if not dups.empty:
-                issues.append(f"중복 trade_id: {len(dups)} 레코드")
-
-        if 'side' in df.columns:
-            bad = df[~df['side'].isin(['LONG', 'SHORT'])]
-            if not bad.empty:
-                issues.append(f"잘못된 side 값: {len(bad)} 레코드")
-
-        if 'regime' in df.columns:
-            regime_data = pd.to_numeric(df['regime'], errors='coerce').dropna()
-            bad_regime = regime_data[~regime_data.isin([-1, 0, 1])]
-            if not bad_regime.empty:
-                issues.append(f"잘못된 regime 값: {len(bad_regime)} 레코드")
-
-        return len(issues) == 0, issues
-
-
-# =========================
-# 단독 테스트
-# =========================
+# ============================================================
+# 테스트 및 검증
+# ============================================================
 if __name__ == "__main__":
-    from config import Config
-
-    dm = DataMerger(Config)
-
-    merged = dm.merge_all_data()
-    if not merged.empty:
-        merged = merged.dropna(subset=['open','high','low','close','volume'], how='any')
-        dm.save_merged_data(merged)
-
-        X, y = dm.get_training_data(lookback_days=30)
-        if X is not None:
-            print("\n학습 데이터 준비 완료:")
-            print(f"- 피처 shape: {X.shape}")
-            print(f"- 타겟 shape: {y.shape}")
-            print(f"- 클래스 분포: {y.value_counts().to_dict()}")
+    print("=" * 60)
+    print("DataMerger 테스트")
+    print("=" * 60)
+    
+    # DataMerger 초기화
+    merger = DataMerger()
+    
+    print("\n✅ DataMerger 초기화 성공")
+    
+    # 테스트 데이터 생성
+    from datetime import timedelta
+    
+    print("\n📝 테스트 데이터 생성")
+    start_time = datetime(2025, 1, 1, 0, 0, 0)
+    n_minutes = 1440  # 1일
+    
+    timestamps = [start_time + timedelta(minutes=i) for i in range(n_minutes)]
+    
+    np.random.seed(42)
+    price = 50000
+    prices = []
+    
+    for _ in range(n_minutes):
+        change = np.random.normal(0, 50)
+        price = max(price + change, 45000)
+        prices.append(price)
+    
+    df_1m_test = pd.DataFrame({
+        'timestamp': timestamps,
+        'close': prices
+    })
+    
+    df_1m_test['open'] = df_1m_test['close'].shift(1).fillna(df_1m_test['close'])
+    df_1m_test['high'] = df_1m_test[['open', 'close']].max(axis=1) * 1.001
+    df_1m_test['low'] = df_1m_test[['open', 'close']].min(axis=1) * 0.999
+    df_1m_test['volume'] = np.random.uniform(1000, 5000, n_minutes)
+    
+    # 데이터 저장
+    merger.data_loader.save_price_data(df_1m_test, "test_merge_data.csv")
+    
+    # 30분봉 집계 테스트
+    print("\n📊 30분봉 집계 테스트")
+    df_30m_test = merger.tf_manager.aggregate_1m_to_30m(df_1m_test)
+    
+    print(f"  1분봉: {len(df_1m_test)}개")
+    print(f"  30분봉: {len(df_30m_test)}개")
+    
+    # 거래 로그 생성 (더미)
+    print("\n📝 거래 로그 생성")
+    for i in range(10):
+        trade_time = start_time + timedelta(minutes=30*i)
+        
+        merger.log_manager.log_trade_entry_simple(
+            trade_id=f"merge_test_{i:03d}",
+            direction='UP' if i % 2 == 0 else 'DOWN',
+            entry_price=50000 + np.random.uniform(-200, 200),
+            entry_ts=trade_time,
+            p_at_entry=np.random.uniform(0.6, 0.8),
+            regime=np.random.choice([1, 0, -1]),
+            bar30_start=trade_time,
+            bar30_end=trade_time + timedelta(minutes=30)
+        )
+    
+    print(f"  생성된 거래: 10개")
+    
+    # 데이터 병합 테스트
+    print("\n🔗 데이터 병합 테스트")
+    df_merged = merger.merge_all_data("2025-01-01", "2025-01-01")
+    
+    if not df_merged.empty:
+        print(f"  ✅ 병합 성공: {len(df_merged)}개 레코드")
+        print(f"\n  컬럼: {list(df_merged.columns)}")
+        
+        # 샘플 데이터
+        sample_cols = ['bar30_start', 'open', 'close', 'volume', 'n_trades', 'win_rate']
+        available_cols = [col for col in sample_cols if col in df_merged.columns]
+        
+        if available_cols:
+            print(f"\n  샘플 데이터:")
+            print(df_merged[available_cols].head(3))
+    else:
+        print("  ❌ 병합 실패")
+    
+    # 데이터 검증 테스트
+    print("\n🔍 데이터 검증 테스트")
+    valid, errors = merger.validate_merged_data(df_merged)
+    
+    if valid:
+        print("  ✅ 검증 통과")
+    else:
+        print("  ⚠️  검증 실패:")
+        for error in errors:
+            print(f"    - {error}")
+    
+    # 데이터 정제 테스트
+    print("\n🧹 데이터 정제 테스트")
+    
+    # 의도적으로 오류 추가
+    df_dirty = df_merged.copy()
+    if len(df_dirty) > 5:
+        df_dirty.loc[2, 'close'] = -100  # 음수 가격
+        df_dirty.loc[3, 'high'] = df_dirty.loc[3, 'low'] - 10  # High < Low
+    
+    print(f"  정제 전: {len(df_dirty)}개")
+    
+    df_clean = merger.clean_data(df_dirty)
+    
+    print(f"  정제 후: {len(df_clean)}개")
+    
+    valid_clean, errors_clean = merger.validate_merged_data(df_clean)
+    
+    if valid_clean:
+        print("  ✅ 정제 후 검증 통과")
+    else:
+        print("  ⚠️  정제 후에도 오류 존재:")
+        for error in errors_clean:
+            print(f"    - {error}")
+    
+    # 품질 리포트 테스트
+    print("\n📊 데이터 품질 리포트")
+    quality_report = merger.get_data_quality_report(df_clean)
+    
+    print(f"  총 레코드: {quality_report['total_records']}")
+    print(f"  결측치 비율: {quality_report['missing_ratio']:.2%}")
+    print(f"  중복 비율: {quality_report['duplicate_ratio']:.2%}")
+    print(f"  이상치 비율: {quality_report['outlier_ratio']:.2%}")
+    print(f"  품질 점수: {quality_report['quality_score']:.1f}/100")
+    
+    # 재학습 데이터셋 생성 테스트
+    print("\n🔄 재학습 데이터셋 생성 테스트")
+    
+    # 더 많은 테스트 데이터 생성 (피처 엔지니어링에 충분한 양)
+    n_minutes_large = 5000
+    timestamps_large = [start_time + timedelta(minutes=i) for i in range(n_minutes_large)]
+    
+    prices_large = []
+    price = 50000
+    for _ in range(n_minutes_large):
+        change = np.random.normal(0, 30)
+        price = max(price + change, 45000)
+        prices_large.append(price)
+    
+    df_1m_large = pd.DataFrame({
+        'timestamp': timestamps_large,
+        'close': prices_large
+    })
+    
+    df_1m_large['open'] = df_1m_large['close'].shift(1).fillna(df_1m_large['close'])
+    df_1m_large['high'] = df_1m_large[['open', 'close']].max(axis=1) * 1.001
+    df_1m_large['low'] = df_1m_large[['open', 'close']].min(axis=1) * 0.999
+    df_1m_large['volume'] = np.random.uniform(1000, 5000, n_minutes_large)
+    
+    merger.data_loader.save_price_data(df_1m_large, "test_merge_data.csv")
+    
+    X, y = merger.create_retrain_dataset("2025-01-01", "2025-01-04")
+    
+    if not X.empty:
+        print(f"  ✅ 데이터셋 생성 성공")
+        print(f"    X shape: {X.shape}")
+        print(f"    y shape: {y.shape}")
+        print(f"    타겟 분포: UP={y.mean():.2%}")
+        
+        # 데이터 품질 체크
+        valid_X, errors_X = merger.data_loader.validate_data_quality(X, y)
+        
+        if valid_X:
+            print(f"  ✅ 데이터 품질 검증 통과")
+        else:
+            print(f"  ⚠️  데이터 품질 이슈:")
+            for error in errors_X:
+                print(f"    - {error}")
+    else:
+        print("  ❌ 데이터셋 생성 실패")
+    
+    print("\n" + "=" * 60)
+    print("테스트 완료")
+    print("=" * 60)

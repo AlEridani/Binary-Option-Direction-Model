@@ -1,599 +1,558 @@
+"""
+모니터링 시스템 - 성능 추적 + 버그 탐지
+버전: 1.3.0
+"""
+
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Tuple
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
 import json
 import psutil
-import time
+from pathlib import Path
 
-from config import Config
+import config
 from log_manager import LogManager
 
 
-# =========================
-# 공용 유틸: 안전한 CLOSED 마스크
-# =========================
-def _closed_mask(df: pd.DataFrame) -> pd.Series:
-    """status가 없으면 result 유무로 CLOSED 추정"""
-    if 'status' in df.columns:
-        return df['status'].astype(str).str.upper().eq('CLOSED')
-    return df['result'].isin([0, 1]) if 'result' in df.columns else pd.Series(False, index=df.index)
-
-
 class PerformanceMonitor:
-    """성능 모니터링 (승률/손익/진입률/모델별)"""
-
+    """
+    성능 모니터링
+    - 승률/손익/진입률 추적
+    - 레짐별/모델별 분석
+    - 연속 손실 추적
+    """
+    
     def __init__(self, log_manager: LogManager):
-        self.config = Config
         self.log_manager = log_manager
-
-        # 성능 기록
-        self.performance_history = []
-        self.performance_path = self.config.RESULT_DIR / "performance_history.jsonl"
-
-    # ==========================================
-    # 승률 추적
-    # ==========================================
+        self.snapshot_history = []
+    
     def track_win_rate(self, window: int = 50) -> Dict:
         """
-        최근 N거래 승률 추적
+        승률 추적
+        
+        Args:
+            window: 윈도우 크기
+        
+        Returns:
+            승률 통계
         """
-        recent_trades = self.log_manager.load_recent_trades(n=window)
-
-        if recent_trades.empty or 'result' not in recent_trades.columns:
-            return {'win_rate': None, 'total_trades': 0, 'wins': 0, 'losses': 0, 'window': window}
-
-        closed = recent_trades[_closed_mask(recent_trades)].copy()
-        if len(closed) == 0:
-            return {'win_rate': None, 'total_trades': 0, 'wins': 0, 'losses': 0, 'window': window}
-
-        wins = int((closed['result'] == 1).sum())
-        losses = int((closed['result'] == 0).sum())
-        total = len(closed)
-        win_rate = wins / total if total > 0 else 0.0
-
-        return {'win_rate': float(win_rate), 'total_trades': int(total), 'wins': int(wins), 'losses': int(losses), 'window': window}
-
+        df = self.log_manager.load_recent_trades(n=window)
+        
+        if df.empty:
+            return {
+                'win_rate': 0.0,
+                'n_trades': 0,
+                'n_wins': 0,
+                'n_losses': 0
+            }
+        
+        df_closed = df[df['status'] == 'CLOSED']
+        
+        if df_closed.empty:
+            return {
+                'win_rate': 0.0,
+                'n_trades': 0,
+                'n_wins': 0,
+                'n_losses': 0
+            }
+        
+        n_wins = (df_closed['result'] == 'WIN').sum()
+        n_losses = (df_closed['result'] == 'LOSS').sum()
+        n_total = len(df_closed)
+        
+        win_rate = n_wins / n_total if n_total > 0 else 0.0
+        
+        return {
+            'win_rate': win_rate,
+            'n_trades': n_total,
+            'n_wins': n_wins,
+            'n_losses': n_losses,
+            'window': window
+        }
+    
     def track_win_rate_by_regime(self, window: int = 100) -> Dict:
         """레짐별 승률 추적"""
-        recent_trades = self.log_manager.load_recent_trades(n=window)
-        if recent_trades.empty or 'regime' not in recent_trades.columns:
+        df = self.log_manager.load_recent_trades(n=window)
+        
+        if df.empty:
             return {}
-
-        closed = recent_trades[_closed_mask(recent_trades)].copy()
-        if closed.empty:
+        
+        df_closed = df[df['status'] == 'CLOSED']
+        
+        if df_closed.empty:
             return {}
-
-        regime_stats = {}
-        for regime_val in closed['regime'].dropna().unique():
-            regime_data = closed[closed['regime'] == regime_val]
-            if 'result' in regime_data.columns and len(regime_data) > 0:
-                wins = int((regime_data['result'] == 1).sum())
-                total = len(regime_data)
-                win_rate = wins / total if total > 0 else 0.0
-                regime_name = {1: "UP", -1: "DOWN", 0: "FLAT"}.get(regime_val, f"REGIME-{regime_val}")
-                regime_stats[regime_name] = {'win_rate': float(win_rate), 'total': int(total), 'wins': int(wins)}
-        return regime_stats
-
-    # ==========================================
-    # 손익 추적
-    # ==========================================
-    def track_profit(self, window: int = 50) -> Dict:
-        """
-        손익 추적 (시뮬레이션)
-        """
-        recent_trades = self.log_manager.load_recent_trades(n=window)
-        if recent_trades.empty or 'result' not in recent_trades.columns:
-            return {'total_profit': 0.0, 'avg_profit_per_trade': 0.0, 'max_drawdown': 0.0, 'profit_factor': 0.0}
-
-        closed = recent_trades[_closed_mask(recent_trades)].copy()
-        if len(closed) == 0:
-            return {'total_profit': 0.0, 'avg_profit_per_trade': 0.0, 'max_drawdown': 0.0, 'profit_factor': 0.0}
-
-        payout = float(self.config.PAYOUT_RATIO)
-        profits = [(payout if int(r) == 1 else -1.0) for r in closed['result'].tolist()]
-
-        total_profit = float(sum(profits))
-        avg_profit = float(total_profit / len(profits)) if len(profits) > 0 else 0.0
-
-        cumulative = np.cumsum(profits)
-        running_max = np.maximum.accumulate(cumulative)
-        drawdown = running_max - cumulative
-        max_drawdown = float(drawdown.max()) if len(drawdown) > 0 else 0.0
-
-        gross_profit = sum(p for p in profits if p > 0)
-        gross_loss = abs(sum(p for p in profits if p < 0))
-        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf')
-
-        return {'total_profit': total_profit, 'avg_profit_per_trade': avg_profit, 'max_drawdown': max_drawdown, 'profit_factor': float(profit_factor)}
-
-    # ==========================================
-    # 진입률 추적
-    # ==========================================
-    def track_entry_rate(self, hours: int = 24) -> Dict:
-        """
-        시간당 진입률 추적
-        """
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-        today = datetime.now(timezone.utc).strftime("%Y%m%d")
-        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y%m%d")
-
-        trades = []
-        for date in [today, yesterday]:
-            df = self.log_manager.load_trade_log(date)
-            if not df.empty:
-                trades.append(df)
-
-        if not trades:
-            return {'entries_per_hour': 0.0, 'total_entries': 0, 'hours': hours}
-
-        all_trades = pd.concat(trades, ignore_index=True)
-        if 'entry_ts' in all_trades.columns:
-            all_trades['entry_ts'] = pd.to_datetime(all_trades['entry_ts'], utc=True, errors='coerce')
-            recent = all_trades[all_trades['entry_ts'] >= cutoff]
-        else:
-            recent = all_trades
-
-        total_entries = int(len(recent))
-        entries_per_hour = float(total_entries / hours) if hours > 0 else 0.0
-        return {'entries_per_hour': entries_per_hour, 'total_entries': total_entries, 'hours': int(hours)}
-
-    # ==========================================
-    # 연속 손실 추적
-    # ==========================================
-    def track_consecutive_losses(self) -> Dict:
-        """
-        현재 연속 손실 및 최대 연속 손실
-        """
-        recent_trades = self.log_manager.load_recent_trades(n=200)
-        if recent_trades.empty or 'result' not in recent_trades.columns:
-            return {'current_streak': 0, 'max_streak': 0}
-
-        closed = recent_trades[_closed_mask(recent_trades)].copy()
-        if len(closed) == 0:
-            return {'current_streak': 0, 'max_streak': 0}
-
-        if 'entry_ts' in closed.columns:
-            closed = closed.sort_values('entry_ts', ascending=False)
-
-        results = closed['result'].astype(int).tolist()
-
-        current_streak = 0
-        for r in results:
-            if r == 0:
-                current_streak += 1
-            else:
-                break
-
-        max_streak = 0
-        temp_streak = 0
-        for r in results:
-            if r == 0:
-                temp_streak += 1
-                max_streak = max(max_streak, temp_streak)
-            else:
-                temp_streak = 0
-
-        return {'current_streak': int(current_streak), 'max_streak': int(max_streak)}
-
-    # ==========================================
-    # 모델별 승률
-    # ==========================================
-    def track_win_rate_by_model(self, window: int = 200) -> Dict:
-        trades = self.log_manager.load_recent_trades(n=window)
-        if trades.empty or 'result' not in trades.columns:
-            return {}
-
-        closed = trades[_closed_mask(trades)].copy()
-        if closed.empty:
-            return {}
-
-        # meta 조인 (model_version)
-        # 필요 시 여러 일자 결합 가능. 우선 오늘자만.
-        today = datetime.now(timezone.utc).strftime("%Y%m%d")
-        meta = self.log_manager.load_trade_meta(today)
-        if not meta.empty:
-            meta = meta[['trade_id', 'model_version']].dropna()
-            closed = closed.merge(meta, on='trade_id', how='left')
-
-        if 'model_version' not in closed.columns:
-            return {}
-
-        out = {}
-        for mv, g in closed.groupby('model_version'):
-            if g.empty:
+        
+        results = {}
+        
+        for regime in [1, 0, -1]:
+            df_regime = df_closed[df_closed['regime'] == regime]
+            
+            if df_regime.empty:
                 continue
-            wins = int((g['result'] == 1).sum())
-            total = int(len(g))
-            out[str(mv) if pd.notna(mv) else 'N/A'] = {
-                'win_rate': float(wins / total) if total else 0.0,
-                'total': total,
-                'wins': wins
+            
+            n_wins = (df_regime['result'] == 'WIN').sum()
+            n_total = len(df_regime)
+            
+            regime_name = {1: 'UP', 0: 'FLAT', -1: 'DOWN'}.get(regime, f'REGIME_{regime}')
+            
+            results[regime_name] = {
+                'win_rate': n_wins / n_total if n_total > 0 else 0.0,
+                'n_trades': n_total,
+                'n_wins': n_wins
             }
-        return out
-
-    # ==========================================
-    # 성능 스냅샷 저장 & 출력
-    # ==========================================
-    def save_snapshot(self):
-        """현재 성능 스냅샷 저장 (JSONL)"""
-        snapshot = {
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'win_rate': self.track_win_rate(window=50),
-            'win_rate_by_regime': self.track_win_rate_by_regime(window=100),
-            'profit': self.track_profit(window=50),
-            'entry_rate': self.track_entry_rate(hours=24),
-            'consecutive_losses': self.track_consecutive_losses()
+        
+        return results
+    
+    def track_win_rate_by_model(self, window: int = 200) -> Dict:
+        """모델 버전별 승률 추적"""
+        df = self.log_manager.load_recent_trades(n=window)
+        
+        if df.empty or 'model_ver' not in df.columns:
+            return {}
+        
+        df_closed = df[df['status'] == 'CLOSED']
+        
+        if df_closed.empty:
+            return {}
+        
+        results = {}
+        
+        for model_ver in df_closed['model_ver'].unique():
+            if pd.isna(model_ver):
+                continue
+            
+            df_model = df_closed[df_closed['model_ver'] == model_ver]
+            
+            n_wins = (df_model['result'] == 'WIN').sum()
+            n_total = len(df_model)
+            
+            results[model_ver] = {
+                'win_rate': n_wins / n_total if n_total > 0 else 0.0,
+                'n_trades': n_total,
+                'n_wins': n_wins
+            }
+        
+        return results
+    
+    def track_profit(self, window: int = 50) -> Dict:
+        """손익 추적"""
+        df = self.log_manager.load_recent_trades(n=window)
+        
+        if df.empty:
+            return {
+                'total_pnl': 0.0,
+                'avg_pnl': 0.0,
+                'pnl_ratio': 0.0
+            }
+        
+        df_closed = df[df['status'] == 'CLOSED']
+        
+        if df_closed.empty:
+            return {
+                'total_pnl': 0.0,
+                'avg_pnl': 0.0,
+                'pnl_ratio': 0.0
+            }
+        
+        # 간단한 PnL 계산 (WIN: +payout, LOSS: -1)
+        wins = df_closed[df_closed['result'] == 'WIN']
+        losses = df_closed[df_closed['result'] == 'LOSS']
+        
+        pnl_wins = wins['payout'].sum() if 'payout' in wins.columns else len(wins) * 0.85
+        pnl_losses = -len(losses)
+        
+        total_pnl = pnl_wins + pnl_losses
+        avg_pnl = total_pnl / len(df_closed)
+        pnl_ratio = total_pnl / len(df_closed) if len(df_closed) > 0 else 0.0
+        
+        return {
+            'total_pnl': total_pnl,
+            'avg_pnl': avg_pnl,
+            'pnl_ratio': pnl_ratio,
+            'n_trades': len(df_closed)
         }
-        with open(self.performance_path, 'a', encoding='utf-8') as f:
-            json.dump(snapshot, f, ensure_ascii=False, default=str)
-            f.write('\n')
-
-    def print_summary(self):
-        """성능 요약 출력"""
-        print(f"\n{'='*60}")
-        print("성능 모니터링 요약")
-        print(f"{'='*60}")
-
-        # 승률
-        wr = self.track_win_rate(window=50)
-        if wr['total_trades'] > 0 and wr['win_rate'] is not None:
-            print(f"\n[승률] (최근 {wr['window']}거래)")
-            print(f"  전체: {wr['win_rate']:.2%} ({wr['wins']}/{wr['total_trades']})")
-        else:
-            print(f"\n[승률] 거래 없음")
-
-        # 레짐별 승률
-        wr_regime = self.track_win_rate_by_regime(window=100)
-        if wr_regime:
-            print(f"\n[레짐별 승률]")
-            for regime, stats in wr_regime.items():
-                print(f"  {regime}: {stats['win_rate']:.2%} ({stats['wins']}/{stats['total']})")
-
-        # 손익
-        profit = self.track_profit(window=50)
-        print(f"\n[손익] (최근 50거래)")
-        print(f"  총 손익: {profit['total_profit']:+.2f}")
-        print(f"  평균 손익: {profit['avg_profit_per_trade']:+.3f}")
-        print(f"  최대 낙폭: {profit['max_drawdown']:.2f}")
-        pf = profit['profit_factor']
-        pf_str = f"{pf:.2f}" if np.isfinite(pf) else "∞"
-        print(f"  Profit Factor: {pf_str}")
-
-        # 진입률
-        entry = self.track_entry_rate(hours=24)
-        print(f"\n[진입률] (최근 24시간)")
-        print(f"  시간당: {entry['entries_per_hour']:.2f}개")
-        print(f"  총 진입: {entry['total_entries']}개")
-
-        # 연속 손실
-        streak = self.track_consecutive_losses()
-        print(f"\n[연속 손실]")
-        print(f"  현재: {streak['current_streak']}연속")
-        print(f"  최대: {streak['max_streak']}연속")
-
-        # 모델별 승률
-        wr_model = self.track_win_rate_by_model(window=200)
-        if wr_model:
-            print(f"\n[모델별 승률]")
-            for mv, s in wr_model.items():
-                print(f"  {mv}: {s['win_rate']:.2%} ({s['wins']}/{s['total']})")
-
-        print(f"{'='*60}\n")
+    
+    def track_entry_rate(self, hours: int = 24) -> Dict:
+        """진입률 추적 (시간당 거래 수)"""
+        # UTC 타임존으로 cutoff_time 생성
+        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours)
+        
+        # 최근 거래 로드
+        df = self.log_manager.load_recent_trades(n=1000)
+        
+        if df.empty or 'entry_ts' not in df.columns:
+            return {
+                'entry_rate': 0.0,
+                'n_entries': 0,
+                'hours': hours
+            }
+        
+        # UTC 타임존으로 변환
+        df['entry_ts'] = pd.to_datetime(df['entry_ts'], utc=True)
+        df_recent = df[df['entry_ts'] >= cutoff_time]
+        
+        n_entries = len(df_recent)
+        entry_rate = n_entries / hours if hours > 0 else 0.0
+        
+        return {
+            'entry_rate': entry_rate,
+            'n_entries': n_entries,
+            'hours': hours
+        }
+    
+    def track_consecutive_losses(self) -> Dict:
+        """연속 손실 추적"""
+        df = self.log_manager.load_recent_trades(n=100)
+        
+        if df.empty:
+            return {
+                'current_streak': 0,
+                'max_streak': 0
+            }
+        
+        df_closed = df[df['status'] == 'CLOSED'].sort_values('entry_ts')
+        
+        if df_closed.empty:
+            return {
+                'current_streak': 0,
+                'max_streak': 0
+            }
+        
+        # 연속 손실 계산
+        results = df_closed['result'].values
+        
+        current_streak = 0
+        max_streak = 0
+        streak = 0
+        
+        for result in reversed(results):
+            if result == 'LOSS':
+                streak += 1
+                max_streak = max(max_streak, streak)
+            else:
+                if current_streak == 0:
+                    current_streak = streak
+                streak = 0
+        
+        if current_streak == 0:
+            current_streak = streak
+        
+        return {
+            'current_streak': current_streak,
+            'max_streak': max_streak
+        }
 
 
 class SystemMonitor:
-    """시스템 상태 모니터링"""
-
-    def __init__(self):
-        self.config = Config
-
-        # 시스템 기록
-        self.system_history = []
-        self.system_path = self.config.RESULT_DIR / "system_history.jsonl"
-
-    # ==========================================
-    # 메모리 사용량
-    # ==========================================
-    def check_memory(self) -> Dict:
+    """
+    시스템 모니터링
+    - 메모리/CPU 사용량
+    - 지연시간
+    - NaN 체크
+    """
+    
+    @staticmethod
+    def check_memory() -> Dict:
         """메모리 사용량 체크"""
         mem = psutil.virtual_memory()
+        
         return {
-            'percent': float(mem.percent),
-            'used_mb': float(mem.used / 1024 / 1024),
-            'available_mb': float(mem.available / 1024 / 1024),
-            'total_mb': float(mem.total / 1024 / 1024)
+            'total_gb': mem.total / (1024**3),
+            'used_gb': mem.used / (1024**3),
+            'percent': mem.percent,
+            'available_gb': mem.available / (1024**3)
         }
-
-    def check_memory_alert(self, threshold: float = 85.0) -> bool:
-        """메모리 경고 체크 (임계값 초과 시 True)"""
-        mem = self.check_memory()
-        return mem['percent'] > threshold
-
-    # ==========================================
-    # CPU 사용량
-    # ==========================================
-    def check_cpu(self) -> Dict:
+    
+    @staticmethod
+    def check_cpu() -> Dict:
         """CPU 사용량 체크"""
-        cpu_percent = psutil.cpu_percent(interval=0.2)  # 블로킹 시간 단축
+        cpu_percent = psutil.cpu_percent(interval=1)
         cpu_count = psutil.cpu_count()
-        return {'percent': float(cpu_percent), 'count': int(cpu_count)}
-
-    # ==========================================
-    # 레이턴시 체크
-    # ==========================================
-    def check_latency(self, func, *args, **kwargs) -> Dict:
-        """함수 실행 시간 측정"""
-        start = time.time()
-        success = True
-        try:
-            func(*args, **kwargs)
-        except Exception:
-            success = False
-        latency = (time.time() - start) * 1000  # ms
-        return {'latency_ms': float(latency), 'success': bool(success)}
-
-    # ==========================================
-    # NaN 체크
-    # ==========================================
-    def check_nan(self, df: pd.DataFrame) -> Dict:
-        """DataFrame NaN 체크"""
-        if df is None or df.empty:
-            return {'has_nan': False, 'nan_count': 0, 'nan_columns': []}
-        nan_count = int(df.isna().sum().sum())
-        nan_columns = df.columns[df.isna().any()].tolist()
-        return {'has_nan': nan_count > 0, 'nan_count': nan_count, 'nan_columns': nan_columns}
-
-    # ==========================================
-    # 시스템 스냅샷
-    # ==========================================
-    def save_snapshot(self):
-        """시스템 상태 스냅샷 저장"""
-        snapshot = {
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'memory': self.check_memory(),
-            'cpu': self.check_cpu()
+        
+        return {
+            'cpu_percent': cpu_percent,
+            'cpu_count': cpu_count,
+            'per_cpu': psutil.cpu_percent(interval=1, percpu=True)
         }
-        with open(self.system_path, 'a', encoding='utf-8') as f:
-            json.dump(snapshot, f, ensure_ascii=False, default=str)
-            f.write('\n')
-
-    def print_summary(self):
-        """시스템 상태 요약 출력"""
-        print(f"\n{'='*60}")
-        print("시스템 모니터링 요약")
-        print(f"{'='*60}")
-
-        # 메모리
-        mem = self.check_memory()
-        print(f"\n[메모리]")
-        print(f"  사용률: {mem['percent']:.1f}%")
-        print(f"  사용량: {mem['used_mb']:.0f} MB / {mem['total_mb']:.0f} MB")
-        print(f"  가용량: {mem['available_mb']:.0f} MB")
-
-        # CPU
-        cpu = self.check_cpu()
-        print(f"\n[CPU]")
-        print(f"  사용률: {cpu['percent']:.1f}%")
-        print(f"  코어 수: {cpu['count']}")
-
-        print(f"{'='*60}\n")
+    
+    @staticmethod
+    def check_nan(df: pd.DataFrame) -> Dict:
+        """DataFrame NaN 체크"""
+        if df.empty:
+            return {
+                'total_nans': 0,
+                'nan_ratio': 0.0,
+                'nan_columns': {}
+            }
+        
+        nan_counts = df.isnull().sum()
+        total_nans = nan_counts.sum()
+        total_values = df.shape[0] * df.shape[1]
+        nan_ratio = total_nans / total_values if total_values > 0 else 0.0
+        
+        nan_columns = nan_counts[nan_counts > 0].to_dict()
+        
+        return {
+            'total_nans': int(total_nans),
+            'nan_ratio': nan_ratio,
+            'nan_columns': nan_columns
+        }
 
 
 class BugDetector:
-    """버그 및 이상 패턴 탐지"""
-
-    def __init__(self, log_manager: LogManager, perf_monitor: PerformanceMonitor):
-        self.config = Config
-        self.log_manager = log_manager
-        self.perf_monitor = perf_monitor
-
-        # 알림 기록
-        self.alerts = []
-        self.alert_path = self.config.RESULT_DIR / "alerts.jsonl"
-
-    # ==========================================
-    # 이상 탐지
-    # ==========================================
-    def detect_low_win_rate(self, threshold: float = 0.45, window: int = 50) -> Optional[Dict]:
-        """승률 급락 탐지"""
-        wr = self.perf_monitor.track_win_rate(window=window)
-        if wr['total_trades'] >= 20 and wr['win_rate'] is not None:
-            if wr['win_rate'] < threshold:
-                return {
-                    'type': 'LOW_WIN_RATE',
-                    'severity': 'CRITICAL',
-                    'message': f"승률 급락: {wr['win_rate']:.1%} < {threshold:.1%} (최근 {window}거래)",
-                    'data': wr
-                }
-        return None
-
-    def detect_high_consecutive_losses(self, threshold: int = 5) -> Optional[Dict]:
-        """연속 손실 탐지"""
-        streak = self.perf_monitor.track_consecutive_losses()
-        if streak['current_streak'] >= threshold:
-            return {
-                'type': 'HIGH_CONSECUTIVE_LOSSES',
-                'severity': 'WARNING',
-                'message': f"연속 손실: {streak['current_streak']}연속",
-                'data': streak
-            }
-        return None
-
-    def detect_no_entries(self, hours: int = 2) -> Optional[Dict]:
-        """진입 중단 탐지"""
-        entry = self.perf_monitor.track_entry_rate(hours=hours)
-        if entry['total_entries'] == 0:
-            return {
-                'type': 'NO_ENTRIES',
-                'severity': 'WARNING',
-                'message': f"진입 중단: 최근 {hours}시간 동안 진입 없음",
-                'data': entry
-            }
-        return None
-
-    def detect_regime_bias(self, threshold: float = 0.8, window: int = 100) -> Optional[Dict]:
-        """레짐 편향 탐지"""
-        wr_regime = self.perf_monitor.track_win_rate_by_regime(window=window)
-        if not wr_regime:
-            return None
-
-        for regime, stats in wr_regime.items():
-            if stats['total'] >= 10:
-                loss_rate = 1 - stats['win_rate']
-                if loss_rate > threshold:
-                    return {
-                        'type': 'REGIME_BIAS',
-                        'severity': 'WARNING',
-                        'message': f"{regime} 레짐 손실률 높음: {loss_rate:.1%}",
-                        'data': {'regime': regime, 'loss_rate': loss_rate, 'stats': stats}
-                    }
-        return None
-
-    def detect_nan_in_logs(self) -> Optional[Dict]:
-        """로그 NaN 탐지"""
-        today = datetime.now(timezone.utc).strftime("%Y%m%d")
-        trades = self.log_manager.load_trade_log(today)
-        if trades.empty:
-            return None
-
-        closed = trades[_closed_mask(trades)].copy()
-        if closed.empty:
-            return None
-
-        critical_cols = ['entry_price', 'label_price', 'result', 'p_at_entry']
-        for col in critical_cols:
-            if col in closed.columns:
-                nan_count = int(closed[col].isna().sum())
-                if nan_count > 0:
-                    return {
-                        'type': 'NAN_IN_LOGS',
-                        'severity': 'CRITICAL',
-                        'message': f"로그 NaN 발견: {col} 컬럼 {nan_count}개",
-                        'data': {'column': col, 'nan_count': nan_count}
-                    }
-        return None
-
-    # ==========================================
-    # 종합 체크
-    # ==========================================
-    def check_all(self) -> List[Dict]:
-        """모든 이상 패턴 체크"""
-        alerts: List[Dict] = []
-
-        for alert in [
-            self.detect_low_win_rate(threshold=0.45, window=50),
-            self.detect_high_consecutive_losses(threshold=5),
-            self.detect_no_entries(hours=2),
-            self.detect_regime_bias(threshold=0.75, window=100),
-            self.detect_nan_in_logs()
-        ]:
-            if alert:
-                alerts.append(alert)
-
-        return alerts
-
-    def save_alert(self, alert: Dict):
-        """알림 저장"""
-        record = {'timestamp': datetime.now(timezone.utc).isoformat(), **alert}
-        with open(self.alert_path, 'a', encoding='utf-8') as f:
-            json.dump(record, f, ensure_ascii=False, default=str)
-            f.write('\n')
-        self.alerts.append(record)
-
-    def print_alerts(self, alerts: List[Dict]):
-        """알림 출력"""
-        if not alerts:
-            print("✓ 이상 없음")
-            return
-
-        print(f"\n{'='*60}")
-        print(f"⚠️  {len(alerts)}개 알림 발생")
-        print(f"{'='*60}")
-
-        for alert in alerts:
-            severity = alert['severity']
-            emoji = "🔴" if severity == 'CRITICAL' else "🟡"
-            print(f"\n{emoji} [{severity}] {alert['type']}")
-            print(f"  {alert['message']}")
-
-        print(f"{'='*60}\n")
-
-
-class AlertManager:
-    """알림 관리 (콘솔/Slack)"""
-
-    def __init__(self):
-        self.config = Config
-        self.slack_webhook = None  # Slack Webhook URL (선택)
-
-    def send_console(self, message: str, severity: str = 'INFO'):
-        """콘솔 알림"""
-        emoji = {'INFO': 'ℹ️', 'WARNING': '⚠️', 'CRITICAL': '🔴'}.get(severity, 'ℹ️')
-        print(f"{emoji} [{severity}] {message}")
-
-    def send_slack(self, message: str, severity: str = 'INFO'):
-        """Slack 알림 (선택)"""
-        if not self.slack_webhook:
-            return
-        # TODO: Slack Webhook 구현
-        pass
-
-
-# ==========================================
-# 통합 모니터
-# ==========================================
-class Monitor:
-    """통합 모니터링 시스템"""
-
+    """
+    버그 탐지기
+    - 낮은 승률
+    - 높은 연속 손실
+    - 진입 없음
+    - 레짐 편향
+    - NaN 급증
+    """
+    
     def __init__(self, log_manager: LogManager):
         self.log_manager = log_manager
         self.perf_monitor = PerformanceMonitor(log_manager)
-        self.sys_monitor = SystemMonitor()
-        self.bug_detector = BugDetector(log_manager, self.perf_monitor)
-        self.alert_manager = AlertManager()
+    
+    def detect_low_win_rate(self, threshold: float = 0.45, window: int = 50) -> Optional[Dict]:
+        """낮은 승률 탐지"""
+        win_rate_data = self.perf_monitor.track_win_rate(window=window)
+        
+        if win_rate_data['n_trades'] < 20:
+            return None
+        
+        if win_rate_data['win_rate'] < threshold:
+            return {
+                'severity': 'CRITICAL',
+                'type': 'LOW_WIN_RATE',
+                'message': f"승률 {win_rate_data['win_rate']:.2%} < {threshold:.0%}",
+                'data': win_rate_data
+            }
+        
+        return None
+    
+    def detect_high_consecutive_losses(self, threshold: int = 5) -> Optional[Dict]:
+        """높은 연속 손실 탐지"""
+        streak_data = self.perf_monitor.track_consecutive_losses()
+        
+        if streak_data['current_streak'] >= threshold:
+            return {
+                'severity': 'WARN',
+                'type': 'HIGH_CONSECUTIVE_LOSSES',
+                'message': f"연속 손실 {streak_data['current_streak']}회",
+                'data': streak_data
+            }
+        
+        return None
+    
+    def detect_no_entries(self, hours: int = 2) -> Optional[Dict]:
+        """진입 없음 탐지"""
+        entry_data = self.perf_monitor.track_entry_rate(hours=hours)
+        
+        if entry_data['n_entries'] == 0:
+            return {
+                'severity': 'WARN',
+                'type': 'NO_ENTRIES',
+                'message': f"최근 {hours}시간 동안 진입 없음",
+                'data': entry_data
+            }
+        
+        return None
+    
+    def detect_regime_bias(self, threshold: float = 0.8, window: int = 50) -> Optional[Dict]:
+        """레짐 편향 탐지"""
+        regime_data = self.perf_monitor.track_win_rate_by_regime(window=window)
+        
+        if not regime_data:
+            return None
+        
+        total_trades = sum(d['n_trades'] for d in regime_data.values())
+        
+        for regime_name, data in regime_data.items():
+            ratio = data['n_trades'] / total_trades if total_trades > 0 else 0
+            
+            if ratio > threshold:
+                return {
+                    'severity': 'INFO',
+                    'type': 'REGIME_BIAS',
+                    'message': f"{regime_name} 레짐 편향 {ratio:.0%}",
+                    'data': {'regime': regime_name, 'ratio': ratio}
+                }
+        
+        return None
+    
+    def detect_nan_in_logs(self) -> Optional[Dict]:
+        """로그 NaN 탐지"""
+        df = self.log_manager.load_recent_trades(n=100)
+        
+        if df.empty:
+            return None
+        
+        nan_data = SystemMonitor.check_nan(df)
+        
+        if nan_data['nan_ratio'] > config.ALERT_NAN_RATIO:
+            return {
+                'severity': 'WARN',
+                'type': 'NAN_IN_LOGS',
+                'message': f"NaN 비율 {nan_data['nan_ratio']:.2%}",
+                'data': nan_data
+            }
+        
+        return None
+    
+    def check_all(self) -> List[Dict]:
+        """모든 버그 체크"""
+        alerts = []
+        
+        # 각 탐지기 실행
+        detectors = [
+            (self.detect_low_win_rate, (config.ALERT_WIN_RATE_LOW,)),
+            (self.detect_high_consecutive_losses, (config.ALERT_CONSECUTIVE_LOSSES,)),
+            (self.detect_no_entries, (config.ALERT_NO_ENTRY_HOURS,)),
+            (self.detect_regime_bias, (config.ALERT_REGIME_BIAS,)),
+            (self.detect_nan_in_logs, ())
+        ]
+        
+        for detector_func, args in detectors:
+            try:
+                result = detector_func(*args) if args else detector_func()
+                if result:
+                    alerts.append(result)
+            except Exception as e:
+                print(f"⚠️  탐지기 실행 실패 ({detector_func.__name__}): {e}")
+        
+        return alerts
 
-    def update(self):
-        """모니터링 업데이트 (주기적 호출)"""
+
+class Monitor:
+    """
+    통합 모니터
+    - 성능 + 시스템 + 버그 탐지
+    - 스냅샷 저장
+    - 알림
+    """
+    
+    def __init__(self, log_manager: LogManager):
+        self.log_manager = log_manager
+        self.perf_monitor = PerformanceMonitor(log_manager)
+        self.bug_detector = BugDetector(log_manager)
+        self.snapshot_file = config.MONITOR_LOG_DIR / "snapshots.jsonl"
+    
+    def update(self) -> Dict:
+        """모니터링 업데이트"""
+        # 성능 지표 수집
+        win_rate_data = self.perf_monitor.track_win_rate(window=50)
+        regime_data = self.perf_monitor.track_win_rate_by_regime(window=100)
+        profit_data = self.perf_monitor.track_profit(window=50)
+        entry_data = self.perf_monitor.track_entry_rate(hours=24)
+        streak_data = self.perf_monitor.track_consecutive_losses()
+        
+        # 시스템 지표 수집
+        mem_data = SystemMonitor.check_memory()
+        cpu_data = SystemMonitor.check_cpu()
+        
+        # 버그 탐지
+        alerts = self.bug_detector.check_all()
+        
+        # 스냅샷 구성 - UTC 타임존으로 타임스탬프 생성
+        snapshot = {
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'performance': {
+                'win_rate': win_rate_data,
+                'regime': regime_data,
+                'profit': profit_data,
+                'entry': entry_data,
+                'streak': streak_data
+            },
+            'system': {
+                'memory': mem_data,
+                'cpu': cpu_data
+            },
+            'alerts': alerts
+        }
+        
         # 스냅샷 저장
-        self.perf_monitor.save_snapshot()
-        self.sys_monitor.save_snapshot()
-
-        # 이상 탐지
-        alerts = self.bug_detector.check_all()
-
-        # 알림 처리
+        self._save_snapshot(snapshot)
+        
+        # 알림 전송 (심각한 경고만)
+        critical_alerts = [a for a in alerts if a['severity'] == 'CRITICAL']
+        if critical_alerts:
+            self._send_alerts(critical_alerts)
+        
+        return snapshot
+    
+    def print_summary(self) -> None:
+        """요약 출력"""
+        snapshot = self.update()
+        
+        print("\n" + "=" * 60)
+        print("시스템 모니터링 요약")
+        print("=" * 60)
+        
+        # 성능
+        perf = snapshot['performance']
+        print(f"\n📊 성능:")
+        print(f"  승률: {perf['win_rate']['win_rate']:.2%} ({perf['win_rate']['n_wins']}W / {perf['win_rate']['n_losses']}L)")
+        print(f"  손익: {perf['profit']['total_pnl']:.2f} (평균 {perf['profit']['avg_pnl']:.3f})")
+        print(f"  진입률: {perf['entry']['entry_rate']:.2f}/시간 ({perf['entry']['n_entries']}건/{perf['entry']['hours']}시간)")
+        print(f"  연속 손실: {perf['streak']['current_streak']}회 (최대 {perf['streak']['max_streak']}회)")
+        
+        # 레짐별
+        if perf['regime']:
+            print(f"\n📈 레짐별 승률:")
+            for regime_name, data in perf['regime'].items():
+                print(f"  {regime_name}: {data['win_rate']:.2%} ({data['n_trades']}건)")
+        
+        # 시스템
+        sys = snapshot['system']
+        print(f"\n💻 시스템:")
+        print(f"  메모리: {sys['memory']['used_gb']:.1f}GB / {sys['memory']['total_gb']:.1f}GB ({sys['memory']['percent']:.1f}%)")
+        print(f"  CPU: {sys['cpu']['cpu_percent']:.1f}% ({sys['cpu']['cpu_count']}코어)")
+        
+        # 알림
+        if snapshot['alerts']:
+            print(f"\n⚠️  알림 ({len(snapshot['alerts'])}건):")
+            for alert in snapshot['alerts']:
+                print(f"  [{alert['severity']}] {alert['message']}")
+        else:
+            print(f"\n✅ 알림 없음")
+        
+        print("=" * 60)
+    
+    def _save_snapshot(self, snapshot: Dict) -> None:
+        """스냅샷 저장"""
+        try:
+            self.snapshot_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(self.snapshot_file, 'a') as f:
+                f.write(json.dumps(snapshot, ensure_ascii=False) + '\n')
+        
+        except Exception as e:
+            print(f"⚠️  스냅샷 저장 실패: {e}")
+    
+    def _send_alerts(self, alerts: List[Dict]) -> None:
+        """알림 전송 (placeholder)"""
+        # TODO: 텔레그램/이메일 연동
         for alert in alerts:
-            self.bug_detector.save_alert(alert)
-            self.alert_manager.send_console(alert['message'], severity=alert['severity'])
-
-    def print_summary(self):
-        """전체 요약 출력"""
-        self.perf_monitor.print_summary()
-        self.sys_monitor.print_summary()
-
-        # 최근 알림
-        alerts = self.bug_detector.check_all()
-        self.bug_detector.print_alerts(alerts)
-
-
-# ==========================================
-# 테스트
-# ==========================================
-if __name__ == "__main__":
-    Config.create_directories()
-    log_manager = LogManager()
-    monitor = Monitor(log_manager)
-
-    print("="*60)
-    print("Monitor 테스트")
-    print("="*60)
-
-    # 업데이트
-    monitor.update()
-
-    # 요약 출력
-    monitor.print_summary()
-
-    print("\n✓ 테스트 완료")
+            print(f"🚨 [ALERT] {alert['message']}")
+    
+    def load_snapshots(self, n: int = 100) -> List[Dict]:
+        """저장된 스냅샷 로드"""
+        if not self.snapshot_file.exists():
+            return []
+        
+        snapshots = []
+        
+        try:
+            with open(self.snapshot_file, 'r') as f:
+                lines = f.readlines()
+            
+            # 최근 n개만
+            for line in lines[-n:]:
+                snapshot = json.loads(line.strip())
+                snapshots.append(snapshot)
+        
+        except Exception as e:
+            print(f"⚠️  스냅샷 로드 실패: {e}")
+        
+        return snapshots
