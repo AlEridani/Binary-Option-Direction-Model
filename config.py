@@ -7,7 +7,11 @@ import os
 from pathlib import Path
 from datetime import datetime, timezone
 
-# ============================================================
+
+
+# 백테스트
+BACKTEST_MARGIN_RATE_30m = 0.02
+MARGIN_RATE_30m = 0.02
 # 시스템 버전 관리
 # ============================================================
 SYSTEM_VERSION = "1.3.0"
@@ -26,6 +30,11 @@ CACHE_DIR = BASE_DIR / "cache"
 LOG_DIR = BASE_DIR / "logs"
 MODEL_DIR = BASE_DIR / "models"
 REPORT_DIR = BASE_DIR / "reports"
+BACKUP_DIR = BASE_DIR / "backups"
+PRICE_DATA_DIR = BASE_DIR / "price_data"
+# 모델 경로
+MODEL_PATH = MODEL_DIR / 'model.pkl'
+SCALER_PATH = MODEL_DIR / 'scaler.pkl'
 
 # 하위 디렉토리
 TRADE_LOG_DIR = LOG_DIR / "trade_log"
@@ -40,12 +49,38 @@ SYSTEM_LOG_DIR = LOG_DIR / "system"
 DIRS_TO_CREATE = [
     DATA_DIR, CACHE_DIR, LOG_DIR, MODEL_DIR, REPORT_DIR,
     TRADE_LOG_DIR, TRADE_ENTRY_DIR, TRADE_CLOSE_DIR, TRADE_META_DIR,
-    FEATURE_LOG_DIR, MONITOR_LOG_DIR, SYSTEM_LOG_DIR
+    FEATURE_LOG_DIR, MONITOR_LOG_DIR, SYSTEM_LOG_DIR,
+    BACKUP_DIR,PRICE_DATA_DIR
 ]
 
-for dir_path in DIRS_TO_CREATE:
-    dir_path.mkdir(parents=True, exist_ok=True)
+# ============================================================
+# 데이터 관련
+# ============================================================
+# ============================================================
+# 경로 설정
+# ============================================================
+BASE_DIR = Path(__file__).resolve().parent
+PRICE_DATA_DIR = BASE_DIR / "price_data"
+PRICE_DATA_DIR.mkdir(exist_ok=True)
 
+# ============================================================
+# 거래 설정
+# ============================================================
+DEFAULT_SYMBOL = "BTCUSDT"
+PRICE_DATA_FILENAME = f"{DEFAULT_SYMBOL.lower()}_1m.csv"
+
+# ============================================================
+# 기본 시간대 / 데이터 타입
+# ============================================================
+TZ = "UTC"
+PRICE_DATA_DTYPES = {
+    "timestamp": "datetime64[ns]",
+    "open": "float64",
+    "high": "float64",
+    "low": "float64",
+    "close": "float64",
+    "volume": "float64"
+}
 # ============================================================
 # 타임프레임 설정
 # ============================================================
@@ -128,6 +163,12 @@ MAX_CONCURRENT_POSITIONS = 5
 TZ = timezone.utc
 USE_UTC = True
 
+# 실행 모드: "AUTO" | "REAL" | "PAPER"
+EXECUTION_MODE = "AUTO"   # 기본: 실주문 시도 후 실패하면 자동 페이퍼 전환
+OPTION_TENOR_MIN = 30     # 30분 만기
+POSITION_SIZE = 5        # 계약 수/달러 등, 내부 정의대로
+FORCE_ENTRY: bool = True    #데이터용 강제진입
+
 # ============================================================
 # 재학습 트리거
 # ============================================================
@@ -188,12 +229,17 @@ TRADE_LOG_COLUMNS = [
     'model_ver',         # 모델 버전
     'feature_ver',       # 피처 버전
     'filter_ver',        # 필터 버전
-    'cutoff_ver',        # 컷오프 버전
     'data_ver',          # 데이터 버전
     
     # 메타
     'mode',              # LIVE / BACKTEST / PAPER
-    'status'             # ACTIVE / CLOSED / CANCELLED
+    'status',         # ACTIVE / CLOSED / CANCELLED
+
+    'p_raw_at_entry',    # 원시 예측 확률
+    'p_cal_at_entry',    # 캘리브레이션 확률  
+    'cal_method',        # 캘리브레이션 방법
+    'cal_ver',           # 캘리브레이션 버전
+    'cross_time'        # 교차 시간
 ]
 
 FEATURE_LOG_COLUMNS = [
@@ -263,7 +309,12 @@ TRADE_LOG_DTYPES = {
     'cutoff_ver': 'str',
     'data_ver': 'str',
     'mode': 'str',
-    'status': 'str'
+    'status': 'str',
+    'p_raw_at_entry': 'float64',
+    'p_cal_at_entry': 'float64', 
+    'cal_method': 'str',
+    'cal_ver': 'str',
+    'cross_time': 'datetime64[ns]'
 }
 
 
@@ -280,7 +331,8 @@ REASON_CODES = {
     'BLOCKED_VOLATILITY': '변동성 과다',
     'BLOCKED_REFRACTORY': '리프랙토리 기간',
     'BLOCKED_LOW_PROB': '확률 부족',
-    
+    'BLOCKED_PATTERN': '패배 패턴',            # ✅ 추가 권장
+
     # 정산
     'CLOSE_EXPIRY_WIN': '만기 승리',
     'CLOSE_EXPIRY_LOSS': '만기 패배',
@@ -306,9 +358,25 @@ ALERT_NAN_RATIO = 0.05
 # ============================================================
 # API 설정 (환경 변수로 관리 권장)
 # ============================================================
-BINANCE_API_KEY = os.getenv('BINANCE_API_KEY', '')
-BINANCE_API_SECRET = os.getenv('BINANCE_API_SECRET', '')
-SLACK_WEBHOOK_URL = os.getenv('SLACK_WEBHOOK_URL', '')
+BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY')
+BINANCE_API_SECRET = os.environ.get('BINANCE_API_SECRET')
+
+# ============================================================
+# 바이낸스 API 설정
+# ============================================================
+SYMBOL = 'BTCUSDT'
+INTERVAL_30m = '30m'
+PREDICT_BARS_30m = 50
+LIMIT_30m = 1000
+POSITION_SIZE = 100
+
+# 모델 경로
+MODEL_PATH = MODEL_DIR / 'model.pkl'
+SCALER_PATH = MODEL_DIR / 'scaler.pkl'
+
+# 마진 설정
+MARGIN_RATE_30m = 0.02
+BACKTEST_MARGIN_RATE_30m = 0.02
 
 # ============================================================
 # 유틸리티 함수
@@ -398,7 +466,7 @@ def dynamic_margin(ece50: float = 0.0, entropy: float = 0.0) -> float:
 
 def decide(p_cal: float, margin: float) -> str | None:
     if p_cal >= P_STAR + margin: 
-        return "UP"
+        return "LONG"
     if p_cal <= (1.0 - P_STAR) - margin: 
-        return "DOWN"
+        return "SHORT"
     return None

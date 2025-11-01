@@ -22,7 +22,7 @@ modules_to_check = [
     ('monitor', 'Monitor'),
     ('log_manager', 'LogManager'),
     ('model_train', 'ModelTrainer'),
-    ('real_trade', 'RealTrader'),
+    ('real_trade', 'RealTradeManager'),
     ('feature_engineer', 'FeatureEngineer'),
     ('data_loader', 'DataLoader'),
     ('timeframe_manager', 'TimeframeManager'),
@@ -164,9 +164,12 @@ def live_trading():
     pipeline = MainPipeline()
     
     # 모델 확인
+    if not getattr(pipeline.trader, "model_loaded", False):
+        pipeline.trader._load_latest_bundle()
+
     if not pipeline.trader.model_loaded:
-        print("\n⚠️  학습된 모델이 없습니다.")
-        print("먼저 모델을 학습해야 합니다. (메뉴 1번 또는 4번)")
+        print("\n⚠️  학습된 모델(번들)이 없습니다.")
+        print("먼저 모델을 학습하세요. (메뉴 1번 또는 4번)")
         return
     
     # 초기화
