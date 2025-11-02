@@ -1,21 +1,21 @@
-# real_trade.py
-# 30분 바이너리 옵션 실시간 거래 및 백테스트 모듈 (A 방식)
-#
-# 핵심 규칙
-# - 29분 50~59초에 예측(분%30==29 & 초 50~59)
-# - 바로 "다음 바" 정각에 진입 (entry_at = floor_30m(now) + 30m)
-# - 엔트리/클로즈 로그와 피쳐 로그는 같은 앵커 키(bar30_start/bar30_end)로 기록
-# - config.decide() 사용, TTL/조기청산 없음, feature_engineer의 target 정의에 따름
+"""
+real_trade.py
+30분 바이너리 옵션 실시간 거래 및 백테스트 모듈 (A 방식)
+
+핵심 규칙
+- 29분 50~59초에 예측(분%30==29 & 초 50~59)
+- 바로 "다음 바" 정각에 진입 (entry_at = floor_30m(now) + 30m)
+- 엔트리/클로즈 로그와 피쳐 로그는 같은 앵커 키(bar30_start/bar30_end)로 기록
+- config.decide() 사용, TTL/조기청산 없음, feature_engineer의 target 정의에 따름
+"""
 
 from __future__ import annotations
 
 import time
 import csv
-from pathlib import Path
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta
-
 from binance.client import Client
 
 import config
@@ -138,9 +138,6 @@ class RealTradeManager:
         self.entry_bar30_end = None
         self.entry_p_up = None
 
-        # ✅ 만기(청산) 시각 고정 — 엔트리 시 bar30_end를 저장
-        self.exit_at = None
-
         self.latest_df = None
 
         # 예측 타이밍 제어
@@ -150,11 +147,9 @@ class RealTradeManager:
         # 안전 종료 핸들러
         self._stop = False
         import signal
-
         def _sigint_handler(signum, frame):
             self._stop = True
             print("\n⏹️  SIGINT 수신 — 안전 종료 준비 중...")
-
         try:
             signal.signal(signal.SIGINT, _sigint_handler)
         except Exception:
@@ -213,22 +208,21 @@ class RealTradeManager:
         bar30_end = entry_at + timedelta(minutes=30)
         return bar30_start, bar30_end, entry_at
 
-    def _log_feature_snapshot(
-        self,
-        symbol: str,
-        bar30_start: datetime,
-        bar30_end: datetime,
-        regime: int,
-        p_up: float,
-        margin: float,
-        extra: dict | None = None,
-    ):
+    def _log_feature_snapshot(self,
+                              symbol: str,
+                              bar30_start: datetime,
+                              bar30_end: datetime,
+                              regime: int,
+                              p_up: float,
+                              margin: float,
+                              extra: dict | None = None):
         """
         피쳐 스냅샷을 '바 앵커' 기준으로 저장
         파일명: feature_log/{SYMBOL}_features_YYYYMMDD.csv
         """
         day_str = bar30_start.strftime("%Y%m%d")
-        path = getattr(config, "FEATURE_LOG_DIR", "feature_log")
+        path = config.FEATURE_LOG_DIR if hasattr(config, "FEATURE_LOG_DIR") else "feature_log"
+        Path = __import__("pathlib").Path
         Path(path).mkdir(parents=True, exist_ok=True)
         fpath = Path(path) / f"{symbol}_features_{day_str}.csv"
 
@@ -244,6 +238,8 @@ class RealTradeManager:
         if extra:
             row.update({k: extra[k] for k in extra})
 
+        header = ["symbol", "bar30_start", "bar30_end", "regime", "p_up", "margin", "pred_at", "decision", "pred_at"]
+        # header 안정화: 중복 키 제거 및 존재하지 않으면 스킵
         header = ["symbol", "bar30_start", "bar30_end", "regime", "p_up", "margin", "pred_at", "decision"]
         if "decision" not in row:
             row["decision"] = "UP" if row["p_up"] >= 0.5 else "DOWN"
@@ -264,32 +260,20 @@ class RealTradeManager:
             klines = self.client.get_klines(
                 symbol=config.SYMBOL,
                 interval=getattr(config, "INTERVAL_30m", "30m"),
-                limit=limit,
+                limit=limit
             )
-            df = pd.DataFrame(
-                klines,
-                columns=[
-                    "open_time",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "volume",
-                    "close_time",
-                    "quote_volume",
-                    "trades",
-                    "taker_buy_base",
-                    "taker_buy_quote",
-                    "ignore",
-                ],
-            )
+            df = pd.DataFrame(klines, columns=[
+                'open_time', 'open', 'high', 'low', 'close', 'volume',
+                'close_time', 'quote_volume', 'trades',
+                'taker_buy_base', 'taker_buy_quote', 'ignore'
+            ])
             # UTC 시간 변환
-            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-            df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+            df['open_time'] = pd.to_datetime(df['open_time'], unit='ms', utc=True)
+            df['close_time'] = pd.to_datetime(df['close_time'], unit='ms', utc=True)
             # 숫자형 변환
-            for col in ["open", "high", "low", "close", "volume"]:
+            for col in ['open', 'high', 'low', 'close', 'volume']:
                 df[col] = df[col].astype(float)
-            df.set_index("open_time", inplace=True)
+            df.set_index('open_time', inplace=True)
             df.sort_index(inplace=True)
             return df
         except Exception as e:
@@ -297,6 +281,7 @@ class RealTradeManager:
             return pd.DataFrame()
 
     def _load_latest_bundle(self):
+        from pathlib import Path
         base = config.MODEL_DIR
         latest = base / "latest"
         print(f"[DEBUG] try bundle: {latest}")
@@ -359,26 +344,14 @@ class RealTradeManager:
         try:
             if not self.model_loaded:
                 print("⚠️  모델 미로딩 (self.model_loaded=False)")
-                return {
-                    "should_enter": False,
-                    "direction": None,
-                    "pred_proba": 0.0,
-                    "regime": 0,
-                    "margin": 0.0,
-                }
+                return {'should_enter': False, 'direction': None, 'pred_proba': 0.0, 'regime': 0, 'margin': 0.0}
 
             # 1) 피처 생성
             df_in = df.copy()
             df_feat = self.fe.create_feature_pool(df_in)
             if df_feat is None or df_feat.empty:
                 print("❌ 피처 생성 실패 (빈 DataFrame)")
-                return {
-                    "should_enter": False,
-                    "direction": None,
-                    "pred_proba": 0.0,
-                    "regime": 0,
-                    "margin": 0.0,
-                }
+                return {'should_enter': False, 'direction': None, 'pred_proba': 0.0, 'regime': 0, 'margin': 0.0}
 
             # 2) 필수 라벨
             if "regime" not in df_feat.columns:
@@ -389,29 +362,14 @@ class RealTradeManager:
             need = int(getattr(config, "PREDICT_BARS_30m", 30))
             if len(df_feat) < need:
                 print(f"⏳ 샘플 부족: {len(df_feat)} < {need}")
-                return {
-                    "should_enter": False,
-                    "direction": None,
-                    "pred_proba": 0.0,
-                    "regime": int(df_feat["regime"].iloc[-1]),
-                    "margin": 0.0,
-                }
+                return {'should_enter': False, 'direction': None, 'pred_proba': 0.0, 'regime': int(df_feat['regime'].iloc[-1]), 'margin': 0.0}
 
             # 4) 최근 구간/레짐
             recent = df_feat.iloc[-need:].copy()
             regime = int(recent["regime"].iloc[-1])
 
             # 5) 학습-예측 피처 정합
-            meta_cols = {
-                "regime",
-                "target",
-                "timestamp",
-                "bar30_start",
-                "open_time",
-                "close_time",
-                "data_ver",
-                "feature_ver",
-            }
+            meta_cols = {"regime", "target", "timestamp", "bar30_start", "open_time", "close_time", "data_ver", "feature_ver"}
             candidate = [c for c in df_feat.columns if c not in meta_cols]
 
             train_cols = None
@@ -447,23 +405,14 @@ class RealTradeManager:
                 use_cols = [c for c in train_cols if c in candidate]
                 dropped = [c for c in train_cols if c not in use_cols]
                 if dropped:
-                    print(
-                        f"[WARN] 학습 피처 중 계산 불가 {len(dropped)}개 제외: "
-                        f"{dropped[:8]}{' ...' if len(dropped)>8 else ''}"
-                    )
+                    print(f"[WARN] 학습 피처 중 계산 불가 {len(dropped)}개 제외: {dropped[:8]}{' ...' if len(dropped)>8 else ''}")
             else:
                 use_cols = candidate
                 print("[WARN] 학습 피처 목록을 찾지 못함 → 메타 제외 후보 전체 사용")
 
             if not use_cols:
                 print("❌ 사용할 피처가 없습니다(use_cols 비어있음)")
-                return {
-                    "should_enter": False,
-                    "direction": None,
-                    "pred_proba": 0.0,
-                    "regime": regime,
-                    "margin": 0.0,
-                }
+                return {'should_enter': False, 'direction': None, 'pred_proba': 0.0, 'regime': regime, 'margin': 0.0}
 
             # 6) 결측/타입 보정
             before_na = recent[use_cols].isna().mean().mean()
@@ -491,21 +440,19 @@ class RealTradeManager:
                 print(f"❌ 예측 단계 실패: {pe}")
                 pred_proba = 0.5
 
-            regime_name = {1: "UP", -1: "DOWN", 0: "FLAT"}.get(regime, "UNKNOWN")
-            print(
-                f"[PRED] regime={regime_name}({regime})  used_feats={len(use_cols)}  "
-                f"NaN(mean_before)={before_na:.3f}  p_up={pred_proba:.4f}"
-            )
-
+            regime_name = {1: 'UP', -1: 'DOWN', 0: 'FLAT'}.get(regime, 'UNKNOWN')
+            print(f"[PRED] regime={regime_name}({regime})  used_feats={len(use_cols)}  "
+                  f"NaN(mean_before)={before_na:.3f}  p_up={pred_proba:.4f}")
+            
             if getattr(config, "FORCE_ENTRY", False):
                 direction = "UP" if pred_proba >= 0.5 else "DOWN"
                 print(f"⚙️  FORCE_ENTRY=True → 무조건 진입: {direction}")
                 return {
-                    "should_enter": True,
-                    "direction": direction,
-                    "pred_proba": float(pred_proba),
-                    "regime": int(regime),
-                    "margin": 0.0,
+                    'should_enter': True,
+                    'direction': direction,
+                    'pred_proba': float(pred_proba),
+                    'regime': int(regime),
+                    'margin': 0.0
                 }
 
             # 8) 진입 판단
@@ -513,48 +460,36 @@ class RealTradeManager:
             try:
                 direction = config.decide(pred_proba, margin)
             except Exception:
-                direction = "UP" if pred_proba >= 0.5 else "DOWN"
+                direction = 'UP' if pred_proba >= 0.5 else 'DOWN'
             should_enter = direction is not None
 
             return {
-                "should_enter": bool(should_enter),
-                "direction": direction if should_enter else None,
-                "pred_proba": float(pred_proba),
-                "regime": int(regime),
-                "margin": float(margin),
+                'should_enter': bool(should_enter),
+                'direction': direction if should_enter else None,
+                'pred_proba': float(pred_proba),
+                'regime': int(regime),
+                'margin': float(margin)
             }
 
         except KeyboardInterrupt:
             print("\n⏹️  사용자 종료(Ctrl+C)")
             self._stop = True
-            return {
-                "should_enter": False,
-                "direction": None,
-                "pred_proba": 0.0,
-                "regime": 0,
-                "margin": 0.0,
-            }
+            return {'should_enter': False, 'direction': None, 'pred_proba': 0.0, 'regime': 0, 'margin': 0.0}
 
         except Exception as e:
             print(f"❌ 예측 실패(상위): {e}")
-            return {
-                "should_enter": False,
-                "direction": None,
-                "pred_proba": 0.0,
-                "regime": 0,
-                "margin": 0.0,
-            }
+            return {'should_enter': False, 'direction': None, 'pred_proba': 0.0, 'regime': 0, 'margin': 0.0}
 
     def execute_entry(self, direction: str, pred_proba: float, regime: int,
                       bar30_start: datetime, bar30_end: datetime):
         now = datetime.now(timezone.utc)
-        regime_name = {1: "UP", -1: "DOWN", 0: "FLAT"}.get(regime, "UNKNOWN")
+        regime_name = {1:'UP', -1:'DOWN', 0:'FLAT'}.get(regime, 'UNKNOWN')
 
         # 엔트리 가격 스냅샷
-        last_close = float("nan")
+        last_close = float('nan')
         try:
             if self.latest_df is not None and not self.latest_df.empty:
-                last_close = float(self.latest_df["close"].iloc[-1])
+                last_close = float(self.latest_df['close'].iloc[-1])
         except Exception:
             pass
 
@@ -569,50 +504,43 @@ class RealTradeManager:
         expire_at = res["expire_at"]
         reason = res["reason"]
 
-        print("\n" + "=" * 60)
+        print("\n" + "="*60)
         print(f"🚀 엔트리 [{kind}] ok={ok} order_id={order_id} reason={reason}")
         print(f"UTC: {now:%Y-%m-%d %H:%M:%S} dir={direction} p_up={pred_proba:.4f} regime={regime_name}")
         print(f"entry_close={last_close} tenor={ttl}min  expire_at={expire_at:%H:%M:%S} UTC")
-        print("=" * 60 + "\n")
+        print("="*60 + "\n")
 
         if ok:
             # 상태 저장 (CLOSE 시 필요)
-            self.in_position = True
-            self.entry_time = now
-            self.entry_price = last_close
-            self.entry_dir = direction
-            self.entry_regime = regime
-            self.entry_kind = kind
-            self.entry_oid = order_id
-            self.entry_bar30_start = bar30_start
-            self.entry_bar30_end = bar30_end
-            self.entry_p_up = float(pred_proba)
+            self.in_position        = True
+            self.entry_time         = now
+            self.entry_price        = last_close
+            self.entry_dir          = direction
+            self.entry_regime       = regime
+            self.entry_kind         = kind
+            self.entry_oid          = order_id
+            self.entry_bar30_start  = bar30_start
+            self.entry_bar30_end    = bar30_end
+            self.entry_p_up         = float(pred_proba)
 
-            # ✅ 이번 포지션의 만기(청산) 시각을 바 앵커로 고정
-            self.exit_at = bar30_end
-            print(f"[ENTRY] will exit at {self.exit_at:%Y-%m-%d %H:%M:%S} UTC")
-
-            # ENTRY 로그
+            # ENTRY 로그 (샘플 포맷과 동일)
             try:
                 self.logger.log_trade_entry_simple(
-                    trade_id=order_id or f"{kind}_{now.strftime('%Y%m%dT%H%M%S')}",
-                    direction=direction,                 # 'UP'/'DOWN'
-                    entry_price=float(last_close),
-                    entry_ts=now,
-                    p_raw_at_entry=float(pred_proba),    # 표준 컬럼(캘리브 전)
-                    p_cal_at_entry=float(pred_proba),    # 캘리브 없으면 동일
-                    cal_method="identity",
-                    cal_ver=getattr(config, "CALIB_VERSION", ""),
-                    regime=int(regime),
-                    bar30_start=bar30_start,
-                    bar30_end=bar30_end,
-                    # 가능 시 아래 2개도 로그로 남기면 복구 정확도↑ (모르는 필드는 무시됨)
-                    exit_at=bar30_end,
-                    exit_anchor=bar30_end,
-                    kind=kind,
-                    symbol=getattr(config, "SYMBOL", "BTCUSDT"),
-                    payout=getattr(config, "PAYOUT_30M_PLUS", 0.85),
-                    tenor_min=ttl,
+                    trade_id = order_id or f"{kind}_{now.strftime('%Y%m%dT%H%M%S')}",
+                    direction = direction,              # 이미 'UP'/'DOWN' 값이므로 그대로
+                    entry_price = float(last_close),
+                    entry_ts = now,
+                    p_raw_at_entry = float(pred_proba), # ✅ 표준 컬럼
+                    p_cal_at_entry = float(pred_proba), # 캘리브 보정 없으면 동일 값
+                    cal_method = "identity",
+                    cal_ver = getattr(config, "CALIB_VERSION", ""),
+                    regime = int(regime),
+                    bar30_start = bar30_start,
+                    bar30_end = bar30_end,
+                    kind = kind,
+                    symbol = getattr(config, "SYMBOL", "BTCUSDT"),
+                    payout = getattr(config, "PAYOUT_30M_PLUS", 0.85),
+                    tenor_min = ttl
                 )
             except Exception as e:
                 print(f"[WARN] entry log failed: {e}")
@@ -620,191 +548,63 @@ class RealTradeManager:
             print("⛔ 진입 실패 (REAL 전용 & 실패, 폴백 없음)")
 
     def check_exit(self):
-        """
-        만기(=exit_at) 시각이 지났는지로 청산 판단.
-        in_position/entry_time 플래그가 사라져도 exit_at이 남아있으면 청산 시도.
-        """
-        now = datetime.now(timezone.utc)
-
-        # 🔒 안전장치 1: in_position/entry_time이 없어도 exit_at이 있으면 그걸 신뢰
-        if self.exit_at is None:
-            # 과거 버전 호환: entry_bar30_end가 있다면 그걸 만기로 사용
-            try:
-                if self.entry_bar30_end is not None:
-                    self.exit_at = self.entry_bar30_end
-            except Exception:
-                pass
-
-        # 안전장치 2: 아무 정보도 없으면 리턴
-        if self.exit_at is None:
+        if not self.in_position or self.entry_time is None:
             return
-
-        # 아직 만기 전이면 10초마다 대기 로그
-        if now < self.exit_at:
-            remain = (self.exit_at - now).total_seconds()
-            if int(remain) % 10 == 0:
-                print(f"[EXIT-WAIT] {int(remain)}s until expiry ({self.exit_at:%H:%M:%S} UTC)")
+        now = datetime.now(timezone.utc)
+        if (now - self.entry_time).total_seconds() < getattr(config, "OPTION_TENOR_MIN", 30)*60:
             return
 
         # 만기 스냅샷용 종가
-        exit_price = float("nan")
+        exit_price = float('nan')
         try:
             df = self.fetch_latest_klines(limit=max(2, getattr(config, "LIMIT_30m", 200)))
             if not df.empty:
-                exit_price = float(df["close"].iloc[-1])
+                exit_price = float(df['close'].iloc[-1])
         except Exception:
             pass
 
         # 가상 판정
         correct = None
-        if self.entry_dir == "UP":
+        if self.entry_dir == 'UP':
             correct = exit_price > self.entry_price
-        elif self.entry_dir == "DOWN":
+        elif self.entry_dir == 'DOWN':
             correct = exit_price < self.entry_price
 
         payout = getattr(config, "PAYOUT_30M_PLUS", 0.85)
         pnl = payout if correct else -1.0
-        res = "WIN" if correct else "LOSS"
 
-        print("\n" + "=" * 60)
+        print("\n" + "="*60)
         print(f"⏰ 만기 채점 kind={getattr(self,'entry_kind','PAPER')} oid={getattr(self,'entry_oid',None)}")
-        print(f"in={self.entry_price} out={exit_price} dir={self.entry_dir} → {res} pnl={pnl:+.2f}")
-        print("=" * 60 + "\n")
+        print(f"in={self.entry_price} out={exit_price} dir={self.entry_dir} → {'WIN' if correct else 'LOSS'} pnl={pnl:+.2f}")
+        print("="*60 + "\n")
 
-        # CLOSE 로그 (trade_id 동일 키로 결과 업데이트)
+        # CLOSE 로그
         try:
-            trade_id = (
-                getattr(self, "entry_oid", None)
-                or f"{getattr(self,'entry_kind','PAPER')}_{self.entry_time.strftime('%Y%m%dT%H%M%S')}"
-            )
+            trade_id = (getattr(self, "entry_oid", None)
+                        or f"{getattr(self,'entry_kind','PAPER')}_{self.entry_time.strftime('%Y%m%dT%H%M%S')}")
+
             self.logger.update_trade_result(
-                trade_id=trade_id,
-                result=res,
-                label_price=float(exit_price),
-                label_ts=now,
-                payout=float(payout),
-                pnl=float(pnl),
+                trade_id = trade_id,
+                result   = "WIN" if correct else "LOSS",
+                label_price = float(exit_price),
+                label_ts    = now,
+                payout      = float(payout),
+                pnl         = float(pnl)
             )
         except Exception as e:
             print(f"[WARN] close log failed: {e}")
 
         # 상태 초기화
-        self.in_position = False
-        self.entry_time = None
-        self.entry_price = None
-        self.entry_dir = None
-        self.entry_regime = None
-        self.entry_kind = None
-        self.entry_oid = None
-        self.entry_bar30_start = None
-        self.entry_bar30_end = None
-        self.entry_p_up = None
-        self.exit_at = None  # ✅ 만기 시각 초기화
-
-    # ---------- 보호장치: 로그의 OPEN들을 스캔해 강제 청산 ----------
-
-    def _iter_due_open_trades(self, lookback_days: int = 2):
-        """
-        최근 N일 로그에서 OPEN 상태이며 bar30_end(혹은 exit_at)가 now 이전인 레코드들을 yield.
-        LogManager에 의존하지 않고 CSV를 직접 스캔하는 보수적 구현.
-        파일명 규칙은 {SYMBOL}_trades_YYYYMMDD.csv 로 가정 (config에서 다르면 수정)
-        """
-        log_dir = getattr(config, "TRADE_LOG_DIR", "trade_log")
-        symbol = getattr(config, "SYMBOL", "BTCUSDT")
-        now = datetime.now(timezone.utc)
-
-        # 오늘 + lookback_days 일수
-        days = [now.date()]
-        for i in range(1, lookback_days + 1):
-            days.append((now - timedelta(days=i)).date())
-
-        for d in days:
-            day_str = d.strftime("%Y%m%d")
-            path = Path(log_dir) / f"{symbol}_trades_{day_str}.csv"
-            if not path.exists():
-                continue
-
-            try:
-                with path.open("r", newline="", encoding="utf-8") as fp:
-                    r = csv.DictReader(fp)
-                    for row in r:
-                        status = (row.get("status") or row.get("trade_status") or "").upper()
-                        if status and status != "OPEN":
-                            continue
-
-                        # 만기 판단 기준: exit_at 우선, 없으면 bar30_end
-                        exit_str = row.get("exit_at") or row.get("bar30_end") or ""
-                        if not exit_str:
-                            continue
-                        try:
-                            exit_at = pd.to_datetime(exit_str, utc=True)
-                            if exit_at.tzinfo is None:
-                                exit_at = exit_at.tz_localize("UTC")
-                        except Exception:
-                            continue
-
-                        if now >= exit_at:
-                            yield row, exit_at
-            except Exception as e:
-                print(f"[GUARD] read error {path}: {e}")
-
-    def _force_close_by_row(self, row, exit_at):
-        """
-        OPEN 행(row)을 받아, 현재 30분봉의 종가로 WIN/LOSS 계산 후 같은 trade_id로 CLOSE 업데이트.
-        """
-        trade_id = (
-            row.get("trade_id")
-            or row.get("order_id")
-            or row.get("id")
-            or (
-                (row.get("kind", "PAPER") + "_" + (row.get("bar30_start", "") or "")
-                 .replace(":", "")
-                 .replace("-", "")
-                 .replace("Z", "")
-                 .replace("T", ""))
-            )
-        )
-
-        # 엔트리 정보
-        try:
-            entry_price = float(row.get("entry_price") or row.get("in") or "nan")
-        except Exception:
-            entry_price = float("nan")
-
-        direction = (row.get("direction") or row.get("side") or "").upper()
-        payout = float(row.get("payout") or getattr(config, "PAYOUT_30M_PLUS", 0.85))
-
-        # 만기 종가 스냅샷(가장 최근 30m 종가)
-        exit_price = float("nan")
-        try:
-            df = self.fetch_latest_klines(limit=max(2, getattr(config, "LIMIT_30m", 200)))
-            if not df.empty:
-                exit_price = float(df["close"].iloc[-1])
-        except Exception:
-            pass
-
-        # 판정
-        correct = None
-        if direction == "UP":
-            correct = exit_price > entry_price
-        elif direction == "DOWN":
-            correct = exit_price < entry_price
-
-        pnl = payout if correct else -1.0
-        res = "WIN" if correct else "LOSS"
-
-        try:
-            self.logger.update_trade_result(
-                trade_id=trade_id,
-                result=res,
-                label_price=float(exit_price),
-                label_ts=datetime.now(timezone.utc),
-                payout=float(payout),
-                pnl=float(pnl),
-            )
-            print(f"[FORCE-CLOSE] {trade_id} → {res} (in={entry_price}, out={exit_price})")
-        except Exception as e:
-            print(f"[WARN] force close failed for {trade_id}: {e}")
+        self.in_position        = False
+        self.entry_time         = None
+        self.entry_price        = None
+        self.entry_dir          = None
+        self.entry_regime       = None
+        self.entry_kind         = None
+        self.entry_oid          = None
+        self.entry_bar30_start  = None
+        self.entry_bar30_end    = None
+        self.entry_p_up         = None
 
     # --------------- 메인 루프 ---------------
 
@@ -819,15 +619,8 @@ class RealTradeManager:
                 # 청산 체크
                 self.check_exit()
 
-                # 🛡️ 보호장치: 로그에 남아있지만 메모리 플래그가 사라진 OPEN들을 강제 청산
-                try:
-                    for row, exit_at in self._iter_due_open_trades(lookback_days=2):
-                        self._force_close_by_row(row, exit_at)
-                except Exception as _e:
-                    print(f"[GUARD] scan open trades err: {_e}")
-
                 # 예측 타이밍 체크
-                if self.should_predict_now() and not self.in_position:
+                if self.should_predict_now():
                     print(f"🔍 예측 시작: {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC")
 
                     # 데이터 수집 & 캐시
@@ -840,14 +633,12 @@ class RealTradeManager:
                         # 예측 및 진입 판단
                         result = self.predict_and_decide(df)
 
-                        regime_name = {1: "UP", -1: "DOWN", 0: "FLAT"}.get(result["regime"], "UNKNOWN")
-                        print(
-                            f"레짐: {regime_name} ({result['regime']}), "
-                            f"예측 확률: {result['pred_proba']:.4f}, "
-                            f"마진: {result['margin']:.4f}"
-                        )
+                        regime_name = {1: 'UP', -1: 'DOWN', 0: 'FLAT'}.get(result['regime'], 'UNKNOWN')
+                        print(f"레짐: {regime_name} ({result['regime']}), "
+                              f"예측 확률: {result['pred_proba']:.4f}, "
+                              f"마진: {result['margin']:.4f}")
 
-                        if result["should_enter"]:
+                        if result['should_enter']:
                             # === A 방식: 다음 바 앵커/정각 계산 ===
                             now_utc = datetime.now(timezone.utc)
                             bar30_start, bar30_end, entry_at = self._compute_bar_anchors(now_utc)
@@ -864,9 +655,9 @@ class RealTradeManager:
                                     extra={
                                         "decision": ("UP" if result["pred_proba"] >= 0.5 else "DOWN"),
                                         "pred_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                    },
+                                    }
                                 )
-                            except Exception:
+                            except Exception as _:
                                 pass
 
                             # 다음 정각까지 대기
@@ -882,11 +673,11 @@ class RealTradeManager:
 
                             # 진입 실행
                             self.execute_entry(
-                                result["direction"],
-                                result["pred_proba"],
-                                result["regime"],
+                                result['direction'],
+                                result['pred_proba'],
+                                result['regime'],
                                 bar30_start=bar30_start,
-                                bar30_end=bar30_end,
+                                bar30_end=bar30_end
                             )
                         else:
                             print("⛔ 진입 조건 미충족, 스킵\n")
@@ -990,11 +781,13 @@ class BacktestManager:
 
         for col in ("regime", "target"):
             if col not in df_feat.columns:
-                raise RuntimeError("피처에 'regime' 또는 'target' 컬럼이 없습니다. FeatureEngineer 라벨링을 확인하세요.")
+                raise RuntimeError(f"피처에 '{col}' 컬럼이 없습니다. FeatureEngineer 라벨링을 확인하세요.")
 
         return df_feat
 
-    def run_backtest(self, df_1m: pd.DataFrame, start_date: str | None = None, end_date: str | None = None) -> pd.DataFrame:
+    def run_backtest(self, df_1m: pd.DataFrame,
+                     start_date: str | None = None,
+                     end_date: str | None = None) -> pd.DataFrame:
         """간단 백테스트 실행."""
         if df_1m is None or df_1m.empty:
             raise ValueError("빈 데이터로는 백테스트를 수행할 수 없습니다.")
@@ -1030,24 +823,19 @@ class BacktestManager:
         pnl = np.where(win == 1, payout, -1.0)
         cum_pnl = np.cumsum(pnl)
 
-        ts_series = (
-            pd.to_datetime(df_feat["timestamp"], utc=True, errors="coerce")
-            if "timestamp" in df_feat.columns
-            else pd.Series([pd.NaT] * len(df_feat))
-        )
+        ts_series = pd.to_datetime(df_feat["timestamp"], utc=True, errors="coerce") \
+            if "timestamp" in df_feat.columns else pd.Series([pd.NaT] * len(df_feat))
 
-        result = pd.DataFrame(
-            {
-                "timestamp": ts_series.to_numpy(),
-                "regime": regimes,
-                "p_up": p_up,
-                "decision": decision,  # 1=UP, 0=DOWN
-                "target": y_true,  # 실제 방향
-                "win": win,
-                "pnl": pnl,
-                "cum_pnl": cum_pnl,
-            }
-        )
+        result = pd.DataFrame({
+            "timestamp": ts_series.to_numpy(),
+            "regime": regimes,
+            "p_up": p_up,
+            "decision": decision,     # 1=UP, 0=DOWN
+            "target": y_true,         # 실제 방향
+            "win": win,
+            "pnl": pnl,
+            "cum_pnl": cum_pnl
+        })
         return result
 
 
@@ -1056,18 +844,16 @@ class BacktestManager:
 # ==============================
 def main():
     import sys
-
     try:
         if len(sys.argv) < 2:
             print("사용법: python real_trade.py [live|backtest]")
             return
         mode = sys.argv[1]
-        if mode == "live":
+        if mode == 'live':
             rtm = RealTradeManager()
             rtm.run_live()
-        elif mode == "backtest":
+        elif mode == 'backtest':
             from data_loader import DataLoader
-
             dl = DataLoader()
             df = dl.load_price_data()
             if df.empty:
@@ -1076,7 +862,7 @@ def main():
             btm = BacktestManager()
             df_result = btm.run_backtest(df)
             if not df_result.empty:
-                output_path = "backtest_result_30m.csv"
+                output_path = 'backtest_result_30m.csv'
                 df_result.to_csv(output_path, index=False)
                 print(f"✅ 결과 저장: {output_path}")
         else:
@@ -1088,5 +874,5 @@ def main():
         print("🛑 종료 정리 완료")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
